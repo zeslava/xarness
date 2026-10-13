@@ -1,0 +1,19 @@
+[package]
+name = "xarness"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+crossterm = { version = "0.29", features = ["event-stream"] }
+dirs = "6"
+futures = "0.3"
+ignore = "0.4"
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+indexmap = { version = "2", features = ["serde"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+toml = "0.9"
