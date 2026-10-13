@@ -6,8 +6,10 @@ use ignore::WalkBuilder;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tree_sitter_tags::TagsContext;
 
 use crate::domain::ports::{Tool, ToolSpec};
+use crate::repomap::{self, Def};
 
 pub struct Grep;
 
@@ -24,7 +26,7 @@ impl Tool for Grep {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "grep",
-            description: "Search file contents with a regex, respecting .gitignore. Returns `path:line:text`, at most 50 matches, lines longer than 200 chars are cut with …. Narrow the pattern or path if there are too many matches.",
+            description: "Search file contents with a regex, respecting .gitignore. Returns `path:line:text`, followed by `[in Name]` when the line is inside a definition — pass that name to read_symbol instead of reading the whole file. At most 50 matches, lines longer than 200 chars are cut with …. Narrow the pattern or path if there are too many matches.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -54,14 +56,29 @@ impl Tool for Grep {
                 continue;
             };
             let rel = super::display(root, entry.path());
+            let mut shown = Vec::new();
             for (i, line) in text.lines().enumerate() {
                 if re.is_match(line) {
                     count += 1;
                     if count <= MAX_MATCHES {
-                        let _ =
-                            writeln!(out, "{rel}:{}:{}", i + 1, super::clip(line, MAX_LINE_CHARS));
+                        shown.push((i + 1, line));
                     }
                 }
+            }
+            if shown.is_empty() {
+                continue;
+            }
+            // Parsed only for files with shown matches, so a broad search stays cheap.
+            let defs = repomap::languages()
+                .for_path(&rel)
+                .map(|c| repomap::defs(&mut TagsContext::new(), c, &text))
+                .unwrap_or_default();
+            for (n, line) in shown {
+                let _ = write!(out, "{rel}:{n}:{}", super::clip(line, MAX_LINE_CHARS));
+                if let Some(sym) = enclosing(&defs, n) {
+                    let _ = write!(out, "  [in {sym}]");
+                }
+                out.push('\n');
             }
         }
         if count > MAX_MATCHES {
@@ -75,5 +92,34 @@ impl Tool for Grep {
         } else {
             out
         })
+    }
+}
+
+/// The innermost definition around `line`, named the way `read_symbol` accepts it.
+fn enclosing(defs: &[Def], line: usize) -> Option<String> {
+    let k = (0..defs.len())
+        .filter(|&k| defs[k].start <= line && line <= defs[k].end)
+        .min_by_key(|&k| defs[k].end - defs[k].start)?;
+    let name = type_name(&defs[k]);
+    Some(match repomap::container(defs, k) {
+        Some(c) => format!("{}::{name}", type_name(&defs[c])),
+        None => name.to_string(),
+    })
+}
+
+/// For `impl Trait for Type` the tag name is the trait; the type is what tells impls apart.
+fn type_name(d: &Def) -> &str {
+    match d
+        .text
+        .strip_prefix("impl")
+        .and_then(|t| t.rsplit_once(" for "))
+    {
+        Some((_, ty)) => {
+            let end = ty
+                .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .unwrap_or(ty.len());
+            &ty[..end]
+        }
+        None => &d.name,
     }
 }

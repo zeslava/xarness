@@ -16,7 +16,8 @@ struct Args {
     name: Option<Names>,
 }
 
-/// Small models send either a list or one comma-separated string; identifiers never contain commas.
+/// Small models send either a list, one comma- or space-separated string, or a list stringified
+/// as JSON (`["a", "b"]`); identifiers never contain whitespace, commas, brackets or quotes.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum Names {
@@ -26,13 +27,14 @@ enum Names {
 
 impl Names {
     fn queries(&self) -> Vec<&str> {
+        let sep = |c: char| c == ',' || c.is_whitespace();
         let parts: Vec<&str> = match self {
-            Names::One(s) => s.split(',').collect(),
-            Names::Many(v) => v.iter().flat_map(|s| s.split(',')).collect(),
+            Names::One(s) => s.split(sep).collect(),
+            Names::Many(v) => v.iter().flat_map(|s| s.split(sep)).collect(),
         };
         parts
             .into_iter()
-            .map(str::trim)
+            .map(|s| s.trim_matches(|c: char| "[]\"'`".contains(c)))
             .filter(|s| !s.is_empty())
             .collect()
     }

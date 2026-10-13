@@ -1,7 +1,12 @@
 //! Repository map for the system prompt: every file with its line count and the definitions
 //! found by tree-sitter tag queries. Built once and kept byte-identical between requests so
 //! the server's KV cache stays valid; it is only rebuilt on demand (`/map`).
+//!
+//! Over budget, definitions are kept by importance: files are ranked by PageRank over the
+//! graph "file references a name defined in file", and each definition scores by its file's
+//! rank plus the rank flowing into it through references.
 
+use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::ops::Range;
 use std::path::Path;
@@ -46,6 +51,8 @@ struct File {
     path: String,
     lines: Option<usize>,
     defs: Vec<Def>,
+    /// Names referenced from this file (calls, types), with repeats.
+    refs: Vec<String>,
 }
 
 pub fn build(root: &Path) -> Option<RepoMap> {
@@ -64,6 +71,7 @@ pub fn build(root: &Path) -> Option<RepoMap> {
                 path: crate::tools::display(root, e.path()),
                 lines: src.as_ref().map(|s| s.lines().count()),
                 defs: Vec::new(),
+                refs: Vec::new(),
             };
             (file, src)
         })
@@ -73,50 +81,180 @@ pub fn build(root: &Path) -> Option<RepoMap> {
     }
 
     // Parsing is wasted if even the bare paths don't fit.
-    if render(&files, None).len() <= BUDGET_BYTES {
-        let langs = languages();
-        let mut ctx = TagsContext::new();
-        for (file, src) in files.iter_mut().zip(&sources) {
-            if let (Some(src), Some(config)) = (src, langs.for_path(&file.path)) {
-                file.defs = defs(&mut ctx, config, src);
-            }
+    let paths_len = render(&files, None).len();
+    if paths_len > BUDGET_BYTES {
+        return Some(RepoMap {
+            text: truncated_paths(&files),
+            files: files.len(),
+        });
+    }
+    let langs = languages();
+    let mut ctx = TagsContext::new();
+    for (file, src) in files.iter_mut().zip(&sources) {
+        if let (Some(src), Some(config)) = (src, langs.for_path(&file.path)) {
+            (file.defs, file.refs) = tags(&mut ctx, config, src);
         }
     }
-
-    let text = [
-        Some(Depth::TraitMember),
-        Some(Depth::Member),
-        Some(Depth::TopLevel),
-        None,
-    ]
-    .into_iter()
-    .map(|d| render(&files, d))
-    .find(|t| t.len() <= BUDGET_BYTES)
-    .unwrap_or_else(|| truncated_paths(&files));
+    let shown = select(&files, BUDGET_BYTES - paths_len);
     Some(RepoMap {
-        text,
+        text: render(&files, Some(&shown)),
         files: files.len(),
     })
 }
 
-/// `max`: the deepest `Depth` to include; `None` renders only paths.
-fn render(files: &[File], max: Option<Depth>) -> String {
+/// `shown[file][def]`: which definitions to list; `None` renders only paths.
+fn render(files: &[File], shown: Option<&[Vec<bool>]>) -> String {
     let mut out = String::new();
-    for f in files {
+    for (i, f) in files.iter().enumerate() {
         path_line(&mut out, f);
-        let Some(max) = max else {
+        let Some(shown) = shown else {
             continue;
         };
-        for d in f.defs.iter().filter(|d| d.depth <= max) {
-            let indent = if d.depth == Depth::TopLevel {
-                "  "
-            } else {
-                "    "
-            };
-            let _ = writeln!(out, "{indent}{}: {}", d.line, d.text);
+        for (d, _) in f.defs.iter().zip(&shown[i]).filter(|(_, s)| **s) {
+            out.push_str(&def_line(d));
         }
     }
     out
+}
+
+fn def_line(d: &Def) -> String {
+    let indent = if d.depth == Depth::TopLevel {
+        "  "
+    } else {
+        "    "
+    };
+    format!("{indent}{}: {}\n", d.line, d.text)
+}
+
+/// Takes definitions in priority order while they fit. Stops at the first one that doesn't,
+/// so a container (which scores at least as high as its members and comes first) is never
+/// skipped while its members are shown.
+fn select(files: &[File], budget: usize) -> Vec<Vec<bool>> {
+    let priority = priorities(files);
+    let mut order: Vec<(usize, usize)> = files
+        .iter()
+        .enumerate()
+        .flat_map(|(i, f)| (0..f.defs.len()).map(move |d| (i, d)))
+        .collect();
+    // Stable, so ties keep file and line order.
+    order.sort_by(|&(a, x), &(b, y)| priority[b][y].total_cmp(&priority[a][x]));
+    let mut shown: Vec<Vec<bool>> = files.iter().map(|f| vec![false; f.defs.len()]).collect();
+    let mut used = 0;
+    for (i, d) in order {
+        let len = def_line(&files[i].defs[d]).len();
+        if used + len > budget {
+            break;
+        }
+        used += len;
+        shown[i][d] = true;
+    }
+    shown
+}
+
+struct Edge<'a> {
+    from: usize,
+    to: usize,
+    name: &'a str,
+    weight: f64,
+}
+
+fn priorities(files: &[File]) -> Vec<Vec<f64>> {
+    let mut definers: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (i, f) in files.iter().enumerate() {
+        for d in &f.defs {
+            let v = definers.entry(d.name.as_str()).or_default();
+            if v.last() != Some(&i) {
+                v.push(i);
+            }
+        }
+    }
+    let mut edges = Vec::new();
+    for (i, f) in files.iter().enumerate() {
+        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for r in &f.refs {
+            *counts.entry(r.as_str()).or_default() += 1;
+        }
+        for (name, count) in counts {
+            let Some(targets) = definers.get(name) else {
+                continue;
+            };
+            // Sublinear in repeats; a name defined in many files (`new`, `run`) says little
+            // about which of them is meant.
+            let weight = (count as f64).sqrt() / targets.len() as f64;
+            for &to in targets.iter().filter(|&&t| t != i) {
+                edges.push(Edge {
+                    from: i,
+                    to,
+                    name,
+                    weight,
+                });
+            }
+        }
+    }
+    let mut out_weight = vec![0.0; files.len()];
+    for e in &edges {
+        out_weight[e.from] += e.weight;
+    }
+    let rank = pagerank(&edges, &out_weight);
+
+    let mut inflow: BTreeMap<(usize, &str), f64> = BTreeMap::new();
+    for e in &edges {
+        *inflow.entry((e.to, e.name)).or_default() += rank[e.from] * e.weight / out_weight[e.from];
+    }
+    files
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let mut p: Vec<f64> = f
+                .defs
+                .iter()
+                .map(|d| {
+                    let depth = match d.depth {
+                        Depth::TopLevel => 1.0,
+                        Depth::Member => 0.5,
+                        Depth::TraitMember => 0.1,
+                    };
+                    rank[i] * depth + inflow.get(&(i, d.name.as_str())).unwrap_or(&0.0)
+                })
+                .collect();
+            // Members come after their container, so walking backwards carries scores up
+            // through nested containers.
+            for k in (0..f.defs.len()).rev() {
+                if let Some(c) = container(&f.defs, k) {
+                    p[c] = p[c].max(p[k]);
+                }
+            }
+            p
+        })
+        .collect()
+}
+
+pub(crate) fn container(defs: &[Def], k: usize) -> Option<usize> {
+    let d = &defs[k];
+    let parent = d.parent.as_ref()?;
+    defs.iter()
+        .enumerate()
+        .filter(|&(i, c)| i != k && &c.text == parent && c.start <= d.start && d.end <= c.end)
+        .min_by_key(|(_, c)| c.end - c.start)
+        .map(|(i, _)| i)
+}
+
+fn pagerank(edges: &[Edge], out_weight: &[f64]) -> Vec<f64> {
+    const DAMPING: f64 = 0.85;
+    let n = out_weight.len();
+    let mut rank = vec![1.0 / n as f64; n];
+    for _ in 0..30 {
+        let dangling: f64 = (0..n)
+            .filter(|&i| out_weight[i] == 0.0)
+            .map(|i| rank[i])
+            .sum();
+        let mut next = vec![(1.0 - DAMPING + DAMPING * dangling) / n as f64; n];
+        for e in edges {
+            next[e.to] += DAMPING * rank[e.from] * e.weight / out_weight[e.from];
+        }
+        rank = next;
+    }
+    rank
 }
 
 fn truncated_paths(files: &[File]) -> String {
@@ -141,8 +279,13 @@ fn path_line(out: &mut String, f: &File) {
 }
 
 pub(crate) fn defs(ctx: &mut TagsContext, config: &TagsConfiguration, src: &str) -> Vec<Def> {
+    tags(ctx, config, src).0
+}
+
+/// Definitions and referenced names, both outside test modules.
+fn tags(ctx: &mut TagsContext, config: &TagsConfiguration, src: &str) -> (Vec<Def>, Vec<String>) {
     let Ok((tags, _)) = ctx.generate_tags(config, src.as_bytes(), None) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let newlines: Vec<usize> = src.match_indices('\n').map(|(i, _)| i).collect();
     let line_of = |byte: usize| newlines.partition_point(|&i| i < byte) + 1;
@@ -150,8 +293,12 @@ pub(crate) fn defs(ctx: &mut TagsContext, config: &TagsConfiguration, src: &str)
     let mut trait_impls: Vec<Range<usize>> = Vec::new();
     let mut containers: Vec<(Range<usize>, String)> = Vec::new();
     let mut found: Vec<(Range<usize>, Def)> = Vec::new();
+    let mut refs: Vec<(Range<usize>, String)> = Vec::new();
     for tag in tags.flatten() {
         let kind = config.syntax_type_name(tag.syntax_type_id);
+        if !tag.is_definition {
+            refs.push((tag.range.clone(), src[tag.name_range.clone()].to_string()));
+        }
         // Impl blocks are only references in the Rust query, but they tell which type the
         // following methods belong to.
         if !tag.is_definition && kind != "implementation" {
@@ -205,7 +352,12 @@ pub(crate) fn defs(ctx: &mut TagsContext, config: &TagsConfiguration, src: &str)
         .collect();
     defs.sort_by_key(|d| d.line);
     defs.dedup_by_key(|d| d.line);
-    defs
+    let refs = refs
+        .into_iter()
+        .filter(|(r, _)| !within(r, &tests))
+        .map(|(_, n)| n)
+        .collect();
+    (defs, refs)
 }
 
 fn within(r: &Range<usize>, outer: &[Range<usize>]) -> bool {
@@ -217,6 +369,21 @@ pub(crate) fn languages() -> &'static Languages {
     static LANGS: OnceLock<Languages> = OnceLock::new();
     LANGS.get_or_init(Languages::new)
 }
+
+const RUST_CONSTS_QUERY: &str = r#"
+(source_file (const_item name: (identifier) @name) @definition.constant)
+(source_file (static_item name: (identifier) @name) @definition.constant)
+(declaration_list (const_item name: (identifier) @name) @definition.constant)
+(declaration_list (static_item name: (identifier) @name) @definition.constant)
+"#;
+
+/// The stock query only sees plain and method calls; types and `Type::f()` paths carry most
+/// of the cross-file links in Rust.
+const RUST_REFS_QUERY: &str = r#"
+(call_expression function: (scoped_identifier name: (identifier) @name)) @reference.call
+(scoped_identifier path: (identifier) @name) @reference.type
+(type_identifier) @name @reference.type
+"#;
 
 pub(crate) struct Languages {
     rust: Option<TagsConfiguration>,
@@ -235,13 +402,16 @@ impl Languages {
             tree_sitter_javascript::TAGS_QUERY,
             tree_sitter_typescript::TAGS_QUERY
         );
+        // The stock Rust query has no consts/statics, which often hold tables worth reading.
+        // Anchored to items and impl/mod bodies so locals inside function bodies stay out.
+        let rust_query = format!(
+            "{}\n{RUST_CONSTS_QUERY}\n{RUST_REFS_QUERY}",
+            tree_sitter_rust::TAGS_QUERY
+        );
         let config =
             |lang: tree_sitter::Language, query: &str| TagsConfiguration::new(lang, query, "").ok();
         Self {
-            rust: config(
-                tree_sitter_rust::LANGUAGE.into(),
-                tree_sitter_rust::TAGS_QUERY,
-            ),
+            rust: config(tree_sitter_rust::LANGUAGE.into(), &rust_query),
             go: config(tree_sitter_go::LANGUAGE.into(), tree_sitter_go::TAGS_QUERY),
             js: config(
                 tree_sitter_javascript::LANGUAGE.into(),
