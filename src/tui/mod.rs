@@ -2,6 +2,8 @@ mod app;
 mod commands;
 mod ui;
 
+use std::io::Write;
+
 use anyhow::Result;
 use crossterm::event::EventStream;
 use futures::StreamExt;
@@ -16,9 +18,20 @@ pub async fn run(config: Config, tools: ToolRegistry) -> Result<()> {
     let (tx, rx) = mpsc::unbounded_channel();
     let app = App::new(config, tools, tx)?;
     let mut terminal = ratatui::init();
+    set_alternate_scroll(true)?;
     let res = event_loop(&mut terminal, app, rx).await;
+    let _ = set_alternate_scroll(false);
     ratatui::restore();
     res
+}
+
+/// Alternate scroll mode: the terminal sends the wheel as Up/Down keys. Unlike mouse capture,
+/// this leaves native text selection working without Shift.
+fn set_alternate_scroll(on: bool) -> std::io::Result<()> {
+    let seq: &[u8] = if on { b"\x1b[?1007h" } else { b"\x1b[?1007l" };
+    let mut out = std::io::stdout();
+    out.write_all(seq)?;
+    out.flush()
 }
 
 async fn event_loop(
@@ -29,7 +42,7 @@ async fn event_loop(
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(100));
     while !app.quit {
-        terminal.draw(|f| ui::draw(f, &app))?;
+        terminal.draw(|f| ui::draw(f, &mut app))?;
         tokio::select! {
             Some(ev) = events.next() => app.on_term_event(ev?),
             Some((id, ev)) = rx.recv() => app.on_agent_event(id, ev),

@@ -44,6 +44,7 @@ pub struct Run {
     pub cut: ContextCut,
     pub tools: Arc<ToolRegistry>,
     pub instructions: Option<Arc<str>>,
+    pub repo_map: Option<Arc<str>>,
     pub extra: Option<Value>,
 }
 
@@ -56,7 +57,12 @@ pub async fn run(mut r: Run, tx: UnboundedSender<(u64, AgentEvent)>, run_id: u64
     let mut scale = 1.0_f64;
     let mut retried = false;
     'turn: loop {
-        let system = system_prompt(r.mode, &r.tools, r.instructions.as_deref());
+        let system = system_prompt(
+            r.mode,
+            &r.tools,
+            r.instructions.as_deref(),
+            r.repo_map.as_deref(),
+        );
         let tools = r.tools.specs(r.mode);
         let fixed = estimate_tokens(&system)
             + tools
@@ -67,13 +73,14 @@ pub async fn run(mut r: Run, tx: UnboundedSender<(u64, AgentEvent)>, run_id: u64
                         + estimate_tokens(&t.parameters.to_string())
                 })
                 .sum::<usize>();
+        let history = elide_old_outputs(&r.history);
         let history = match context_window {
             Some(ctx) => {
                 let reserve = r.model.max_tokens.unwrap_or(DEFAULT_OUTPUT_RESERVE);
                 let budget = (ctx.saturating_sub(reserve) as f64 / scale) as usize;
-                fit_context(&r.history, budget.saturating_sub(fixed), &mut r.cut)
+                fit_context(&history, budget.saturating_sub(fixed), &mut r.cut)
             }
-            None => r.history.clone(),
+            None => history,
         };
         let estimated = fixed + history.iter().map(message_tokens).sum::<usize>();
         let mut messages = vec![Message::System(system)];
@@ -150,6 +157,7 @@ pub async fn run(mut r: Run, tx: UnboundedSender<(u64, AgentEvent)>, run_id: u64
                 Ok(out) => (out, false),
                 Err(e) => (format!("error: {e:#}"), true),
             };
+            let output = cap_output(output);
             send(AgentEvent::ToolResult {
                 output: output.clone(),
                 is_error,
@@ -223,7 +231,10 @@ impl ContextCut {
     fn apply(&self, history: &[Message]) -> Vec<Message> {
         let mut out = history[self.start.min(history.len())..].to_vec();
         for &(i, keep) in &self.truncated {
-            if let Some(Message::Tool { content, .. }) = out.get_mut(i) {
+            // The message may have been elided since the cut was made.
+            if let Some(Message::Tool { content, .. }) = out.get_mut(i)
+                && keep < content.len()
+            {
                 content.truncate(keep);
                 content.push_str(TRUNCATED_MARK);
             }
@@ -283,7 +294,57 @@ fn trim(history: &[Message], budget: usize) -> ContextCut {
     ContextCut { start, truncated }
 }
 
-fn system_prompt(mode: Mode, tools: &ToolRegistry, instructions: Option<&str>) -> String {
+/// Tool outputs from finished turns (followed by a later user message) longer than this are
+/// replaced with `ELIDED_MARK`. The view changes only when a new turn starts, so within a turn
+/// the sent prefix stays byte-identical and the server's KV cache stays valid.
+const ELIDE_MIN_BYTES: usize = 200;
+const ELIDED_MARK: &str = "[output from an earlier turn elided; re-run the tool if needed]";
+
+fn elide_old_outputs(history: &[Message]) -> Vec<Message> {
+    let last_user = history
+        .iter()
+        .rposition(|m| matches!(m, Message::User(_)))
+        .unwrap_or(0);
+    history
+        .iter()
+        .enumerate()
+        .map(|(i, m)| match m {
+            Message::Tool { call_id, content }
+                if i < last_user && content.len() > ELIDE_MIN_BYTES =>
+            {
+                Message::Tool {
+                    call_id: call_id.clone(),
+                    content: ELIDED_MARK.into(),
+                }
+            }
+            _ => m.clone(),
+        })
+        .collect()
+}
+
+/// Backstop for tools that return more than their own limits should allow.
+const MAX_TOOL_OUTPUT: usize = 16_000;
+
+fn cap_output(mut s: String) -> String {
+    if s.len() <= MAX_TOOL_OUTPUT {
+        return s;
+    }
+    let total = s.len();
+    let mut keep = MAX_TOOL_OUTPUT;
+    while !s.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    s.truncate(keep);
+    s.push_str(&format!("\n…[output truncated: {keep} of {total} bytes]"));
+    s
+}
+
+fn system_prompt(
+    mode: Mode,
+    tools: &ToolRegistry,
+    instructions: Option<&str>,
+    repo_map: Option<&str>,
+) -> String {
     let cwd = tools.root().display();
     let task = match mode {
         Mode::Plan => {
@@ -296,11 +357,22 @@ fn system_prompt(mode: Mode, tools: &ToolRegistry, instructions: Option<&str>) -
         }
     };
     let mut prompt = format!(
-        "You are a coding agent working in `{cwd}`. All paths are relative to it.\n{task}\nBe concise."
+        "You are a coding agent working in `{cwd}`. All paths are relative to it.\n{task}\nBe concise. When showing code from files, quote it verbatim; put explanations \
+         outside the code block."
     );
     if let Some(text) = instructions {
         prompt.push_str("\n\n# Project instructions (AGENTS.md)\n\n");
         prompt.push_str(text.trim());
+    }
+    if let Some(map) = repo_map {
+        prompt.push_str(
+            "\n\n# Repository map\n\nFiles with line counts and their definitions as `line: declaration`. \
+             Consult it before searching: if a symbol you need is listed, go straight to read_symbol with \
+             its name instead of grepping for it. Use grep only for what the map does not show \
+             (usages, string literals, symbols missing from the map). It may be stale: if the line \
+             does not match, fall back to grep.\n\n",
+        );
+        prompt.push_str(map);
     }
     prompt
 }

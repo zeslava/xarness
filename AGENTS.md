@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```sh
 cargo build
 cargo run                      # launches the TUI in the current dir (needs a config, see below)
-cargo test                     # unit tests (currently only in src/tools/edit.rs)
+cargo test                     # unit tests
 cargo test <name>              # single test by name substring
 cargo clippy --all-targets
 cargo fmt
@@ -21,7 +21,13 @@ The working directory at launch becomes the sandbox root for all tools.
 
 ## Config
 
-Loaded from the first existing of: `./.xarness.toml`, `./.xarness.json`, `~/.config/xarness/config.{toml,json}`. See `.xarness.json` for an example.
+Three layers, each the first existing of its candidates, merged in order (later overrides earlier key by key; objects merge recursively, arrays such as `models` are replaced whole):
+
+1. global: `<config_dir>/xarness/config.{toml,json}` (`dirs::config_dir()`, `~/.config` on Linux)
+2. project: `./.xarness/config.{toml,json}`, or the old `./.xarness.{toml,json}`
+3. local: `./.xarness/config.local.{toml,json}` — gitignored, for keys and personal endpoints
+
+See `.xarness/config.json` for an example.
 
 - Models are addressed as `provider/model`; split on the **first** `/` only, since model ids may contain `/`.
 - `context_window` enables history trimming; without it, full history is sent.
@@ -42,3 +48,4 @@ Hexagonal layout:
 - **History is committed atomically**: the agent sends `AgentEvent::Commit` with the assistant message plus all its tool results together, so an interrupted run (Esc aborts the task) never leaves dangling tool calls. The TUI ignores events whose `run_id` is stale.
 - **Context fitting** (`agent.rs`): token counts are estimated at ~3 chars/token, then corrected by a `scale` factor from server-reported `prompt_tokens`. `fit_context` drops whole turns from the front (a turn starts at a `User` message), then truncates oldest tool outputs. On `ContextOverflow` with no text yet streamed, it recalibrates and retries the turn once.
 - The system prompt is rebuilt each turn from the current `Mode`. `AGENTS.md` from the working directory (only there, no parent/subdir lookup) is read once in `App::new` and appended to it.
+- `repomap.rs` builds a repo map (files + tree-sitter tag definitions, Rust/Go/JS/TS) appended to the system prompt. It is built only in `App::new` and on `/map`, never per turn, so the prompt prefix stays byte-identical for the server's KV cache. Over budget it degrades by `Depth` (trait-impl methods → all members → paths only → truncated paths).

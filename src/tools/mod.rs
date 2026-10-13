@@ -2,6 +2,7 @@ mod edit;
 mod grep;
 mod ls;
 mod read;
+mod symbol;
 mod write;
 
 use std::path::{Component, Path, PathBuf};
@@ -24,6 +25,7 @@ impl ToolRegistry {
             root,
             tools: vec![
                 Box::new(read::ReadFile),
+                Box::new(symbol::ReadSymbol),
                 Box::new(ls::ListDir),
                 Box::new(grep::Grep),
                 Box::new(write::WriteFile),

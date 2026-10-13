@@ -11,6 +11,7 @@ use crate::agent::{self, AgentEvent, ContextCut, Run};
 use crate::config::{Config, ModelConfig};
 use crate::domain::message::{Message, Mode};
 use crate::domain::ports::LlmProvider;
+use crate::repomap;
 use crate::tools::ToolRegistry;
 
 pub enum Entry {
@@ -43,6 +44,8 @@ pub struct App {
     tools: Arc<ToolRegistry>,
     /// Contents of AGENTS.md in the working directory, read once at startup.
     instructions: Option<Arc<str>>,
+    /// Built at startup and on `/map` only, so the system prompt prefix stays cacheable.
+    repo_map: Option<Arc<str>>,
     pub mode: Mode,
     history: Vec<Message>,
     cut: ContextCut,
@@ -53,10 +56,14 @@ pub struct App {
     pub cursor: usize,
     /// Submitted inputs, slash commands included; survives `/clear` like shell history.
     sent: Vec<String>,
-    /// While browsing `sent` with Up/Down: how many entries back from the newest (0 = newest).
+    /// While browsing `sent` with Ctrl+P/Ctrl+N: how many entries back from the newest (0 = newest).
     recall: Option<usize>,
+    /// Selected row of the slash-command completion popup.
+    pub completion: usize,
     /// Lines scrolled up from the bottom of the log.
     pub scroll: u16,
+    /// Log viewport height from the last draw, for page scrolling.
+    pub log_height: u16,
     /// Spinner frame counter, advanced only while a run is active.
     pub tick: usize,
     running: Option<JoinHandle<()>>,
@@ -76,6 +83,7 @@ impl App {
         let instructions = std::fs::read_to_string(tools.root().join("AGENTS.md"))
             .ok()
             .map(Arc::from);
+        let repo_map = repomap::build(tools.root()).map(|m| Arc::from(m.text));
         Ok(Self {
             config,
             provider_name,
@@ -84,6 +92,7 @@ impl App {
             provider,
             tools: Arc::new(tools),
             instructions,
+            repo_map,
             mode: Mode::Plan,
             history: Vec::new(),
             cut: ContextCut::default(),
@@ -93,7 +102,9 @@ impl App {
             cursor: 0,
             sent: Vec::new(),
             recall: None,
+            completion: 0,
             scroll: 0,
+            log_height: 0,
             tick: 0,
             running: None,
             run_id: 0,
@@ -124,15 +135,56 @@ impl App {
 
     fn on_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        if matches!(
-            key.code,
-            KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete
-        ) {
+        if !ctrl
+            && matches!(
+                key.code,
+                KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete
+            )
+        {
             // Editing a recalled entry turns it into ordinary input.
             self.recall = None;
+            self.completion = 0;
+        }
+        let completions = self.completions();
+        if !completions.is_empty() {
+            let n = completions.len();
+            let selected = completions[self.completion.min(n - 1)].0;
+            match key.code {
+                KeyCode::Up => {
+                    self.completion = (self.completion + n - 1) % n;
+                    return;
+                }
+                KeyCode::Down => {
+                    self.completion = (self.completion + 1) % n;
+                    return;
+                }
+                KeyCode::Tab => {
+                    self.input = format!("/{selected} ");
+                    self.cursor = self.input.chars().count();
+                    return;
+                }
+                KeyCode::Enter => self.input = format!("/{selected}"),
+                _ => {}
+            }
         }
         match key.code {
             KeyCode::Char('c') if ctrl => self.quit = true,
+            KeyCode::Char('p') if ctrl => match self.recall {
+                Some(n) if n + 1 < self.sent.len() => self.show_recalled(n + 1),
+                Some(_) => {}
+                // Don't clobber text being typed.
+                None if self.input.is_empty() && !self.sent.is_empty() => self.show_recalled(0),
+                None => {}
+            },
+            KeyCode::Char('n') if ctrl => match self.recall {
+                Some(0) => {
+                    self.recall = None;
+                    self.input.clear();
+                    self.cursor = 0;
+                }
+                Some(n) => self.show_recalled(n - 1),
+                None => {}
+            },
             KeyCode::Esc => self.interrupt(),
             KeyCode::Enter => self.submit(),
             KeyCode::BackTab => self.set_mode(self.mode.toggle()),
@@ -154,26 +206,21 @@ impl App {
             KeyCode::Right => self.cursor = (self.cursor + 1).min(self.input.chars().count()),
             KeyCode::Home => self.cursor = 0,
             KeyCode::End => self.cursor = self.input.chars().count(),
-            // Up/Down browse history when the input is empty or already recalled, else scroll.
-            KeyCode::Up => match self.recall {
-                Some(n) if n + 1 < self.sent.len() => self.show_recalled(n + 1),
-                Some(_) => {}
-                None if self.input.is_empty() && self.scroll == 0 && !self.sent.is_empty() => {
-                    self.show_recalled(0)
-                }
-                None => self.scroll = self.scroll.saturating_add(1),
-            },
-            KeyCode::Down => match self.recall {
-                Some(0) => {
-                    self.recall = None;
-                    self.input.clear();
-                    self.cursor = 0;
-                }
-                Some(n) => self.show_recalled(n - 1),
-                None => self.scroll = self.scroll.saturating_sub(1),
-            },
+            // The terminal sends the mouse wheel as Up/Down (alternate scroll mode).
+            KeyCode::Up => self.scroll = self.scroll.saturating_add(1),
+            KeyCode::Down => self.scroll = self.scroll.saturating_sub(1),
+            KeyCode::PageUp => self.scroll = self.scroll.saturating_add(self.page()),
+            KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(self.page()),
             _ => {}
         }
+    }
+
+    pub fn completions(&self) -> Vec<(&'static str, &'static str)> {
+        commands::complete(&self.input)
+    }
+
+    fn page(&self) -> u16 {
+        self.log_height.saturating_sub(1).max(1)
     }
 
     fn show_recalled(&mut self, n: usize) {
@@ -226,6 +273,7 @@ impl App {
             cut: self.cut.clone(),
             tools: self.tools.clone(),
             instructions: self.instructions.clone(),
+            repo_map: self.repo_map.clone(),
             extra: self.think_patch(),
         };
         self.running = Some(tokio::spawn(agent::run(run, self.tx.clone(), self.run_id)));
@@ -314,6 +362,26 @@ impl App {
                         )));
                     }
                 }
+            }
+            Command::Map => {
+                let map = repomap::build(self.tools.root());
+                let msg = match &map {
+                    Some(m) => format!(
+                        "repo map rebuilt: {} files, ~{} tokens",
+                        m.files,
+                        m.text.len() / 3
+                    ),
+                    None => "repo map: no files".into(),
+                };
+                self.repo_map = map.map(|m| Arc::from(m.text));
+                self.log.push(Entry::Info(msg));
+            }
+            Command::MapShow => {
+                let msg = match &self.repo_map {
+                    Some(m) => m.to_string(),
+                    None => "repo map: none".into(),
+                };
+                self.log.push(Entry::Info(msg));
             }
             Command::Clear => {
                 self.interrupt();

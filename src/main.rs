@@ -2,6 +2,7 @@ mod adapters;
 mod agent;
 mod config;
 mod domain;
+mod repomap;
 mod tools;
 mod tui;
 

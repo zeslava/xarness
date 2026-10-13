@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use indexmap::IndexMap;
@@ -62,33 +62,45 @@ impl ProviderConfig {
 }
 
 impl Config {
+    /// Merges the global, project and local layers, later ones overriding earlier ones key by
+    /// key. Objects merge recursively; anything else, arrays included, is replaced, so a layer
+    /// that redefines a provider's `models` replaces the whole list.
     pub fn load() -> Result<Self> {
-        let path = Self::locate().ok_or_else(|| {
-            anyhow!(
-                "config not found: create ./.xarness.{{toml,json}} or ~/.config/xarness/config.{{toml,json}}"
-            )
-        })?;
-        let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        let parsed = if path.extension().is_some_and(|e| e == "json") {
-            serde_json::from_str(&raw).map_err(anyhow::Error::from)
-        } else {
-            toml::from_str(&raw).map_err(anyhow::Error::from)
-        };
-        parsed.with_context(|| format!("parsing {}", path.display()))
-    }
-
-    fn locate() -> Option<PathBuf> {
         let global = dirs::config_dir().map(|d| d.join("xarness"));
-        [".xarness.toml", ".xarness.json"]
-            .into_iter()
+        let layers = [
+            global
+                .iter()
+                .flat_map(|d| [d.join("config.toml"), d.join("config.json")])
+                .collect(),
+            // `.xarness.{toml,json}` in the root is the old location, still read.
+            [
+                ".xarness/config.toml",
+                ".xarness/config.json",
+                ".xarness.toml",
+                ".xarness.json",
+            ]
             .map(PathBuf::from)
-            .chain(
-                global
-                    .into_iter()
-                    .flat_map(|d| [d.join("config.toml"), d.join("config.json")]),
-            )
-            .find(|p| p.is_file())
+            .to_vec(),
+            [".xarness/config.local.toml", ".xarness/config.local.json"]
+                .map(PathBuf::from)
+                .to_vec(),
+        ];
+        let mut merged: Option<Value> = None;
+        for path in layers
+            .iter()
+            .filter_map(|candidates: &Vec<PathBuf>| candidates.iter().find(|p| p.is_file()))
+        {
+            let layer = read_layer(path)?;
+            match &mut merged {
+                Some(m) => merge(m, layer),
+                None => merged = Some(layer),
+            }
+        }
+        let merged = merged.ok_or_else(|| {
+            let global = global.map_or("<config dir>/xarness".into(), |d| d.display().to_string());
+            anyhow!("config not found: create ./.xarness/config.{{toml,json}} or {global}/config.{{toml,json}}")
+        })?;
+        serde_json::from_value(merged).context("invalid config")
     }
 
     /// `spec` is `provider/model`; the model id itself may contain `/` (e.g. litellm's `openai/gpt-4o`).
@@ -124,5 +136,60 @@ impl Config {
         self.providers
             .iter()
             .flat_map(|(p, cfg)| cfg.models.iter().map(move |m| format!("{p}/{}", m.id)))
+    }
+}
+
+fn read_layer(path: &Path) -> Result<Value> {
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let parsed = if path.extension().is_some_and(|e| e == "json") {
+        serde_json::from_str(&raw).map_err(anyhow::Error::from)
+    } else {
+        toml::from_str(&raw).map_err(anyhow::Error::from)
+    };
+    parsed.with_context(|| format!("parsing {}", path.display()))
+}
+
+fn merge(base: &mut Value, over: Value) {
+    match (base, over) {
+        (Value::Object(b), Value::Object(o)) => {
+            for (k, v) in o {
+                match b.get_mut(&k) {
+                    Some(slot) => merge(slot, v),
+                    None => {
+                        b.insert(k, v);
+                    }
+                }
+            }
+        }
+        (b, o) => *b = o,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn merge_overrides_by_key() {
+        let mut base = json!({
+            "default": "a/x",
+            "providers": { "a": { "base_url": "http://a", "models": [{ "id": "x" }, { "id": "y" }] } }
+        });
+        merge(
+            &mut base,
+            json!({ "default": "a/z", "providers": { "a": { "models": [{ "id": "z" }] }, "b": { "base_url": "http://b" } } }),
+        );
+        assert_eq!(
+            base,
+            json!({
+                "default": "a/z",
+                "providers": {
+                    "a": { "base_url": "http://a", "models": [{ "id": "z" }] },
+                    "b": { "base_url": "http://b" }
+                }
+            })
+        );
     }
 }

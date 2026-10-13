@@ -1,8 +1,8 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Position};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use super::app::{App, Entry};
 use crate::domain::message::Mode;
@@ -11,7 +11,7 @@ const TOOL_OUTPUT_PREVIEW: usize = 8;
 const MAX_INPUT_ROWS: usize = 6;
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-pub fn draw(f: &mut Frame, app: &App) {
+pub fn draw(f: &mut Frame, app: &mut App) {
     let width = f.area().width.saturating_sub(2).max(1) as usize;
     let input_rows = input_lines(&app.input, width)
         .len()
@@ -26,8 +26,12 @@ pub fn draw(f: &mut Frame, app: &App) {
     let log = Paragraph::new(log_text(app)).wrap(Wrap { trim: false });
     let total = log.line_count(log_area.width) as u16;
     let max_scroll = total.saturating_sub(log_area.height);
+    // Clamp so scrolling past the top doesn't need as many presses to come back.
+    app.scroll = app.scroll.min(max_scroll);
+    app.log_height = log_area.height;
     let offset = max_scroll.saturating_sub(app.scroll);
     f.render_widget(log.scroll((offset, 0)), log_area);
+    completion_popup(f, app, log_area);
 
     let rows = input_lines(&app.input, width);
     let (cur_row, cur_col) = (app.cursor / width, app.cursor % width);
@@ -70,6 +74,34 @@ pub fn draw(f: &mut Frame, app: &App) {
         input_area.y + 1 + (cur_row - first) as u16,
     ));
     f.render_widget(status_line(app), status_area);
+}
+
+/// Drawn over the bottom of the log, right above the input.
+fn completion_popup(f: &mut Frame, app: &App, log_area: Rect) {
+    let items = app.completions();
+    if items.is_empty() {
+        return;
+    }
+    let selected = app.completion.min(items.len() - 1);
+    let name_width = items.iter().map(|(n, _)| n.len()).max().unwrap_or(0) + 1;
+    let lines: Vec<Line> = items
+        .iter()
+        .enumerate()
+        .map(|(i, (name, desc))| {
+            let line = Line::from(vec![
+                Span::raw(format!(" /{name:<name_width$}")),
+                Span::styled(format!(" {desc} "), Style::new().dim()),
+            ]);
+            if i == selected { line.reversed() } else { line }
+        })
+        .collect();
+    let height = (lines.len() as u16).min(log_area.height);
+    let width = (lines.iter().map(Line::width).max().unwrap_or(0) as u16).min(log_area.width);
+    let area = Rect::new(log_area.x, log_area.bottom() - height, width, height);
+    f.render_widget(Clear, area);
+    // Keep the selected row visible when the log area is too short for all of them.
+    let skip = (selected as u16 + 1).saturating_sub(height);
+    f.render_widget(Paragraph::new(lines).scroll((skip, 0)), area);
 }
 
 /// Hard-wrap by chars so the cursor position is trivially computable.
@@ -145,7 +177,10 @@ fn log_text(app: &App) -> Text<'static> {
             }
             Entry::Tool { name, arguments } => lines.push(Line::from(vec![
                 Span::styled(format!("⚙ {name} "), Style::new().fg(Color::Magenta).bold()),
-                Span::styled(truncate(arguments, 200), Style::new().dim()),
+                Span::styled(
+                    truncate(&tool_summary(name, arguments), 200),
+                    Style::new().dim(),
+                ),
             ])),
             Entry::ToolOutput { text, is_error } => {
                 let style = if *is_error {
@@ -176,6 +211,54 @@ fn log_text(app: &App) -> Text<'static> {
         lines.push(Line::default());
     }
     Text::from(lines)
+}
+
+/// Human-readable form of tool arguments; falls back to raw JSON for unknown
+/// tools or arguments that don't parse.
+fn tool_summary(name: &str, arguments: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(arguments) else {
+        return arguments.to_string();
+    };
+    let str_arg = |k: &str| v.get(k).and_then(|x| x.as_str());
+    let path = str_arg("path");
+    match (name, path) {
+        ("read_file", Some(p)) => {
+            let offset = v.get("offset").and_then(|x| x.as_u64());
+            let limit = v.get("limit").and_then(|x| x.as_u64());
+            match (offset, limit) {
+                (Some(o), Some(l)) => format!("{p}:{o}-{}", o + l.saturating_sub(1)),
+                (Some(o), None) => format!("{p}:{o}-"),
+                (None, Some(l)) => format!("{p}:1-{l}"),
+                (None, None) => p.to_string(),
+            }
+        }
+        ("read_symbol", Some(p)) => match v.get("name") {
+            Some(serde_json::Value::String(n)) => format!("{n} in {p}"),
+            Some(serde_json::Value::Array(ns)) => {
+                let ns: Vec<&str> = ns.iter().filter_map(|n| n.as_str()).collect();
+                format!("{} in {p}", ns.join(", "))
+            }
+            // Small files come back whole, so "outline" would be misleading.
+            _ => p.to_string(),
+        },
+        ("grep", _) => match str_arg("pattern") {
+            Some(pat) => format!("/{pat}/ in {}", path.unwrap_or(".")),
+            None => arguments.to_string(),
+        },
+        ("list_dir", _) => path.unwrap_or(".").to_string(),
+        ("write_file", Some(p)) => match str_arg("content") {
+            Some(c) => format!("{p} ({} lines)", c.lines().count()),
+            None => p.to_string(),
+        },
+        ("edit_file", Some(p)) => {
+            if v.get("replace_all").and_then(|x| x.as_bool()) == Some(true) {
+                format!("{p} (replace all)")
+            } else {
+                p.to_string()
+            }
+        }
+        _ => arguments.to_string(),
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
