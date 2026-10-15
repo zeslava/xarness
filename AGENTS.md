@@ -27,7 +27,7 @@ Three layers, each the first existing of its candidates, merged in order (later 
 2. project: `./.xarness/config.{toml,json}`
 3. local: `./.xarness/config.local.{toml,json}` — gitignored, for keys and personal endpoints
 
-See `.xarness/config.json` for an example.
+The schema is defined in `src/config.rs`.
 
 - Models are addressed as `provider/model`; split on the **first** `/` only, since model ids may contain `/`.
 - `context_window` enables history trimming; without it, the provider is asked (llama.cpp `/props` → `n_ctx`, fetched each turn), and if that fails full history is sent.
