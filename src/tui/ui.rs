@@ -83,14 +83,14 @@ fn completion_popup(f: &mut Frame, app: &App, log_area: Rect) {
         return;
     }
     let selected = app.completion.min(items.len() - 1);
-    let name_width = items.iter().map(|(n, _)| n.len()).max().unwrap_or(0) + 1;
+    let name_width = items.iter().map(|c| c.label.len()).max().unwrap_or(0) + 1;
     let lines: Vec<Line> = items
         .iter()
         .enumerate()
-        .map(|(i, (name, desc))| {
+        .map(|(i, c)| {
             let line = Line::from(vec![
-                Span::raw(format!(" /{name:<name_width$}")),
-                Span::styled(format!(" {desc} "), Style::new().dim()),
+                Span::raw(format!(" {:<name_width$}", c.label)),
+                Span::styled(format!(" {} ", c.desc), Style::new().dim()),
             ]);
             if i == selected { line.reversed() } else { line }
         })
@@ -123,6 +123,19 @@ fn status_line(app: &App) -> Line<'static> {
         Span::styled(label, Style::new().fg(Color::Black).bg(color).bold()),
         Span::raw(format!(" {} ", app.model_label())),
     ];
+    if let Some(think) = &app.think {
+        spans.push(Span::styled(
+            format!("· think {think} "),
+            Style::new().fg(Color::DarkGray),
+        ));
+    }
+    if app.awaiting_approval() {
+        spans.push(Span::styled(
+            "run this command? [y]es  [a]lways this session  [n]o",
+            Style::new().fg(Color::Black).bg(Color::Magenta).bold(),
+        ));
+        return Line::from(spans);
+    }
     if let Some(u) = &app.usage {
         let mut s = format!("· ctx {}", kilo(u.used));
         let mut fg = Color::DarkGray;
@@ -153,7 +166,7 @@ fn kilo(n: u32) -> String {
 
 fn log_text(app: &App) -> Text<'static> {
     let mut lines: Vec<Line> = Vec::new();
-    for (i, entry) in app.log.iter().enumerate() {
+    for entry in app.log.iter() {
         match entry {
             Entry::User(t) => {
                 for (i, l) in t.lines().enumerate() {
@@ -163,13 +176,7 @@ fn log_text(app: &App) -> Text<'static> {
             }
             Entry::Assistant(t) => lines.extend(t.lines().map(|l| Line::from(l.to_string()))),
             Entry::Thinking => {
-                // Only the latest entry of an active run is still thinking.
-                let active = app.is_running() && i + 1 == app.log.len();
-                let icon = if active {
-                    SPINNER[app.tick % SPINNER.len()]
-                } else {
-                    "✻"
-                };
+                let icon = SPINNER[app.tick % SPINNER.len()];
                 lines.push(Line::styled(
                     format!("{icon} thinking"),
                     Style::new().fg(Color::Magenta).bold(),

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use indexmap::IndexMap;
 use serde::Deserialize;
 use serde_json::Value;
@@ -61,26 +61,24 @@ impl ProviderConfig {
     }
 }
 
+/// Written to the global layer on first run when no config exists anywhere.
+const DEFAULT_CONFIG: &str = "{\n  \"providers\": {}\n}\n";
+
 impl Config {
     /// Merges the global, project and local layers, later ones overriding earlier ones key by
     /// key. Objects merge recursively; anything else, arrays included, is replaced, so a layer
     /// that redefines a provider's `models` replaces the whole list.
     pub fn load() -> Result<Self> {
-        let global = dirs::config_dir().map(|d| d.join("xarness"));
+        // Not `dirs::config_dir()`: on macOS that is `~/Library/Application Support`.
+        let global = dirs::home_dir().map(|h| h.join(".config/xarness"));
         let layers = [
             global
                 .iter()
                 .flat_map(|d| [d.join("config.toml"), d.join("config.json")])
                 .collect(),
-            // `.xarness.{toml,json}` in the root is the old location, still read.
-            [
-                ".xarness/config.toml",
-                ".xarness/config.json",
-                ".xarness.toml",
-                ".xarness.json",
-            ]
-            .map(PathBuf::from)
-            .to_vec(),
+            [".xarness/config.toml", ".xarness/config.json"]
+                .map(PathBuf::from)
+                .to_vec(),
             [".xarness/config.local.toml", ".xarness/config.local.json"]
                 .map(PathBuf::from)
                 .to_vec(),
@@ -96,10 +94,15 @@ impl Config {
                 None => merged = Some(layer),
             }
         }
-        let merged = merged.ok_or_else(|| {
-            let global = global.map_or("<config dir>/xarness".into(), |d| d.display().to_string());
-            anyhow!("config not found: create ./.xarness/config.{{toml,json}} or {global}/config.{{toml,json}}")
-        })?;
+        let merged = merged.unwrap_or_else(|| {
+            // Best effort: the template only helps the user get started, a failure to write it
+            // must not stop the app from launching with no providers.
+            if let Some(dir) = &global {
+                let _ = std::fs::create_dir_all(dir)
+                    .and_then(|()| std::fs::write(dir.join("config.json"), DEFAULT_CONFIG));
+            }
+            Value::Object(Default::default())
+        });
         serde_json::from_value(merged).context("invalid config")
     }
 
@@ -120,16 +123,15 @@ impl Config {
         Ok((provider.to_string(), m.clone()))
     }
 
-    pub fn default_model(&self) -> Result<(String, ModelConfig)> {
+    /// `None` when no models are configured at all.
+    pub fn default_model(&self) -> Result<Option<(String, ModelConfig)>> {
         if let Some(spec) = &self.default {
-            return self.resolve_model(spec);
+            return self.resolve_model(spec).map(Some);
         }
-        for (name, p) in &self.providers {
-            if let Some(m) = p.models.first() {
-                return Ok((name.clone(), m.clone()));
-            }
-        }
-        bail!("no models configured")
+        Ok(self
+            .providers
+            .iter()
+            .find_map(|(name, p)| p.models.first().map(|m| (name.clone(), m.clone()))))
     }
 
     pub fn all_models(&self) -> impl Iterator<Item = String> + '_ {

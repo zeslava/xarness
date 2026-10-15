@@ -71,5 +71,9 @@ pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
     /// Tools that change the filesystem are only available in build mode.
     fn mutating(&self) -> bool;
+    /// Each call waits for the user's approval in the TUI.
+    fn needs_approval(&self) -> bool {
+        false
+    }
     fn run(&self, args: Value, root: &Path) -> anyhow::Result<String>;
 }

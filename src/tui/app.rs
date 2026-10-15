@@ -3,9 +3,10 @@ use std::sync::Arc;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use super::commands::{self, Command};
+use super::commands::{self, Command, Completion};
 use crate::adapters::build_provider;
 use crate::agent::{self, AgentEvent, ContextCut, Run};
 use crate::config::{Config, ModelConfig};
@@ -34,13 +35,31 @@ fn default_think(model: &ModelConfig) -> Option<String> {
     model.think.as_ref().and_then(|t| t.default.clone())
 }
 
+struct Active {
+    provider_name: String,
+    model: ModelConfig,
+    provider: Arc<dyn LlmProvider>,
+}
+
+impl Active {
+    fn new(config: &Config, provider_name: String, model: ModelConfig) -> Self {
+        Self {
+            provider: build_provider(&config.providers[&provider_name]),
+            provider_name,
+            model,
+        }
+    }
+}
+
+const NO_PROVIDERS: &str = "no providers configured: add one to ~/.config/xarness/config.json \
+     or ./.xarness/config.json, then restart";
+
 pub struct App {
     config: Config,
-    pub provider_name: String,
-    pub model: ModelConfig,
+    /// `None` until a provider with models is configured.
+    active: Option<Active>,
     /// Selected key of `model.think.levels`.
     pub think: Option<String>,
-    provider: Arc<dyn LlmProvider>,
     tools: Arc<ToolRegistry>,
     /// Contents of AGENTS.md in the working directory, read once at startup.
     instructions: Option<Arc<str>>,
@@ -67,6 +86,10 @@ pub struct App {
     /// Spinner frame counter, advanced only while a run is active.
     pub tick: usize,
     running: Option<JoinHandle<()>>,
+    /// A tool call waiting for y/a/n.
+    approval: Option<oneshot::Sender<bool>>,
+    /// Set by answering `a`: approve every call until the app exits.
+    approve_all: bool,
     run_id: u64,
     tx: UnboundedSender<(u64, AgentEvent)>,
     pub quit: bool,
@@ -78,18 +101,21 @@ impl App {
         tools: ToolRegistry,
         tx: UnboundedSender<(u64, AgentEvent)>,
     ) -> anyhow::Result<Self> {
-        let (provider_name, model) = config.default_model()?;
-        let provider = build_provider(&config.providers[&provider_name]);
+        let active = config
+            .default_model()?
+            .map(|(name, model)| Active::new(&config, name, model));
+        let log = match active {
+            Some(_) => Vec::new(),
+            None => vec![Entry::Info(NO_PROVIDERS.into())],
+        };
         let instructions = std::fs::read_to_string(tools.root().join("AGENTS.md"))
             .ok()
             .map(Arc::from);
         let repo_map = repomap::build(tools.root()).map(|m| Arc::from(m.text));
         Ok(Self {
+            think: active.as_ref().and_then(|a| default_think(&a.model)),
+            active,
             config,
-            provider_name,
-            think: default_think(&model),
-            model,
-            provider,
             tools: Arc::new(tools),
             instructions,
             repo_map,
@@ -97,7 +123,7 @@ impl App {
             history: Vec::new(),
             cut: ContextCut::default(),
             usage: None,
-            log: Vec::new(),
+            log,
             input: String::new(),
             cursor: 0,
             sent: Vec::new(),
@@ -107,10 +133,16 @@ impl App {
             log_height: 0,
             tick: 0,
             running: None,
+            approval: None,
+            approve_all: false,
             run_id: 0,
             tx,
             quit: false,
         })
+    }
+
+    pub fn awaiting_approval(&self) -> bool {
+        self.approval.is_some()
     }
 
     pub fn is_running(&self) -> bool {
@@ -118,11 +150,14 @@ impl App {
     }
 
     pub fn model_label(&self) -> String {
-        format!(
-            "{}/{}",
-            self.provider_name,
-            self.model.name.as_deref().unwrap_or(&self.model.id)
-        )
+        match &self.active {
+            Some(a) => format!(
+                "{}/{}",
+                a.provider_name,
+                a.model.name.as_deref().unwrap_or(&a.model.id)
+            ),
+            None => "no model".into(),
+        }
     }
 
     pub fn on_term_event(&mut self, ev: Event) {
@@ -135,6 +170,24 @@ impl App {
 
     fn on_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if let Some(reply) = self.approval.take() {
+            let answer = match key.code {
+                KeyCode::Char('y') => true,
+                KeyCode::Char('a') => {
+                    self.approve_all = true;
+                    true
+                }
+                KeyCode::Char('n') => false,
+                // Esc still interrupts; anything else leaves the question open.
+                KeyCode::Esc => return self.interrupt(),
+                _ => {
+                    self.approval = Some(reply);
+                    return;
+                }
+            };
+            let _ = reply.send(answer);
+            return;
+        }
         if !ctrl
             && matches!(
                 key.code,
@@ -148,7 +201,7 @@ impl App {
         let completions = self.completions();
         if !completions.is_empty() {
             let n = completions.len();
-            let selected = completions[self.completion.min(n - 1)].0;
+            let selected = &completions[self.completion.min(n - 1)].insert;
             match key.code {
                 KeyCode::Up => {
                     self.completion = (self.completion + n - 1) % n;
@@ -159,11 +212,11 @@ impl App {
                     return;
                 }
                 KeyCode::Tab => {
-                    self.input = format!("/{selected} ");
+                    self.input = selected.clone();
                     self.cursor = self.input.chars().count();
                     return;
                 }
-                KeyCode::Enter => self.input = format!("/{selected}"),
+                KeyCode::Enter => self.input = selected.clone(),
                 _ => {}
             }
         }
@@ -215,8 +268,40 @@ impl App {
         }
     }
 
-    pub fn completions(&self) -> Vec<(&'static str, &'static str)> {
-        commands::complete(&self.input)
+    pub fn completions(&self) -> Vec<Completion> {
+        commands::complete(&self.input, |name| self.arg_candidates(name))
+    }
+
+    fn arg_candidates(&self, command: &str) -> Vec<(String, String)> {
+        let mark = |current: bool| if current { "current" } else { "" }.to_string();
+        match command {
+            "think" => self
+                .active
+                .as_ref()
+                .and_then(|a| a.model.think.as_ref())
+                .map(|t| {
+                    t.levels
+                        .keys()
+                        .map(|l| (l.clone(), mark(Some(l) == self.think.as_ref())))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            "model" => {
+                let current = self
+                    .active
+                    .as_ref()
+                    .map(|a| format!("{}/{}", a.provider_name, a.model.id));
+                self.config
+                    .all_models()
+                    .map(|m| {
+                        let desc = mark(Some(&m) == current.as_ref());
+                        (m, desc)
+                    })
+                    .collect()
+            }
+            "map" => vec![("show".into(), "print the current map".into())],
+            _ => Vec::new(),
+        }
     }
 
     fn page(&self) -> u16 {
@@ -251,9 +336,15 @@ impl App {
             self.command(commands::parse(&text));
             return;
         }
-        if self.is_running() {
-            self.log
-                .push(Entry::Error("agent is busy; Esc to interrupt".into()));
+        let blocked = if self.active.is_none() {
+            Some(NO_PROVIDERS)
+        } else if self.is_running() {
+            Some("agent is busy; Esc to interrupt")
+        } else {
+            None
+        };
+        if let Some(msg) = blocked {
+            self.log.push(Entry::Error(msg.into()));
             self.input = text;
             self.cursor = self.input.chars().count();
             return;
@@ -264,10 +355,13 @@ impl App {
     }
 
     fn start_run(&mut self) {
+        let Some(active) = &self.active else {
+            return;
+        };
         self.run_id += 1;
         let run = Run {
-            provider: self.provider.clone(),
-            model: self.model.clone(),
+            provider: active.provider.clone(),
+            model: active.model.clone(),
             mode: self.mode,
             history: self.history.clone(),
             cut: self.cut.clone(),
@@ -281,15 +375,23 @@ impl App {
 
     fn think_patch(&self) -> Option<Value> {
         let level = self.think.as_ref()?;
-        self.model.think.as_ref()?.levels.get(level).cloned()
+        self.active
+            .as_ref()?
+            .model
+            .think
+            .as_ref()?
+            .levels
+            .get(level)
+            .cloned()
     }
 
     fn interrupt(&mut self) {
+        self.approval = None;
         if let Some(h) = self.running.take() {
             h.abort();
             // Invalidate events already queued by the aborted run.
             self.run_id += 1;
-            self.log.push(Entry::Info("interrupted".into()));
+            self.push_log(Entry::Info("interrupted".into()));
         }
     }
 
@@ -302,7 +404,11 @@ impl App {
             Command::Plan => self.set_mode(Mode::Plan),
             Command::Build => self.set_mode(Mode::Build),
             Command::Model(None) => {
-                let current = format!("{}/{}", self.provider_name, self.model.id);
+                let Some(active) = &self.active else {
+                    self.log.push(Entry::Info(NO_PROVIDERS.into()));
+                    return;
+                };
+                let current = format!("{}/{}", active.provider_name, active.model.id);
                 let list = self
                     .config
                     .all_models()
@@ -316,10 +422,8 @@ impl App {
             }
             Command::Model(Some(spec)) => match self.config.resolve_model(&spec) {
                 Ok((provider, model)) => {
-                    self.provider = build_provider(&self.config.providers[&provider]);
-                    self.provider_name = provider;
                     self.think = default_think(&model);
-                    self.model = model;
+                    self.active = Some(Active::new(&self.config, provider, model));
                     self.cut = ContextCut::default();
                     self.usage = None;
                     self.log
@@ -328,7 +432,7 @@ impl App {
                 Err(e) => self.log.push(Entry::Error(e.to_string())),
             },
             Command::Think(arg) => {
-                let Some(think) = &self.model.think else {
+                let Some(think) = self.active.as_ref().and_then(|a| a.model.think.as_ref()) else {
                     self.log.push(Entry::Error(
                         "no think levels configured for this model".into(),
                     ));
@@ -351,10 +455,7 @@ impl App {
                             .join("\n");
                         self.log.push(Entry::Info(list));
                     }
-                    Some(level) if think.levels.contains_key(&level) => {
-                        self.log.push(Entry::Info(format!("think: {level}")));
-                        self.think = Some(level);
-                    }
+                    Some(level) if think.levels.contains_key(&level) => self.think = Some(level),
                     Some(level) => {
                         let available = think.levels.keys().cloned().collect::<Vec<_>>().join(", ");
                         self.log.push(Entry::Error(format!(
@@ -405,7 +506,7 @@ impl App {
         match ev {
             AgentEvent::TextDelta(t) => match self.log.last_mut() {
                 Some(Entry::Assistant(s)) => s.push_str(&t),
-                _ => self.log.push(Entry::Assistant(t)),
+                _ => self.push_log(Entry::Assistant(t)),
             },
             AgentEvent::Thinking => {
                 if !matches!(self.log.last(), Some(Entry::Thinking)) {
@@ -413,12 +514,12 @@ impl App {
                 }
             }
             AgentEvent::ToolStart { name, arguments } => {
-                self.log.push(Entry::Tool { name, arguments })
+                self.push_log(Entry::Tool { name, arguments })
             }
             // Successful tool output is noise in the log; only errors are shown.
             AgentEvent::ToolResult { output, is_error } => {
                 if is_error {
-                    self.log.push(Entry::ToolOutput {
+                    self.push_log(Entry::ToolOutput {
                         text: output,
                         is_error,
                     })
@@ -439,8 +540,28 @@ impl App {
                     cached,
                 })
             }
-            AgentEvent::Error(e) => self.log.push(Entry::Error(e)),
-            AgentEvent::Finished => self.running = None,
+            AgentEvent::Approve(reply) if self.approve_all => {
+                let _ = reply.send(true);
+            }
+            AgentEvent::Approve(reply) => self.approval = Some(reply),
+            AgentEvent::Error(e) => self.push_log(Entry::Error(e)),
+            AgentEvent::Finished => {
+                self.drop_thinking();
+                self.running = None
+            }
         }
+    }
+
+    /// `Thinking` is only a live indicator: whatever comes next replaces it, so a finished run
+    /// leaves no empty "thinking" lines between tool calls.
+    fn drop_thinking(&mut self) {
+        if matches!(self.log.last(), Some(Entry::Thinking)) {
+            self.log.pop();
+        }
+    }
+
+    fn push_log(&mut self, entry: Entry) {
+        self.drop_thinking();
+        self.log.push(entry);
     }
 }

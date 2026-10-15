@@ -2,6 +2,7 @@ mod edit;
 mod grep;
 mod ls;
 mod read;
+mod run;
 mod symbol;
 mod write;
 
@@ -30,6 +31,7 @@ impl ToolRegistry {
                 Box::new(grep::Grep),
                 Box::new(write::WriteFile),
                 Box::new(edit::EditFile),
+                Box::new(run::RunCommand),
             ],
         }
     }
@@ -47,6 +49,12 @@ impl ToolRegistry {
 
     pub fn specs(&self, mode: Mode) -> Vec<ToolSpec> {
         self.available(mode).map(|t| t.spec()).collect()
+    }
+
+    pub fn needs_approval(&self, name: &str) -> bool {
+        self.tools
+            .iter()
+            .any(|t| t.spec().name == name && t.needs_approval())
     }
 
     pub fn run(&self, mode: Mode, name: &str, arguments: &str) -> Result<String> {

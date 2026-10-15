@@ -25,23 +25,58 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("quit", "exit"),
 ];
 
-/// Commands matching a `/name` prefix being typed: exact, then prefix, then fuzzy
-/// (subsequence) matches. Empty once arguments start, so the popup gets out of the way.
-pub fn complete(input: &str) -> Vec<(&'static str, &'static str)> {
+pub struct Completion {
+    pub label: String,
+    pub desc: String,
+    /// Replaces the whole input when picked.
+    pub insert: String,
+}
+
+/// Completions for a `/name` or `/name arg` being typed: exact, then prefix, then fuzzy
+/// (subsequence) matches. Argument candidates come from `args(name)`, since some are
+/// only known at run time (config). Empty past the first argument.
+pub fn complete(input: &str, args: impl Fn(&str) -> Vec<(String, String)>) -> Vec<Completion> {
     let Some(typed) = input.strip_prefix('/') else {
         return Vec::new();
     };
-    if typed.contains(char::is_whitespace) {
+    let Some((name, arg)) = typed.split_once(char::is_whitespace) else {
+        let commands = COMMANDS
+            .iter()
+            .map(|&(name, desc)| (name.to_string(), desc.to_string()));
+        return ranked(typed, commands)
+            .into_iter()
+            .map(|(name, desc)| Completion {
+                label: format!("/{name}"),
+                insert: format!("/{name} "),
+                desc,
+            })
+            .collect();
+    };
+    let arg = arg.trim_start();
+    if arg.contains(char::is_whitespace) {
         return Vec::new();
     }
-    let mut found: Vec<(u8, (&str, &str))> = COMMANDS
-        .iter()
-        .filter_map(|&(name, desc)| {
+    ranked(arg, args(name).into_iter())
+        .into_iter()
+        .map(|(value, desc)| Completion {
+            insert: format!("/{name} {value}"),
+            label: value,
+            desc,
+        })
+        .collect()
+}
+
+fn ranked(
+    typed: &str,
+    candidates: impl Iterator<Item = (String, String)>,
+) -> Vec<(String, String)> {
+    let mut found: Vec<(u8, (String, String))> = candidates
+        .filter_map(|(name, desc)| {
             let rank = if name == typed {
                 0
             } else if name.starts_with(typed) {
                 1
-            } else if is_subsequence(typed, name) {
+            } else if is_subsequence(typed, &name) {
                 2
             } else {
                 return None;

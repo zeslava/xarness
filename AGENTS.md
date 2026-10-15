@@ -23,8 +23,8 @@ The working directory at launch becomes the sandbox root for all tools.
 
 Three layers, each the first existing of its candidates, merged in order (later overrides earlier key by key; objects merge recursively, arrays such as `models` are replaced whole):
 
-1. global: `<config_dir>/xarness/config.{toml,json}` (`dirs::config_dir()`, `~/.config` on Linux)
-2. project: `./.xarness/config.{toml,json}`, or the old `./.xarness.{toml,json}`
+1. global: `~/.config/xarness/config.{toml,json}` on every OS; if no layer exists at all, a `config.json` with empty `providers` is written here (best effort) and the TUI starts with no model, prompting to configure a provider
+2. project: `./.xarness/config.{toml,json}`
 3. local: `./.xarness/config.local.{toml,json}` — gitignored, for keys and personal endpoints
 
 See `.xarness/config.json` for an example.

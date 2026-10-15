@@ -3,6 +3,7 @@ use std::sync::Arc;
 use futures::StreamExt;
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::oneshot;
 
 use crate::config::ModelConfig;
 use crate::domain::message::{Message, Mode};
@@ -32,6 +33,8 @@ pub enum AgentEvent {
         window: Option<u32>,
         cached: Option<u32>,
     },
+    /// A tool call waits for the user to answer `true` (run it) or `false`.
+    Approve(oneshot::Sender<bool>),
     Error(String),
     Finished,
 }
@@ -156,7 +159,19 @@ pub async fn run(mut r: Run, tx: UnboundedSender<(u64, AgentEvent)>, run_id: u64
                 name: c.name.clone(),
                 arguments: c.arguments.clone(),
             });
-            let (output, is_error) = match r.tools.run(r.mode, &c.name, &c.arguments) {
+            let approved = if r.tools.needs_approval(&c.name) {
+                let (reply, answer) = oneshot::channel();
+                send(AgentEvent::Approve(reply));
+                answer.await.unwrap_or(false)
+            } else {
+                true
+            };
+            let result = if approved {
+                r.tools.run(r.mode, &c.name, &c.arguments)
+            } else {
+                Err(anyhow::anyhow!("the user declined this call"))
+            };
+            let (output, is_error) = match result {
                 Ok(out) => (out, false),
                 Err(e) => (format!("error: {e:#}"), true),
             };
