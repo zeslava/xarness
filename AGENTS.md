@@ -30,7 +30,7 @@ Three layers, each the first existing of its candidates, merged in order (later 
 See `.xarness/config.json` for an example.
 
 - Models are addressed as `provider/model`; split on the **first** `/` only, since model ids may contain `/`.
-- `context_window` enables history trimming; without it, full history is sent.
+- `context_window` enables history trimming; without it, the provider is asked (llama.cpp `/props` → `n_ctx`, fetched each turn), and if that fails full history is sent.
 - `think.levels` maps a level name to raw JSON merged into the request body (`ChatRequest.extra`) — reasoning control is provider-specific, so it is pure config, not code.
 
 ## Architecture

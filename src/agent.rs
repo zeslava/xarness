@@ -52,7 +52,10 @@ pub async fn run(mut r: Run, tx: UnboundedSender<(u64, AgentEvent)>, run_id: u64
     let send = |ev| {
         let _ = tx.send((run_id, ev));
     };
-    let mut context_window = r.model.context_window;
+    let mut context_window = match r.model.context_window {
+        Some(c) => Some(c),
+        None => r.provider.context_window().await,
+    };
     // Server-reported prompt size / our char-based estimate; corrects the estimator per model.
     let mut scale = 1.0_f64;
     let mut retried = false;
@@ -216,7 +219,7 @@ fn message_tokens(m: &Message) -> usize {
 /// Fraction of the budget the history is trimmed down to once it overflows. The headroom lets
 /// the following requests reuse the same prefix (and the server's KV cache) instead of each
 /// shifting the front of the history a little.
-const TRIM_TARGET: f64 = 0.6;
+const TRIM_TARGET: f64 = 0.4;
 
 /// The part of the history that is sent: messages from `start`, with some tool outputs cut to a
 /// byte length. History is append-only, so the same cut yields a byte-identical prefix.

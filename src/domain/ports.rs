@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use futures::FutureExt;
+use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use serde_json::Value;
 
@@ -59,6 +61,10 @@ impl std::error::Error for ContextOverflow {}
 
 pub trait LlmProvider: Send + Sync {
     fn stream(&self, req: ChatRequest) -> BoxStream<'static, anyhow::Result<LlmEvent>>;
+    /// Context size the server is actually running with, if it exposes one.
+    fn context_window(&self) -> BoxFuture<'static, Option<u32>> {
+        async { None }.boxed()
+    }
 }
 
 pub trait Tool: Send + Sync {

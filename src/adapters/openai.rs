@@ -2,8 +2,9 @@ use std::collections::BTreeMap;
 
 use anyhow::{Result, anyhow, bail};
 use futures::channel::mpsc;
+use futures::future::BoxFuture;
 use futures::stream::BoxStream;
-use futures::{SinkExt, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt};
 use serde_json::{Value, json};
 
 use crate::domain::message::{Message, ToolCall};
@@ -41,6 +42,21 @@ impl LlmProvider for OpenAiProvider {
             }
         });
         rx.boxed()
+    }
+
+    /// llama.cpp serves the runtime `n_ctx` at `/props` on the server root, outside `/v1`.
+    fn context_window(&self) -> BoxFuture<'static, Option<u32>> {
+        let root = self.base_url.trim_end_matches("/v1");
+        let http = self
+            .client
+            .get(format!("{root}/props"))
+            .timeout(std::time::Duration::from_secs(2));
+        async move {
+            let v: Value = http.send().await.ok()?.json().await.ok()?;
+            let n = v.pointer("/default_generation_settings/n_ctx")?.as_u64()?;
+            Some(n as u32)
+        }
+        .boxed()
     }
 }
 
