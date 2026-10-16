@@ -35,7 +35,7 @@ impl Renderer {
                 let mut parts = t.split('\n').peekable();
                 while let Some(part) = parts.next() {
                     if !part.is_empty() {
-                        self.push(part.to_string(), Style::new().fg(Color::Yellow));
+                        self.push(part.to_string(), Style::new().fg(Color::LightBlue));
                     }
                     if parts.peek().is_some() {
                         self.flush_line(true);
@@ -48,7 +48,7 @@ impl Renderer {
                 }
                 self.push(t.into_string(), self.style());
             }
-            Event::Code(t) => self.push(t.into_string(), self.style().fg(Color::Yellow)),
+            Event::Code(t) => self.push(t.into_string(), self.style().fg(Color::LightBlue)),
             Event::Html(t) | Event::InlineHtml(t) => self.push(t.into_string(), self.style()),
             Event::SoftBreak => self.push(" ".into(), self.style()),
             Event::HardBreak => self.flush_line(true),

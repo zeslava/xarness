@@ -39,7 +39,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let first = (cur_row + 1).saturating_sub(input_rows);
     let border = match app.mode {
         Mode::Plan => Color::Cyan,
-        Mode::Build => Color::Yellow,
+        Mode::Build => Color::LightBlue,
     };
     let visible: Vec<Line> = rows
         .into_iter()
@@ -118,7 +118,7 @@ fn input_lines(input: &str, width: usize) -> Vec<String> {
 fn status_line(app: &App) -> Line<'static> {
     let (label, color) = match app.mode {
         Mode::Plan => (" PLAN ", Color::Cyan),
-        Mode::Build => (" BUILD ", Color::Yellow),
+        Mode::Build => (" BUILD ", Color::LightBlue),
     };
     let mut spans = vec![
         Span::styled(label, Style::new().fg(Color::Black).bg(color).bold()),
@@ -144,9 +144,9 @@ fn status_line(app: &App) -> Line<'static> {
             let pct = u.used as u64 * 100 / w as u64;
             s += &format!("/{} {pct}%", kilo(w));
             fg = match pct {
-                0..60 => Color::DarkGray,
-                60..85 => Color::Yellow,
-                _ => Color::Red,
+                0..50 => Color::DarkGray,
+                50..75 => Color::Gray,
+                _ => Color::LightRed,
             };
         }
         if let Some(c) = u.cached {
