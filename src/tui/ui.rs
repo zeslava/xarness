@@ -37,7 +37,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let rows = input_lines(&app.input, width);
     let (cur_row, cur_col) = (app.cursor / width, app.cursor % width);
     let first = (cur_row + 1).saturating_sub(input_rows);
-    let border = match app.mode {
+    let accent = match app.mode {
         Mode::Plan => Color::Cyan,
         Mode::Build => Color::LightBlue,
     };
@@ -49,7 +49,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .map(|(i, r)| {
             if i == 0 && first == 0 {
                 Line::from(vec![
-                    Span::styled("> ", Style::new().fg(border).bold()),
+                    Span::styled("> ", Style::new().fg(accent).bold()),
                     Span::raw(r),
                 ])
             } else {
@@ -61,7 +61,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Paragraph::new(visible).block(
             Block::default()
                 .borders(Borders::TOP)
-                .border_style(Style::new().fg(border)),
+                .border_style(Style::new().fg(Color::Gray)),
         ),
         input_area,
     );
