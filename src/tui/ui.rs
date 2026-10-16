@@ -265,6 +265,11 @@ fn tool_summary(name: &str, arguments: &str) -> String {
             }
         }
         _ => arguments.to_string(),
+        // A span can't hold line breaks, so multi-line scripts are flattened.
+        ("run", _) => match str_arg("command") {
+            Some(c) => c.trim().replace('\n', " ↵ "),
+            None => arguments.to_string(),
+        },
     }
 }
 
