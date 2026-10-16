@@ -1,10 +1,13 @@
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use futures::channel::mpsc;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::{FutureExt, SinkExt, StreamExt};
+use reqwest::StatusCode;
+use reqwest::header::RETRY_AFTER;
 use serde_json::{Value, json};
 
 use crate::domain::message::{Message, ToolCall};
@@ -64,16 +67,7 @@ async fn pump(
     http: reqwest::RequestBuilder,
     tx: &mut mpsc::Sender<Result<LlmEvent>>,
 ) -> Result<()> {
-    let resp = http.send().await?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        if let Some(e) = context_overflow(&body) {
-            return Err(e.into());
-        }
-        bail!("HTTP {status}: {body}");
-    }
-
+    let resp = send_with_retry(http, tx).await?;
     let mut bytes = resp.bytes_stream();
     let mut buf = String::new();
     let mut acc = DeltaAccumulator::default();
@@ -121,6 +115,52 @@ async fn pump(
         }
     }
     finish(acc, tx).await
+}
+
+const MAX_RETRIES: u32 = 5;
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Retries rate-limit errors (429 or a "too many tokens" body), honoring `Retry-After`
+/// (seconds) or falling back to exponential backoff.
+async fn send_with_retry(
+    http: reqwest::RequestBuilder,
+    tx: &mpsc::Sender<Result<LlmEvent>>,
+) -> Result<reqwest::Response> {
+    let mut attempt = 0;
+    loop {
+        let req = http
+            .try_clone()
+            .ok_or_else(|| anyhow!("request body is not cloneable"))?;
+        let resp = req.send().await?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(resp);
+        }
+        let retry_after = resp
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(Duration::from_secs);
+        let body = resp.text().await.unwrap_or_default();
+        if let Some(e) = context_overflow(&body) {
+            return Err(e.into());
+        }
+        let rate_limited = status == StatusCode::TOO_MANY_REQUESTS
+            || body.to_lowercase().contains("too many tokens");
+        if !rate_limited || attempt >= MAX_RETRIES {
+            bail!("HTTP {status}: {body}");
+        }
+        let delay = retry_after
+            .unwrap_or(Duration::from_secs(1 << attempt))
+            .min(MAX_BACKOFF);
+        tokio::time::sleep(delay).await;
+        // The run was aborted while we waited.
+        if tx.is_closed() {
+            bail!("aborted");
+        }
+        attempt += 1;
+    }
 }
 
 async fn finish(acc: DeltaAccumulator, tx: &mut mpsc::Sender<Result<LlmEvent>>) -> Result<()> {
