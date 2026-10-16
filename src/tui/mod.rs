@@ -1,5 +1,6 @@
 mod app;
 mod commands;
+mod markdown;
 mod ui;
 
 use std::io::Write;

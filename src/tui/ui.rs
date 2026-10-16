@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use super::app::{App, Entry};
+use super::markdown;
 use crate::domain::message::Mode;
 
 const TOOL_OUTPUT_PREVIEW: usize = 8;
@@ -174,7 +175,7 @@ fn log_text(app: &App) -> Text<'static> {
                     lines.push(Line::from(format!("{prefix}{l}")).bold().fg(Color::Blue));
                 }
             }
-            Entry::Assistant(t) => lines.extend(t.lines().map(|l| Line::from(l.to_string()))),
+            Entry::Assistant(t) => lines.extend(markdown::render(t).lines),
             Entry::Thinking => {
                 let icon = SPINNER[app.tick % SPINNER.len()];
                 lines.push(Line::styled(
@@ -264,12 +265,12 @@ fn tool_summary(name: &str, arguments: &str) -> String {
                 p.to_string()
             }
         }
-        _ => arguments.to_string(),
         // A span can't hold line breaks, so multi-line scripts are flattened.
         ("run", _) => match str_arg("command") {
             Some(c) => c.trim().replace('\n', " ↵ "),
             None => arguments.to_string(),
         },
+        _ => arguments.to_string(),
     }
 }
 
