@@ -1,7 +1,8 @@
 use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -9,16 +10,21 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use super::jobs::Jobs;
 use crate::domain::ports::{Tool, ToolSpec};
 
-pub struct RunCommand;
+pub struct RunCommand {
+    pub jobs: Arc<Jobs>,
+}
 
 #[derive(Deserialize)]
 struct Args {
     command: String,
+    #[serde(default)]
+    background: bool,
 }
 
-const TIMEOUT: Duration = Duration::from_secs(120);
+pub(super) const TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_LINES: usize = 60;
 const OK_TAIL_LINES: usize = 10;
 const MAX_LINE_CHARS: usize = 300;
@@ -27,11 +33,12 @@ impl Tool for RunCommand {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "run",
-            description: "Run a shell command in the working directory, e.g. the build, test or lint commands from the project instructions. Run it after editing code to check your changes. Output is condensed: on failure the error lines (at most 60), on success the last lines. Times out after 120s.",
+            description: "Run a shell command in the working directory, e.g. the build, test or lint commands from the project instructions. Run it after editing code to check your changes. Output is condensed: on failure the error lines (at most 60), on success the last lines. Times out after 120s. For commands that keep running, such as dev servers or watchers, set `background` and check on them with the `job` tool.",
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string", "description": "Passed to `sh -c`" }
+                    "command": { "type": "string", "description": "Passed to `sh -c`" },
+                    "background": { "type": "boolean", "description": "Start without waiting and return a job id" }
                 },
                 "required": ["command"]
             }),
@@ -48,37 +55,16 @@ impl Tool for RunCommand {
 
     fn run(&self, args: Value, root: &Path) -> Result<String> {
         let a: Args = super::parse(args)?;
-        let mut child = Command::new("sh")
-            .arg("-c")
-            // Merged in the shell so stdout and stderr keep their relative order.
-            .arg(format!("exec 2>&1\n{}", a.command))
-            .current_dir(root)
-            .env("NO_COLOR", "1")
-            .env("CARGO_TERM_COLOR", "never")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .spawn()
-            .context("spawning sh")?;
+        if a.background {
+            let id = self.jobs.start(&a.command, root)?;
+            return Ok(format!("started job #{id}"));
+        }
+        let mut child = shell(&a.command, root).spawn().context("spawning sh")?;
 
-        // Read on a thread so a full pipe can't stall the child; a background grandchild may keep
-        // the pipe open past a timeout kill, so the thread is not joined then.
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let mut stdout = child.stdout.take().context("no stdout")?;
-        let reader = {
-            let output = Arc::clone(&output);
-            std::thread::spawn(move || {
-                let mut buf = [0; 8192];
-                while let Ok(n) = stdout.read(&mut buf) {
-                    if n == 0 {
-                        break;
-                    }
-                    output
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .extend_from_slice(&buf[..n]);
-                }
-            })
-        };
+        // A background grandchild may keep the pipe open past a timeout kill, so the reader is
+        // not joined then.
+        let stdout = child.stdout.take().context("no stdout")?;
+        let (output, reader) = collect(stdout, usize::MAX);
 
         let start = Instant::now();
         let status = loop {
@@ -112,14 +98,54 @@ impl Tool for RunCommand {
     }
 }
 
-fn tail(text: &str, n: usize) -> String {
+pub(super) fn shell(command: &str, root: &Path) -> Command {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        // Merged in the shell so stdout and stderr keep their relative order.
+        .arg(format!("exec 2>&1\n{command}"))
+        .current_dir(root)
+        .env("NO_COLOR", "1")
+        .env("CARGO_TERM_COLOR", "never")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped());
+    cmd
+}
+
+/// Reads on a thread so a full pipe can't stall the child. Past `cap` bytes the oldest output
+/// is dropped.
+pub(super) fn collect(
+    mut stdout: ChildStdout,
+    cap: usize,
+) -> (Arc<Mutex<Vec<u8>>>, JoinHandle<()>) {
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let reader = {
+        let output = Arc::clone(&output);
+        std::thread::spawn(move || {
+            let mut buf = [0; 8192];
+            while let Ok(n) = stdout.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                let mut out = output.lock().unwrap_or_else(|e| e.into_inner());
+                out.extend_from_slice(&buf[..n]);
+                if out.len() > cap {
+                    let excess = out.len() - cap;
+                    out.drain(..excess);
+                }
+            }
+        })
+    };
+    (output, reader)
+}
+
+pub(super) fn tail(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     clipped(&lines[lines.len().saturating_sub(n)..])
 }
 
 /// Short output is kept whole; long output is cut to the lines that point at a problem, falling
 /// back to the tail when none do.
-fn condense(text: &str) -> String {
+pub(super) fn condense(text: &str) -> String {
     let mut lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     lines.dedup();
     if lines.len() <= MAX_LINES {

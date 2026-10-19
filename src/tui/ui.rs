@@ -450,6 +450,9 @@ fn tool_summary(name: &str, arguments: &str) -> String {
         }
         // A span can't hold line breaks, so multi-line scripts are flattened.
         ("run", _) => match str_arg("command") {
+            Some(c) if v.get("background").and_then(|x| x.as_bool()) == Some(true) => {
+                format!("{} &", c.trim().replace('\n', " ↵ "))
+            }
             Some(c) => c.trim().replace('\n', " ↵ "),
             None => arguments.to_string(),
         },

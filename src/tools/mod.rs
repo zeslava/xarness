@@ -1,5 +1,6 @@
 mod edit;
 mod grep;
+mod jobs;
 mod ls;
 mod read;
 mod run;
@@ -7,6 +8,7 @@ mod symbol;
 mod write;
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
 use serde::de::DeserializeOwned;
@@ -22,6 +24,7 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     pub fn new(root: PathBuf) -> Self {
+        let jobs = Arc::new(jobs::Jobs::default());
         Self {
             root,
             tools: vec![
@@ -31,7 +34,10 @@ impl ToolRegistry {
                 Box::new(grep::Grep),
                 Box::new(write::WriteFile),
                 Box::new(edit::EditFile),
-                Box::new(run::RunCommand),
+                Box::new(run::RunCommand {
+                    jobs: Arc::clone(&jobs),
+                }),
+                Box::new(jobs::JobTool { jobs }),
             ],
         }
     }
