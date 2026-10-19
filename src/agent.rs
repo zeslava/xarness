@@ -548,11 +548,18 @@ fn system_prompt(
         }
         Mode::Build => {
             "You are in BUILD mode. Implement the requested changes using the tools. \
-             Read files before editing them; prefer edit_file for targeted changes."
+             Read files before editing them; prefer edit_file for targeted changes. \
+             Change only what the task requires: no unrelated refactoring, renaming, reformatting, \
+             extra features, comments, tests or new files unless asked. If the request is ambiguous \
+             or a broader change seems necessary, stop and ask instead of guessing."
         }
     };
     let mut prompt = format!(
-        "You are a coding agent working in `{cwd}`. All paths are relative to it.\n{task}\nBe concise. When showing code from files, quote it verbatim; put explanations \
+        "You are a coding agent working in `{cwd}`. All paths are relative to it.\n{task}\n\
+         Do exactly what the user asked — nothing more. If you have ideas, improvements or noticed \
+         other problems, mention them briefly at the end and ask whether to act on them; do not act \
+         on them yourself. If the user asks a question, answer it without changing anything.\n\
+         Be concise. When showing code from files, quote it verbatim; put explanations \
          outside the code block."
     );
     if let Some(text) = instructions {
