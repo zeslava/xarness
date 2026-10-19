@@ -27,6 +27,8 @@ pub enum AgentEvent {
         messages: Vec<Message>,
         cut: ContextCut,
     },
+    /// Replaces the whole history (`/compact`).
+    Compacted(Vec<Message>),
     /// Context usage after a model response, as reported by the server.
     Usage {
         used: u32,
@@ -217,6 +219,88 @@ pub async fn run(mut r: Run, tx: UnboundedSender<(u64, AgentEvent)>, run_id: u64
             return;
         }
     }
+}
+
+const COMPACT_PROMPT: &str = "You summarize a conversation between a user and a coding agent \
+so the agent can continue the work from the summary alone. Keep: the user's goals and constraints, \
+decisions made and why, files read or changed and what changed in them, commands run and their \
+outcomes, errors and unresolved problems, the current state and next steps. Be specific: exact \
+paths, identifiers, values. Omit pleasantries. Write in the language the user writes in.";
+const COMPACT_REQUEST: &str = "Summarize the conversation so far.";
+
+/// Summarizes the history with the model and sends it back as a request/summary pair, so roles
+/// keep alternating once the next user message is appended. On failure the history is kept.
+pub async fn compact(
+    r: Run,
+    focus: Option<String>,
+    tx: UnboundedSender<(u64, AgentEvent)>,
+    run_id: u64,
+) {
+    let send = |ev| {
+        let _ = tx.send((run_id, ev));
+    };
+    let context_window = match r.model.context_window {
+        Some(c) => Some(c),
+        None => r.provider.context_window().await,
+    };
+    let request = Message::User(match &focus {
+        Some(f) => format!("{COMPACT_REQUEST} Focus on: {f}"),
+        None => COMPACT_REQUEST.into(),
+    });
+    let history = elide_old_outputs(&r.history);
+    let history = match context_window {
+        Some(ctx) => {
+            let reserve = r.model.max_tokens.unwrap_or(DEFAULT_OUTPUT_RESERVE);
+            let fixed = estimate_tokens(COMPACT_PROMPT) + message_tokens(&request);
+            let budget = (ctx.saturating_sub(reserve) as usize).saturating_sub(fixed);
+            fit_context(&history, budget, &mut ContextCut::default())
+        }
+        None => history,
+    };
+    let mut messages = vec![Message::System(COMPACT_PROMPT.into())];
+    messages.extend(history);
+    messages.push(request);
+    let req = ChatRequest {
+        model: r.model.id.clone(),
+        max_tokens: r.model.max_tokens,
+        temperature: r.model.temperature,
+        messages,
+        tools: Vec::new(),
+        extra: r.extra.clone(),
+    };
+
+    let mut stream = r.provider.stream(req);
+    let mut summary = String::new();
+    let mut truncated = false;
+    while let Some(ev) = stream.next().await {
+        match ev {
+            Ok(LlmEvent::TextDelta(t)) => {
+                summary.push_str(&t);
+                send(AgentEvent::TextDelta(t));
+            }
+            Ok(LlmEvent::Reasoning) => send(AgentEvent::Thinking),
+            Ok(LlmEvent::Done { truncated: t, .. }) => truncated = t,
+            Err(e) => {
+                send(AgentEvent::Error(format!("compaction failed: {e:#}")));
+                send(AgentEvent::Finished);
+                return;
+            }
+        }
+    }
+    if truncated || summary.trim().is_empty() {
+        send(AgentEvent::Error(
+            "compaction failed: summary empty or cut off at max_tokens; history kept".into(),
+        ));
+    } else {
+        send(AgentEvent::Compacted(vec![
+            Message::User(COMPACT_REQUEST.into()),
+            Message::Assistant {
+                content: summary,
+                tool_calls: Vec::new(),
+            },
+        ]));
+    }
+    send(AgentEvent::Finished);
 }
 
 const DEFAULT_OUTPUT_RESERVE: u32 = 2048;

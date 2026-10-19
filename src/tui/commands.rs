@@ -5,13 +5,14 @@ pub enum Command {
     Think(Option<String>),
     Map,
     MapShow,
+    Compact(Option<String>),
     Clear,
     Help,
     Quit,
     Unknown(String),
 }
 
-pub const HELP: &str = "/clear  /plan  /build  /model [provider/model]  /think [level]  /map [show]  /help  /quit\n\
+pub const HELP: &str = "/clear  /compact [focus]  /plan  /build  /model [provider/model]  /think [level]  /map [show]  /help  /quit\n\
 Tab — complete command, Shift+Tab — toggle mode, Esc — interrupt, Up/Down/PgUp/PgDn/wheel — scroll, Ctrl+P/Ctrl+N — input history, Ctrl+C — interrupt or clear input, twice to quit\n\
 Shift+Enter/Alt+Enter/Ctrl+J — new line, Ctrl+W/Alt+Backspace — delete word, Ctrl+U/Ctrl+K — delete to line start/end, \
 Ctrl+A/Ctrl+E — line start/end, Ctrl+←→/Alt+B/Alt+F — move by word\n\
@@ -19,6 +20,7 @@ Approval: ←→/Tab + Enter; type a reason, pick no and Enter to decline with i
 
 pub const COMMANDS: &[(&str, &str)] = &[
     ("clear", "clear history"),
+    ("compact", "replace history with a summary"),
     ("plan", "read-only mode"),
     ("build", "mode with mutating tools"),
     ("model", "list or switch model"),
@@ -110,6 +112,7 @@ pub fn parse(input: &str) -> Command {
             Some("show") => Command::MapShow,
             Some(other) => Command::Unknown(format!("map {other}")),
         },
+        "compact" => Command::Compact(arg.map(str::to_string)),
         "clear" => Command::Clear,
         "help" => Command::Help,
         "quit" | "exit" | "q" => Command::Quit,

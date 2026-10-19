@@ -496,10 +496,15 @@ impl App {
     }
 
     fn start_run(&mut self) {
-        let Some(active) = &self.active else {
+        let Some(run) = self.new_run() else {
             return;
         };
-        self.run_id += 1;
+        self.running = Some(tokio::spawn(agent::run(run, self.tx.clone(), self.run_id)));
+        self.phase = (Phase::Waiting, Instant::now());
+    }
+
+    fn new_run(&mut self) -> Option<Run> {
+        let active = self.active.as_ref()?;
         let run = Run {
             provider: active.provider.clone(),
             model: active.model.clone(),
@@ -511,8 +516,8 @@ impl App {
             repo_map: self.repo_map.clone(),
             extra: self.think_patch(),
         };
-        self.running = Some(tokio::spawn(agent::run(run, self.tx.clone(), self.run_id)));
-        self.phase = (Phase::Waiting, Instant::now());
+        self.run_id += 1;
+        Some(run)
     }
 
     fn set_phase(&mut self, phase: Phase) {
@@ -666,6 +671,25 @@ impl App {
                 self.usage = None;
                 self.log.clear();
             }
+            Command::Compact(focus) => {
+                if self.is_running() {
+                    self.log.push(Entry::Error(
+                        "a run is active; wait for it or interrupt (Esc)".into(),
+                    ));
+                } else if self.history.is_empty() {
+                    self.log.push(Entry::Info("nothing to compact".into()));
+                } else if let Some(run) = self.new_run() {
+                    self.running = Some(tokio::spawn(agent::compact(
+                        run,
+                        focus,
+                        self.tx.clone(),
+                        self.run_id,
+                    )));
+                    self.phase = (Phase::Waiting, Instant::now());
+                } else {
+                    self.log.push(Entry::Error(NO_PROVIDERS.into()));
+                }
+            }
             Command::Help => self.log.push(Entry::Info(commands::HELP.into())),
             Command::Quit => self.quit = true,
             Command::Unknown(name) => self
@@ -704,6 +728,12 @@ impl App {
             AgentEvent::Commit { messages, cut } => {
                 self.history.extend(messages);
                 self.cut = cut;
+            }
+            AgentEvent::Compacted(messages) => {
+                self.history = messages;
+                self.cut = ContextCut::default();
+                self.usage = None;
+                self.push_log(Entry::Info("history compacted".into()));
             }
             AgentEvent::Usage {
                 used,
