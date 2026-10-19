@@ -5,6 +5,7 @@ pub enum Command {
     Think(Option<String>),
     Map,
     MapShow,
+    Mcp,
     Compact(Option<String>),
     Clear,
     Help,
@@ -12,7 +13,7 @@ pub enum Command {
     Unknown(String),
 }
 
-pub const HELP: &str = "/clear  /compact [focus]  /plan  /build  /model [provider/model]  /think [level]  /map [show]  /help  /quit\n\
+pub const HELP: &str = "/clear  /compact [focus]  /plan  /build  /model [provider/model]  /think [level]  /map [show]  /mcp  /help  /quit\n\
 Tab — complete command, Shift+Tab — toggle mode, Esc — interrupt, Up/Down/PgUp/PgDn/wheel — scroll, Ctrl+P/Ctrl+N — input history, Ctrl+C — interrupt or clear input, twice to quit\n\
 Shift+Enter/Alt+Enter/Ctrl+J — new line, Ctrl+W/Alt+Backspace — delete word, Ctrl+U/Ctrl+K — delete to line start/end, \
 Ctrl+A/Ctrl+E — line start/end, Ctrl+←→/Alt+B/Alt+F — move by word\n\
@@ -26,6 +27,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("model", "list or switch model"),
     ("think", "list or set reasoning level"),
     ("map", "rebuild repo map"),
+    ("mcp", "MCP server status"),
     ("help", "show help"),
     ("quit", "exit"),
 ];
@@ -112,6 +114,7 @@ pub fn parse(input: &str) -> Command {
             Some("show") => Command::MapShow,
             Some(other) => Command::Unknown(format!("map {other}")),
         },
+        "mcp" => Command::Mcp,
         "compact" => Command::Compact(arg.map(str::to_string)),
         "clear" => Command::Clear,
         "help" => Command::Help,

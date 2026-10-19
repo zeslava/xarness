@@ -15,12 +15,22 @@ use futures::StreamExt;
 use ratatui::DefaultTerminal;
 use tokio::sync::mpsc;
 
+use crate::adapters::mcp;
 use crate::config::Config;
 use crate::tools::ToolRegistry;
 use app::App;
 
 pub async fn run(config: Config, tools: ToolRegistry) -> Result<()> {
     let (tx, rx) = mpsc::unbounded_channel();
+    let (mcp_tx, mcp_rx) = mpsc::unbounded_channel();
+    if !config.mcp.is_empty() {
+        let servers = config.mcp.clone();
+        let root = tools.root().to_path_buf();
+        // In the background: servers started via npx/uvx can take seconds to come up.
+        tokio::spawn(async move {
+            let _ = mcp_tx.send(mcp::connect_all(servers, root).await);
+        });
+    }
     let app = App::new(config, tools, tx)?;
     let mut terminal = ratatui::init();
     set_alternate_scroll(true)?;
@@ -34,7 +44,7 @@ pub async fn run(config: Config, tools: ToolRegistry) -> Result<()> {
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         )?;
     }
-    let res = event_loop(&mut terminal, app, rx).await;
+    let res = event_loop(&mut terminal, app, rx, mcp_rx).await;
     if enhanced {
         let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     }
@@ -57,6 +67,7 @@ async fn event_loop(
     terminal: &mut DefaultTerminal,
     mut app: App,
     mut rx: mpsc::UnboundedReceiver<(u64, crate::agent::AgentEvent)>,
+    mut mcp_rx: mpsc::UnboundedReceiver<mcp::Connected>,
 ) -> Result<()> {
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(100));
@@ -65,6 +76,7 @@ async fn event_loop(
         tokio::select! {
             Some(ev) = events.next() => app.on_term_event(ev?),
             Some((id, ev)) = rx.recv() => app.on_agent_event(id, ev),
+            Some(servers) = mcp_rx.recv() => app.on_mcp(servers),
             // Only animates the spinner, so no redraws while idle.
             _ = ticker.tick(), if app.is_running() => app.tick = app.tick.wrapping_add(1),
         }

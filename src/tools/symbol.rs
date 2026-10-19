@@ -5,6 +5,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tree_sitter_tags::TagsContext;
 
+use futures::FutureExt;
+use futures::future::{self, BoxFuture};
+
 use crate::domain::ports::{Tool, ToolSpec};
 use crate::repomap::{self, Def};
 
@@ -48,8 +51,8 @@ const SMALL_FILE_LINES: usize = 150;
 impl Tool for ReadSymbol {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "read_symbol",
-            description: "Read code by definition instead of by line range; much cheaper than read_file for Rust, Go, JS and TS. With `name`: returns the full source of those functions/methods/types (with its doc comments and attributes), line-numbered. The repo map in the system prompt already lists definition names, so pass `name` directly instead of asking for an outline first. Without `name`: returns the file's outline (every definition with its line range), or the whole file if it is under 150 lines.",
+            name: "read_symbol".into(),
+            description: "Read code by definition instead of by line range; much cheaper than read_file for Rust, Go, JS and TS. With `name`: returns the full source of those functions/methods/types (with its doc comments and attributes), line-numbered. The repo map in the system prompt already lists definition names, so pass `name` directly instead of asking for an outline first. Without `name`: returns the file's outline (every definition with its line range), or the whole file if it is under 150 lines.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -71,7 +74,13 @@ impl Tool for ReadSymbol {
         false
     }
 
-    fn run(&self, args: Value, root: &Path) -> Result<String> {
+    fn run(&self, args: Value, root: &Path) -> BoxFuture<'static, Result<String>> {
+        future::ready(self.call(args, root)).boxed()
+    }
+}
+
+impl ReadSymbol {
+    fn call(&self, args: Value, root: &Path) -> Result<String> {
         let a: Args = super::parse(args)?;
         let path = super::resolve(root, &a.path)?;
         let Some(config) = repomap::languages().for_path(&a.path) else {

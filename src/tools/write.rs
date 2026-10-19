@@ -4,6 +4,9 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use futures::FutureExt;
+use futures::future::{self, BoxFuture};
+
 use crate::domain::ports::{Tool, ToolSpec};
 
 pub struct WriteFile;
@@ -17,8 +20,10 @@ struct Args {
 impl Tool for WriteFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "write_file",
-            description: "Create or overwrite a file with the given content. Parent directories are created.",
+            name: "write_file".into(),
+            description:
+                "Create or overwrite a file with the given content. Parent directories are created."
+                    .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -34,7 +39,13 @@ impl Tool for WriteFile {
         true
     }
 
-    fn run(&self, args: Value, root: &Path) -> Result<String> {
+    fn run(&self, args: Value, root: &Path) -> BoxFuture<'static, Result<String>> {
+        future::ready(self.call(args, root)).boxed()
+    }
+}
+
+impl WriteFile {
+    fn call(&self, args: Value, root: &Path) -> Result<String> {
         let a: Args = super::parse(args)?;
         let path = super::resolve(root, &a.path)?;
         if let Some(parent) = path.parent() {

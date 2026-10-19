@@ -86,8 +86,8 @@ pub async fn run(mut r: Run, tx: UnboundedSender<(u64, AgentEvent)>, run_id: u64
             + tools
                 .iter()
                 .map(|t| {
-                    estimate_tokens(t.name)
-                        + estimate_tokens(t.description)
+                    estimate_tokens(&t.name)
+                        + estimate_tokens(&t.description)
                         + estimate_tokens(&t.parameters.to_string())
                 })
                 .sum::<usize>();
@@ -183,7 +183,7 @@ pub async fn run(mut r: Run, tx: UnboundedSender<(u64, AgentEvent)>, run_id: u64
                 Answer::Yes
             };
             let result = match answer {
-                Answer::Yes => r.tools.run(r.mode, &c.name, &c.arguments),
+                Answer::Yes => r.tools.run(r.mode, &c.name, &c.arguments).await,
                 Answer::No(None) => Err(anyhow::anyhow!("the user declined this call")),
                 Answer::No(Some(reason)) => Err(anyhow::anyhow!(
                     "the user declined this call and said: {reason}"

@@ -32,14 +32,15 @@ The schema is defined in `src/config.rs`.
 - Models are addressed as `provider/model`; split on the **first** `/` only, since model ids may contain `/`.
 - `context_window` enables history trimming; without it, the provider is asked (llama.cpp `/props` → `n_ctx`, fetched each turn), and if that fails full history is sent.
 - `think.levels` maps a level name to raw JSON merged into the request body (`ChatRequest.extra`) — reasoning control is provider-specific, so it is pure config, not code.
+- `mcp.<server>` configures an MCP server: `command`/`args`/`env` (stdio) or `url`/`headers`/`headers_env` (streamable HTTP), plus `enabled`, `approval` (`auto` | `always` | `never`) and an optional `tools` allowlist.
 
 ## Architecture
 
 Hexagonal layout:
 
 - `domain/` — `Message`, `Mode` (Plan/Build), and ports in `domain/ports.rs`: `LlmProvider` (returns a `BoxStream` of `LlmEvent`) and `Tool`. Domain must not import from `adapters/`.
-- `adapters/` — `LlmProvider` implementations; `build_provider` dispatches on `ProviderKind`. `openai.rs` does SSE parsing, accumulates streamed tool-call deltas, and maps server "context exceeded" errors to the `ContextOverflow` error type.
-- `tools/` — `Tool` impls registered in `ToolRegistry::new`. Tools with `mutating() == true` are hidden from the model and rejected at run time in Plan mode. All paths go through `tools::resolve`, which is lexical (no canonicalize, symlinks not followed) and rejects anything outside root.
+- `adapters/` — `LlmProvider` implementations; `build_provider` dispatches on `ProviderKind`. `openai.rs` does SSE parsing, accumulates streamed tool-call deltas, and maps server "context exceeded" errors to the `ContextOverflow` error type. `mcp.rs` is the MCP client (`rmcp`): exposes each server tool as a `Tool` named `server__tool`; `mutating` = not annotated `readOnlyHint`, and with `approval = auto` mutating tools need approval.
+- `tools/` — `Tool` impls registered in `ToolRegistry::new`. MCP tools are added later via `add_mcp`: servers connect in the background at startup (`tui::run`), so the tool list changes at most once per session. Tools with `mutating() == true` are hidden from the model and rejected at run time in Plan mode. All paths go through `tools::resolve`, which is lexical (no canonicalize, symlinks not followed) and rejects anything outside root.
 - `agent.rs` — the agent loop, run as a spawned tokio task per user turn. Streams a request, executes tool calls, loops until the model returns no tool calls. Emits `AgentEvent`s tagged with a `run_id` over an unbounded channel.
 - `tui/` — `mod.rs` event loop `select!`s over terminal events, agent events and a spinner ticker (only while running). `app.rs` owns state/history and handles keys and slash commands (`commands.rs`); `ui.rs` renders.
 

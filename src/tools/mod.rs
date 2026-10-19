@@ -8,7 +8,7 @@ mod symbol;
 mod write;
 
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use anyhow::{Result, anyhow, bail};
 use serde::de::DeserializeOwned;
@@ -19,7 +19,9 @@ use crate::domain::ports::{Tool, ToolSpec};
 
 pub struct ToolRegistry {
     root: PathBuf,
-    tools: Vec<Box<dyn Tool>>,
+    tools: Vec<Arc<dyn Tool>>,
+    /// Added once MCP servers connect, after startup.
+    mcp: RwLock<Vec<Arc<dyn Tool>>>,
 }
 
 impl ToolRegistry {
@@ -28,17 +30,18 @@ impl ToolRegistry {
         Self {
             root,
             tools: vec![
-                Box::new(read::ReadFile),
-                Box::new(symbol::ReadSymbol),
-                Box::new(ls::ListDir),
-                Box::new(grep::Grep),
-                Box::new(write::WriteFile),
-                Box::new(edit::EditFile),
-                Box::new(run::RunCommand {
+                Arc::new(read::ReadFile),
+                Arc::new(symbol::ReadSymbol),
+                Arc::new(ls::ListDir),
+                Arc::new(grep::Grep),
+                Arc::new(write::WriteFile),
+                Arc::new(edit::EditFile),
+                Arc::new(run::RunCommand {
                     jobs: Arc::clone(&jobs),
                 }),
-                Box::new(jobs::JobTool { jobs }),
+                Arc::new(jobs::JobTool { jobs }),
             ],
+            mcp: RwLock::default(),
         }
     }
 
@@ -46,34 +49,48 @@ impl ToolRegistry {
         &self.root
     }
 
-    fn available(&self, mode: Mode) -> impl Iterator<Item = &dyn Tool> {
+    pub fn add_mcp(&self, tools: Vec<Arc<dyn Tool>>) {
+        self.mcp
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(tools);
+    }
+
+    fn available(&self, mode: Mode) -> Vec<Arc<dyn Tool>> {
+        let mcp = self.mcp.read().unwrap_or_else(PoisonError::into_inner);
         self.tools
             .iter()
-            .map(|t| t.as_ref())
-            .filter(move |t| mode == Mode::Build || !t.mutating())
+            .chain(mcp.iter())
+            .filter(|t| mode == Mode::Build || !t.mutating())
+            .cloned()
+            .collect()
+    }
+
+    fn find(&self, mode: Mode, name: &str) -> Option<Arc<dyn Tool>> {
+        self.available(mode)
+            .into_iter()
+            .find(|t| t.spec().name == name)
     }
 
     pub fn specs(&self, mode: Mode) -> Vec<ToolSpec> {
-        self.available(mode).map(|t| t.spec()).collect()
+        self.available(mode).iter().map(|t| t.spec()).collect()
     }
 
     pub fn needs_approval(&self, name: &str) -> bool {
-        self.tools
-            .iter()
-            .any(|t| t.spec().name == name && t.needs_approval())
+        self.find(Mode::Build, name)
+            .is_some_and(|t| t.needs_approval())
     }
 
-    pub fn run(&self, mode: Mode, name: &str, arguments: &str) -> Result<String> {
+    pub async fn run(&self, mode: Mode, name: &str, arguments: &str) -> Result<String> {
         let tool = self
-            .available(mode)
-            .find(|t| t.spec().name == name)
+            .find(mode, name)
             .ok_or_else(|| anyhow!("tool `{name}` is not available in {} mode", mode.label()))?;
         let args: Value = if arguments.trim().is_empty() {
             Value::Object(Default::default())
         } else {
             serde_json::from_str(arguments).map_err(|e| anyhow!("invalid arguments: {e}"))?
         };
-        tool.run(args, &self.root)
+        tool.run(args, &self.root).await
     }
 }
 

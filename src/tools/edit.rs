@@ -4,6 +4,9 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use futures::FutureExt;
+use futures::future::{self, BoxFuture};
+
 use crate::domain::ports::{Tool, ToolSpec};
 
 pub struct EditFile;
@@ -20,8 +23,8 @@ struct Args {
 impl Tool for EditFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "edit_file",
-            description: "Replace an exact string in a file. old_string must match exactly (including whitespace) and be unique unless replace_all is true. Differences in trailing whitespace or indentation are tolerated; on a miss the closest matching lines are shown.",
+            name: "edit_file".into(),
+            description: "Replace an exact string in a file. old_string must match exactly (including whitespace) and be unique unless replace_all is true. Differences in trailing whitespace or indentation are tolerated; on a miss the closest matching lines are shown.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -39,7 +42,13 @@ impl Tool for EditFile {
         true
     }
 
-    fn run(&self, args: Value, root: &Path) -> Result<String> {
+    fn run(&self, args: Value, root: &Path) -> BoxFuture<'static, Result<String>> {
+        future::ready(self.call(args, root)).boxed()
+    }
+}
+
+impl EditFile {
+    fn call(&self, args: Value, root: &Path) -> Result<String> {
         let a: Args = super::parse(args)?;
         let path = super::resolve(root, &a.path)?;
         let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", a.path))?;

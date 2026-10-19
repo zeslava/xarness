@@ -11,6 +11,8 @@ pub struct Config {
     pub default: Option<String>,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
+    #[serde(default)]
+    pub mcp: BTreeMap<String, McpServerConfig>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Default)]
@@ -49,6 +51,42 @@ pub struct ThinkConfig {
     /// Level name → fields merged into the request body as-is, since every
     /// server/model spells reasoning control differently.
     pub levels: IndexMap<String, Value>,
+}
+
+/// One MCP server: `command` (stdio) or `url` (streamable HTTP), checked when connecting.
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpServerConfig {
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    pub url: Option<String>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// Header name → environment variable holding its value, to keep secrets out of config.
+    #[serde(default)]
+    pub headers_env: BTreeMap<String, String>,
+    #[serde(default = "enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub approval: McpApproval,
+    /// Exact names of the server's tools to expose; absent = all.
+    pub tools: Option<Vec<String>>,
+}
+
+fn enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum McpApproval {
+    /// Ask only for tools not annotated read-only.
+    #[default]
+    Auto,
+    Always,
+    Never,
 }
 
 impl ProviderConfig {

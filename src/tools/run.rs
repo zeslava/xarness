@@ -11,6 +11,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::jobs::Jobs;
+use futures::FutureExt;
+use futures::future::{self, BoxFuture};
+
 use crate::domain::ports::{Tool, ToolSpec};
 
 pub struct RunCommand {
@@ -32,8 +35,8 @@ const MAX_LINE_CHARS: usize = 300;
 impl Tool for RunCommand {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "run",
-            description: "Run a shell command in the working directory, e.g. the build, test or lint commands from the project instructions. Run it after editing code to check your changes. Output is condensed: on failure the error lines (at most 60), on success the last lines. Times out after 120s. For commands that keep running, such as dev servers or watchers, set `background` and check on them with the `job` tool.",
+            name: "run".into(),
+            description: "Run a shell command in the working directory, e.g. the build, test or lint commands from the project instructions. Run it after editing code to check your changes. Output is condensed: on failure the error lines (at most 60), on success the last lines. Times out after 120s. For commands that keep running, such as dev servers or watchers, set `background` and check on them with the `job` tool.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -53,7 +56,13 @@ impl Tool for RunCommand {
         true
     }
 
-    fn run(&self, args: Value, root: &Path) -> Result<String> {
+    fn run(&self, args: Value, root: &Path) -> BoxFuture<'static, Result<String>> {
+        future::ready(self.call(args, root)).boxed()
+    }
+}
+
+impl RunCommand {
+    fn call(&self, args: Value, root: &Path) -> Result<String> {
         let a: Args = super::parse(args)?;
         if a.background {
             let id = self.jobs.start(&a.command, root)?;

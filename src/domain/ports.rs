@@ -8,8 +8,8 @@ use serde_json::Value;
 use super::message::{Message, ToolCall};
 
 pub struct ToolSpec {
-    pub name: &'static str,
-    pub description: &'static str,
+    pub name: String,
+    pub description: String,
     pub parameters: Value,
 }
 
@@ -75,5 +75,5 @@ pub trait Tool: Send + Sync {
     fn needs_approval(&self) -> bool {
         false
     }
-    fn run(&self, args: Value, root: &Path) -> anyhow::Result<String>;
+    fn run(&self, args: Value, root: &Path) -> BoxFuture<'static, anyhow::Result<String>>;
 }

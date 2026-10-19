@@ -8,6 +8,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::run::{self, TIMEOUT};
+use futures::FutureExt;
+use futures::future::{self, BoxFuture};
+
 use crate::domain::ports::{Tool, ToolSpec};
 
 /// A long-running server must not grow memory without bound; only the tail is ever shown.
@@ -118,8 +121,8 @@ struct Args {
 impl Tool for JobTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "job",
-            description: "Inspect background commands started with `run` and `background: true`. Without `id`, lists all jobs. With `id`, shows the job's status and the last lines of its output; `wait` first waits up to that many seconds (at most 120) for it to exit, `kill` stops it.",
+            name: "job".into(),
+            description: "Inspect background commands started with `run` and `background: true`. Without `id`, lists all jobs. With `id`, shows the job's status and the last lines of its output; `wait` first waits up to that many seconds (at most 120) for it to exit, `kill` stops it.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -136,7 +139,13 @@ impl Tool for JobTool {
         true
     }
 
-    fn run(&self, args: Value, _root: &Path) -> Result<String> {
+    fn run(&self, args: Value, _root: &Path) -> BoxFuture<'static, Result<String>> {
+        future::ready(self.call(args, _root)).boxed()
+    }
+}
+
+impl JobTool {
+    fn call(&self, args: Value, _root: &Path) -> Result<String> {
         let a: Args = super::parse(args)?;
         let Some(id) = a.id else {
             let mut list = self.jobs.list.lock().unwrap_or_else(|e| e.into_inner());

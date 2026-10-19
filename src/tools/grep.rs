@@ -8,6 +8,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tree_sitter_tags::TagsContext;
 
+use futures::FutureExt;
+use futures::future::{self, BoxFuture};
+
 use crate::domain::ports::{Tool, ToolSpec};
 use crate::repomap::{self, Def};
 
@@ -25,8 +28,8 @@ const MAX_LINE_CHARS: usize = 200;
 impl Tool for Grep {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "grep",
-            description: "Search file contents with a regex, respecting .gitignore. Returns `path:line:text`, followed by `[in Name]` when the line is inside a definition — pass that name to read_symbol instead of reading the whole file. At most 50 matches, lines longer than 200 chars are cut with …. Narrow the pattern or path if there are too many matches.",
+            name: "grep".into(),
+            description: "Search file contents with a regex, respecting .gitignore. Returns `path:line:text`, followed by `[in Name]` when the line is inside a definition — pass that name to read_symbol instead of reading the whole file. At most 50 matches, lines longer than 200 chars are cut with …. Narrow the pattern or path if there are too many matches.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -42,7 +45,13 @@ impl Tool for Grep {
         false
     }
 
-    fn run(&self, args: Value, root: &Path) -> Result<String> {
+    fn run(&self, args: Value, root: &Path) -> BoxFuture<'static, Result<String>> {
+        future::ready(self.call(args, root)).boxed()
+    }
+}
+
+impl Grep {
+    fn call(&self, args: Value, root: &Path) -> Result<String> {
         let a: Args = super::parse(args)?;
         let re = Regex::new(&a.pattern)?;
         let base = super::resolve(root, a.path.as_deref().unwrap_or("."))?;

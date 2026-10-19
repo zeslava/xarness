@@ -1,3 +1,4 @@
+pub mod mcp;
 pub mod openai;
 
 use std::sync::Arc;

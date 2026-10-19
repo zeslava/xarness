@@ -10,6 +10,7 @@ use tokio::task::JoinHandle;
 
 use super::commands::{self, Command, Completion};
 use crate::adapters::build_provider;
+use crate::adapters::mcp;
 use crate::agent::{self, AgentEvent, Answer, ContextCut, Run};
 use crate::config::{Config, ModelConfig};
 use crate::domain::message::{Message, Mode};
@@ -85,6 +86,8 @@ pub struct App {
     tools: Arc<ToolRegistry>,
     /// Contents of AGENTS.md in the working directory, read once at startup.
     instructions: Option<Arc<str>>,
+    /// Per server: tool count or connection error; `None` while connecting.
+    mcp: Option<Vec<(String, Result<usize, String>)>>,
     /// Built at startup and on `/map` only, so the system prompt prefix stays cacheable.
     repo_map: Option<Arc<str>>,
     pub mode: Mode,
@@ -148,6 +151,7 @@ impl App {
             active,
             config,
             tools: Arc::new(tools),
+            mcp: None,
             instructions,
             repo_map,
             mode: Mode::Plan,
@@ -664,6 +668,10 @@ impl App {
                 };
                 self.log.push(Entry::Info(msg));
             }
+            Command::Mcp => {
+                let msg = self.mcp_status();
+                self.log.push(Entry::Info(msg));
+            }
             Command::Clear => {
                 self.interrupt();
                 self.history.clear();
@@ -771,6 +779,43 @@ impl App {
                 }
             }
         }
+    }
+
+    pub fn on_mcp(&mut self, servers: mcp::Connected) {
+        let status = servers
+            .into_iter()
+            .map(|(name, res)| match res {
+                Ok(tools) => {
+                    let n = tools.len();
+                    self.tools.add_mcp(tools);
+                    (name, Ok(n))
+                }
+                Err(e) => (name, Err(format!("{e:#}"))),
+            })
+            .collect();
+        self.mcp = Some(status);
+        let msg = self.mcp_status();
+        self.push_log(Entry::Info(msg));
+    }
+
+    fn mcp_status(&self) -> String {
+        if self.config.mcp.is_empty() {
+            return "mcp: no servers configured".into();
+        }
+        let Some(status) = &self.mcp else {
+            return "mcp: connecting…".into();
+        };
+        if status.is_empty() {
+            return "mcp: all servers disabled".into();
+        }
+        status
+            .iter()
+            .map(|(name, res)| match res {
+                Ok(n) => format!("mcp {name}: {n} tools"),
+                Err(e) => format!("mcp {name}: failed: {e}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn push_log(&mut self, entry: Entry) {

@@ -4,6 +4,9 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use futures::FutureExt;
+use futures::future::{self, BoxFuture};
+
 use crate::domain::ports::{Tool, ToolSpec};
 
 pub struct ReadFile;
@@ -21,8 +24,8 @@ const MAX_LINE_CHARS: usize = 500;
 impl Tool for ReadFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "read_file",
-            description: "Read a text file. Returns lines prefixed with 1-based line numbers; returns at most 300 lines by default, lines longer than 500 chars are cut with …. For large files, first use grep to find the relevant line numbers, then read just that range with offset/limit.",
+            name: "read_file".into(),
+            description: "Read a text file. Returns lines prefixed with 1-based line numbers; returns at most 300 lines by default, lines longer than 500 chars are cut with …. For large files, first use grep to find the relevant line numbers, then read just that range with offset/limit.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -39,7 +42,13 @@ impl Tool for ReadFile {
         false
     }
 
-    fn run(&self, args: Value, root: &Path) -> Result<String> {
+    fn run(&self, args: Value, root: &Path) -> BoxFuture<'static, Result<String>> {
+        future::ready(self.call(args, root)).boxed()
+    }
+}
+
+impl ReadFile {
+    fn call(&self, args: Value, root: &Path) -> Result<String> {
         let a: Args = super::parse(args)?;
         let path = super::resolve(root, &a.path)?;
         let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", a.path))?;

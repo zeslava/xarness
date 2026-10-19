@@ -4,6 +4,9 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use futures::FutureExt;
+use futures::future::{self, BoxFuture};
+
 use crate::domain::ports::{Tool, ToolSpec};
 
 pub struct ListDir;
@@ -21,8 +24,8 @@ fn dot() -> String {
 impl Tool for ListDir {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "list_dir",
-            description: "List entries of a directory. Directories end with `/`.",
+            name: "list_dir".into(),
+            description: "List entries of a directory. Directories end with `/`.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -36,7 +39,13 @@ impl Tool for ListDir {
         false
     }
 
-    fn run(&self, args: Value, root: &Path) -> Result<String> {
+    fn run(&self, args: Value, root: &Path) -> BoxFuture<'static, Result<String>> {
+        future::ready(self.call(args, root)).boxed()
+    }
+}
+
+impl ListDir {
+    fn call(&self, args: Value, root: &Path) -> Result<String> {
         let a: Args = super::parse(args)?;
         let path = super::resolve(root, &a.path)?;
         let mut entries: Vec<String> = std::fs::read_dir(&path)
