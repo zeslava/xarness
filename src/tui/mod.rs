@@ -6,7 +6,11 @@ mod ui;
 use std::io::Write;
 
 use anyhow::Result;
-use crossterm::event::EventStream;
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, EventStream, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
+use crossterm::terminal::supports_keyboard_enhancement;
 use futures::StreamExt;
 use ratatui::DefaultTerminal;
 use tokio::sync::mpsc;
@@ -20,7 +24,21 @@ pub async fn run(config: Config, tools: ToolRegistry) -> Result<()> {
     let app = App::new(config, tools, tx)?;
     let mut terminal = ratatui::init();
     set_alternate_scroll(true)?;
+    // Without it a pasted newline arrives as Enter and submits the first line.
+    crossterm::execute!(std::io::stdout(), EnableBracketedPaste)?;
+    // Kitty keyboard protocol, so Shift+Enter is distinguishable from Enter.
+    let enhanced = supports_keyboard_enhancement().unwrap_or(false);
+    if enhanced {
+        crossterm::execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
     let res = event_loop(&mut terminal, app, rx).await;
+    if enhanced {
+        let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    }
+    let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
     let _ = set_alternate_scroll(false);
     ratatui::restore();
     res

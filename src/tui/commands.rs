@@ -11,16 +11,19 @@ pub enum Command {
     Unknown(String),
 }
 
-pub const HELP: &str = "/plan  /build  /model [provider/model]  /think [level]  /map [show]  /clear  /help  /quit\n\
-Tab — complete command, Shift+Tab — toggle mode, Esc — interrupt, Up/Down/PgUp/PgDn/wheel — scroll, Ctrl+P/Ctrl+N — input history, Ctrl+C — quit";
+pub const HELP: &str = "/clear  /plan  /build  /model [provider/model]  /think [level]  /map [show]  /help  /quit\n\
+Tab — complete command, Shift+Tab — toggle mode, Esc — interrupt, Up/Down/PgUp/PgDn/wheel — scroll, Ctrl+P/Ctrl+N — input history, Ctrl+C — interrupt or clear input, twice to quit\n\
+Shift+Enter/Alt+Enter/Ctrl+J — new line, Ctrl+W/Alt+Backspace — delete word, Ctrl+U/Ctrl+K — delete to line start/end, \
+Ctrl+A/Ctrl+E — line start/end, Ctrl+←→/Alt+B/Alt+F — move by word\n\
+Approval: ←→/Tab + Enter; type a reason, pick no and Enter to decline with it; Esc interrupts";
 
 pub const COMMANDS: &[(&str, &str)] = &[
+    ("clear", "clear history"),
     ("plan", "read-only mode"),
     ("build", "mode with mutating tools"),
     ("model", "list or switch model"),
     ("think", "list or set reasoning level"),
     ("map", "rebuild repo map"),
-    ("clear", "clear history"),
     ("help", "show help"),
     ("quit", "exit"),
 ];

@@ -33,10 +33,20 @@ pub enum AgentEvent {
         window: Option<u32>,
         cached: Option<u32>,
     },
-    /// A tool call waits for the user to answer `true` (run it) or `false`.
-    Approve(oneshot::Sender<bool>),
+    /// A tool call waits for the user's answer.
+    Approve {
+        name: String,
+        arguments: String,
+        reply: oneshot::Sender<Answer>,
+    },
     Error(String),
     Finished,
+}
+
+pub enum Answer {
+    Yes,
+    /// Declined, optionally with what the model should do instead.
+    No(Option<String>),
 }
 
 pub struct Run {
@@ -159,17 +169,23 @@ pub async fn run(mut r: Run, tx: UnboundedSender<(u64, AgentEvent)>, run_id: u64
                 name: c.name.clone(),
                 arguments: c.arguments.clone(),
             });
-            let approved = if r.tools.needs_approval(&c.name) {
+            let answer = if r.tools.needs_approval(&c.name) {
                 let (reply, answer) = oneshot::channel();
-                send(AgentEvent::Approve(reply));
-                answer.await.unwrap_or(false)
+                send(AgentEvent::Approve {
+                    name: c.name.clone(),
+                    arguments: c.arguments.clone(),
+                    reply,
+                });
+                answer.await.unwrap_or(Answer::No(None))
             } else {
-                true
+                Answer::Yes
             };
-            let result = if approved {
-                r.tools.run(r.mode, &c.name, &c.arguments)
-            } else {
-                Err(anyhow::anyhow!("the user declined this call"))
+            let result = match answer {
+                Answer::Yes => r.tools.run(r.mode, &c.name, &c.arguments),
+                Answer::No(None) => Err(anyhow::anyhow!("the user declined this call")),
+                Answer::No(Some(reason)) => Err(anyhow::anyhow!(
+                    "the user declined this call and said: {reason}"
+                )),
             };
             let (output, is_error) = match result {
                 Ok(out) => (out, false),
@@ -206,7 +222,6 @@ pub async fn run(mut r: Run, tx: UnboundedSender<(u64, AgentEvent)>, run_id: u64
 const DEFAULT_OUTPUT_RESERVE: u32 = 2048;
 /// Initial guess before the server reports real counts; ~3 chars/token errs on the safe side.
 const CHARS_PER_TOKEN: usize = 3;
-const TRUNCATED_MARK: &str = "\n…[truncated to fit context]";
 
 fn estimate_tokens(s: &str) -> usize {
     s.len() / CHARS_PER_TOKEN + 1
@@ -235,6 +250,13 @@ fn message_tokens(m: &Message) -> usize {
 /// the following requests reuse the same prefix (and the server's KV cache) instead of each
 /// shifting the front of the history a little.
 const TRIM_TARGET: f64 = 0.4;
+/// Target when tool outputs have to be cut. These are usually what the model has just read in
+/// the current turn, so the headroom is small: cutting more makes it re-read the same files.
+const TRUNCATE_TARGET: f64 = 0.85;
+/// Outputs are first cut down to this many bytes (head + tail), and dropped entirely only if
+/// that is not enough. Outputs already this short are never cut.
+const MIN_KEEP: usize = 600;
+const LABEL_ARGS_MAX: usize = 120;
 
 /// The part of the history that is sent: messages from `start`, with some tool outputs cut to a
 /// byte length. History is append-only, so the same cut yields a byte-identical prefix.
@@ -249,38 +271,86 @@ impl ContextCut {
     fn apply(&self, history: &[Message]) -> Vec<Message> {
         let mut out = history[self.start.min(history.len())..].to_vec();
         for &(i, keep) in &self.truncated {
+            let label = call_label(&out, i);
             // The message may have been elided since the cut was made.
             if let Some(Message::Tool { content, .. }) = out.get_mut(i)
                 && keep < content.len()
             {
-                content.truncate(keep);
-                content.push_str(TRUNCATED_MARK);
+                *content = shorten(content, keep, &label);
             }
         }
         out
     }
 }
 
+/// Names the call that produced tool output `i`, so a cut output still tells the model what it
+/// already ran.
+fn call_label(messages: &[Message], i: usize) -> String {
+    let Some(Message::Tool { call_id, .. }) = messages.get(i) else {
+        return "tool".into();
+    };
+    let call = messages[..i].iter().rev().find_map(|m| match m {
+        Message::Assistant { tool_calls, .. } => tool_calls.iter().find(|c| &c.id == call_id),
+        _ => None,
+    });
+    let Some(c) = call else {
+        return "tool".into();
+    };
+    let mut args = c.arguments.as_str();
+    if args.len() > LABEL_ARGS_MAX {
+        let mut end = LABEL_ARGS_MAX;
+        while !args.is_char_boundary(end) {
+            end -= 1;
+        }
+        args = &args[..end];
+    }
+    format!("{} {args}", c.name)
+}
+
+fn cut_marker(label: &str, shown: usize, total: usize) -> String {
+    format!("\n…[{label}: output cut to fit context, {shown} of {total} bytes shown]\n")
+}
+
+/// Keeps about `keep` bytes split between the head and the tail of `content`.
+fn shorten(content: &str, keep: usize, label: &str) -> String {
+    let mut head = keep / 2;
+    while !content.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = content.len() - (keep - keep / 2);
+    while !content.is_char_boundary(tail) {
+        tail += 1;
+    }
+    let tail = tail.max(head);
+    let shown = head + content.len() - tail;
+    let mut s = String::from(&content[..head]);
+    s.push_str(&cut_marker(label, shown, content.len()));
+    s.push_str(&content[tail..]);
+    s
+}
+
 fn total_tokens(h: &[Message]) -> usize {
     h.iter().map(message_tokens).sum()
 }
 
-/// Keeps `cut` while its view fits `budget`; otherwise re-trims to `TRIM_TARGET` of it.
+/// Keeps `cut` while its view fits `budget`; otherwise re-trims.
 fn fit_context(history: &[Message], budget: usize, cut: &mut ContextCut) -> Vec<Message> {
     let view = cut.apply(history);
     if total_tokens(&view) <= budget {
         return view;
     }
-    *cut = trim(history, (budget as f64 * TRIM_TARGET) as usize);
+    *cut = trim(history, budget);
     cut.apply(history)
 }
 
-/// Drops whole turns from the front (a turn starts at a user message, so tool calls never lose
-/// their results). If the remaining turns still don't fit — e.g. one long agentic run — tool
-/// outputs are truncated oldest-first.
+/// Drops whole turns from the front down to `TRIM_TARGET` of `budget` (a turn starts at a user
+/// message, so tool calls never lose their results). If the remaining turns still don't fit
+/// `budget` — e.g. one long agentic run — tool outputs are cut oldest-first down to
+/// `TRUNCATE_TARGET`: first to `MIN_KEEP` bytes each, then dropped entirely.
 fn trim(history: &[Message], budget: usize) -> ContextCut {
+    let target = (budget as f64 * TRIM_TARGET) as usize;
     let mut start = 0;
-    while total_tokens(&history[start..]) > budget {
+    while total_tokens(&history[start..]) > target {
         match history[start + 1..]
             .iter()
             .position(|m| matches!(m, Message::User(_)))
@@ -290,25 +360,48 @@ fn trim(history: &[Message], budget: usize) -> ContextCut {
         }
     }
 
-    let mut truncated = Vec::new();
-    let mut excess = total_tokens(&history[start..]).saturating_sub(budget);
-    for (i, m) in history[start..].iter().enumerate() {
-        if excess == 0 {
-            break;
-        }
-        let Message::Tool { content, .. } = m else {
-            continue;
+    let view = &history[start..];
+    let total = total_tokens(view);
+    if total <= budget {
+        return ContextCut {
+            start,
+            truncated: Vec::new(),
         };
-        let cut = (excess * CHARS_PER_TOKEN + TRUNCATED_MARK.len()).min(content.len());
-        let mut keep = content.len() - cut;
-        while !content.is_char_boundary(keep) {
-            keep -= 1;
-        }
-        truncated.push((i, keep));
-        let removed = content.len() - keep;
-        excess =
-            excess.saturating_sub(removed.saturating_sub(TRUNCATED_MARK.len()) / CHARS_PER_TOKEN);
     }
+    let mut excess = total - (budget as f64 * TRUNCATE_TARGET) as usize;
+    let mut keeps: Vec<Option<usize>> = vec![None; view.len()];
+    for floor in [MIN_KEEP, 0] {
+        for (i, m) in view.iter().enumerate() {
+            if excess == 0 {
+                break;
+            }
+            let Message::Tool { content, .. } = m else {
+                continue;
+            };
+            if content.len() <= MIN_KEEP {
+                continue;
+            }
+            let cur = match keeps[i] {
+                Some(k) => k,
+                None => {
+                    let marker = cut_marker(&call_label(view, i), content.len(), content.len());
+                    excess += marker.len() / CHARS_PER_TOKEN + 1;
+                    content.len()
+                }
+            };
+            if cur <= floor {
+                continue;
+            }
+            let cut = (excess * CHARS_PER_TOKEN).min(cur - floor);
+            keeps[i] = Some(cur - cut);
+            excess = excess.saturating_sub(cut / CHARS_PER_TOKEN);
+        }
+    }
+    let truncated = keeps
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, k)| Some((i, k?)))
+        .collect();
     ContextCut { start, truncated }
 }
 

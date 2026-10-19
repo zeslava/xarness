@@ -1,4 +1,6 @@
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use serde_json::Value;
@@ -8,7 +10,7 @@ use tokio::task::JoinHandle;
 
 use super::commands::{self, Command, Completion};
 use crate::adapters::build_provider;
-use crate::agent::{self, AgentEvent, ContextCut, Run};
+use crate::agent::{self, AgentEvent, Answer, ContextCut, Run};
 use crate::config::{Config, ModelConfig};
 use crate::domain::message::{Message, Mode};
 use crate::domain::ports::LlmProvider;
@@ -18,11 +20,20 @@ use crate::tools::ToolRegistry;
 pub enum Entry {
     User(String),
     Assistant(String),
-    Thinking,
     Tool { name: String, arguments: String },
     ToolOutput { text: String, is_error: bool },
     Info(String),
     Error(String),
+}
+
+/// What an active run is doing, for the live indicator at the bottom of the log.
+#[derive(PartialEq)]
+pub enum Phase {
+    /// Request sent, nothing streamed yet (prompt processing).
+    Waiting,
+    Thinking,
+    Writing,
+    Running(String),
 }
 
 pub struct ContextUsage {
@@ -49,6 +60,17 @@ impl Active {
             model,
         }
     }
+}
+
+/// Answers to a tool call approval, in menu order.
+pub const APPROVAL_OPTIONS: [&str; 3] = ["yes", "allow for session", "no"];
+
+pub struct Approval {
+    reply: oneshot::Sender<Answer>,
+    pub name: String,
+    pub arguments: String,
+    /// Highlighted index into `APPROVAL_OPTIONS`.
+    pub choice: usize,
 }
 
 const NO_PROVIDERS: &str = "no providers configured: add one to ~/.config/xarness/config.json \
@@ -83,15 +105,24 @@ pub struct App {
     pub scroll: u16,
     /// Log viewport height from the last draw, for page scrolling.
     pub log_height: u16,
+    /// Wrapped log height from the last draw, to keep a scrolled view in place as it grows.
+    pub log_total: usize,
+    /// Lines added below the view since it was scrolled up.
+    pub unseen: usize,
     /// Spinner frame counter, advanced only while a run is active.
     pub tick: usize,
     running: Option<JoinHandle<()>>,
-    /// A tool call waiting for y/a/n.
-    approval: Option<oneshot::Sender<bool>>,
-    /// Set by answering `a`: approve every call until the app exits.
-    approve_all: bool,
+    /// Current phase of the active run and when it began.
+    pub phase: (Phase, Instant),
+    /// Messages submitted while a run was active, sent together as one turn when it finishes.
+    pub queued: VecDeque<String>,
+    approval: Option<Approval>,
+    /// Tools answered with "always": approved without asking until the app exits.
+    pub always: BTreeSet<String>,
     run_id: u64,
     tx: UnboundedSender<(u64, AgentEvent)>,
+    /// Set by the first Ctrl+C; the next key either quits (Ctrl+C) or disarms it.
+    pub quit_armed: bool,
     pub quit: bool,
 }
 
@@ -131,18 +162,23 @@ impl App {
             completion: 0,
             scroll: 0,
             log_height: 0,
+            log_total: 0,
+            unseen: 0,
             tick: 0,
             running: None,
+            phase: (Phase::Waiting, Instant::now()),
+            queued: VecDeque::new(),
             approval: None,
-            approve_all: false,
+            always: BTreeSet::new(),
             run_id: 0,
             tx,
+            quit_armed: false,
             quit: false,
         })
     }
 
-    pub fn awaiting_approval(&self) -> bool {
-        self.approval.is_some()
+    pub fn approval(&self) -> Option<&Approval> {
+        self.approval.as_ref()
     }
 
     pub fn is_running(&self) -> bool {
@@ -161,32 +197,126 @@ impl App {
     }
 
     pub fn on_term_event(&mut self, ev: Event) {
-        if let Event::Key(key) = ev
-            && key.kind != KeyEventKind::Release
-        {
-            self.on_key(key);
+        match ev {
+            Event::Key(key) if key.kind != KeyEventKind::Release => self.on_key(key),
+            Event::Paste(text) => self.paste(&text),
+            _ => {}
         }
+    }
+
+    fn paste(&mut self, text: &str) {
+        // The input renderer assumes one cell per char, so tabs become spaces.
+        let text = text
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .replace('\t', "    ");
+        self.insert(&text);
+    }
+
+    fn insert(&mut self, text: &str) {
+        self.recall = None;
+        self.completion = 0;
+        let at = self.byte_pos();
+        self.input.insert_str(at, text);
+        self.cursor += text.chars().count();
+    }
+
+    /// Removes chars `from..to` (char indices) and puts the cursor at `from`.
+    fn delete(&mut self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        self.recall = None;
+        self.completion = 0;
+        let byte = |i: usize| {
+            self.input
+                .char_indices()
+                .nth(i)
+                .map_or(self.input.len(), |(b, _)| b)
+        };
+        let range = byte(from)..byte(to);
+        self.input.replace_range(range, "");
+        self.cursor = from;
+    }
+
+    /// Start of the word before the cursor, skipping whitespace first, as readline's Ctrl+W.
+    fn word_back(&self) -> usize {
+        let chars: Vec<char> = self.input.chars().collect();
+        let mut i = self.cursor;
+        while i > 0 && chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        while i > 0 && !chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        i
+    }
+
+    fn word_forward(&self) -> usize {
+        let chars: Vec<char> = self.input.chars().collect();
+        let mut i = self.cursor;
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        while i < chars.len() && !chars[i].is_whitespace() {
+            i += 1;
+        }
+        i
+    }
+
+    /// Char bounds of the input line holding the cursor, newline excluded.
+    fn line_bounds(&self) -> (usize, usize) {
+        let chars: Vec<char> = self.input.chars().collect();
+        let start = chars[..self.cursor]
+            .iter()
+            .rposition(|&c| c == '\n')
+            .map_or(0, |i| i + 1);
+        let end = chars[self.cursor..]
+            .iter()
+            .position(|&c| c == '\n')
+            .map_or(chars.len(), |i| self.cursor + i);
+        (start, end)
     }
 
     fn on_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        if let Some(reply) = self.approval.take() {
-            let answer = match key.code {
-                KeyCode::Char('y') => true,
-                KeyCode::Char('a') => {
-                    self.approve_all = true;
-                    true
-                }
-                KeyCode::Char('n') => false,
-                // Esc still interrupts; anything else leaves the question open.
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let quit_armed = std::mem::take(&mut self.quit_armed);
+        // Shift+Enter needs the kitty keyboard protocol; Alt+Enter and Ctrl+J work everywhere.
+        let newline = match key.code {
+            KeyCode::Enter => alt || key.modifiers.contains(KeyModifiers::SHIFT),
+            KeyCode::Char('j') => ctrl,
+            _ => false,
+        };
+        if newline {
+            return self.insert("\n");
+        }
+        if let Some(mut a) = self.approval.take() {
+            let n = APPROVAL_OPTIONS.len();
+            // No letter hotkeys: any letter could start a decline reason.
+            match key.code {
+                KeyCode::Enter => return self.answer(a),
                 KeyCode::Esc => return self.interrupt(),
-                _ => {
-                    self.approval = Some(reply);
-                    return;
-                }
+                _ => {}
+            }
+            // Left/Right move the input cursor once a reason is being typed; Up/Down stay
+            // scrolling, since the terminal sends the mouse wheel as them.
+            let empty = self.input.is_empty();
+            let step = match key.code {
+                KeyCode::Tab => Some(1),
+                KeyCode::Right if empty => Some(1),
+                KeyCode::BackTab => Some(n - 1),
+                KeyCode::Left if empty => Some(n - 1),
+                _ => None,
             };
-            let _ = reply.send(answer);
-            return;
+            if let Some(step) = step {
+                a.choice = (a.choice + step) % n;
+            }
+            self.approval = Some(a);
+            if step.is_some() {
+                return;
+            }
+            // Anything else edits the input, scrolls or quits as usual.
         }
         if !ctrl
             && matches!(
@@ -199,7 +329,7 @@ impl App {
             self.completion = 0;
         }
         let completions = self.completions();
-        if !completions.is_empty() {
+        if !completions.is_empty() && self.approval.is_none() {
             let n = completions.len();
             let selected = &completions[self.completion.min(n - 1)].insert;
             match key.code {
@@ -221,7 +351,18 @@ impl App {
             }
         }
         match key.code {
-            KeyCode::Char('c') if ctrl => self.quit = true,
+            KeyCode::Char('c') if ctrl => {
+                if quit_armed {
+                    self.quit = true;
+                } else if self.is_running() {
+                    self.interrupt();
+                } else {
+                    self.input.clear();
+                    self.cursor = 0;
+                    self.recall = None;
+                }
+                self.quit_armed = !self.quit;
+            }
             KeyCode::Char('p') if ctrl => match self.recall {
                 Some(n) if n + 1 < self.sent.len() => self.show_recalled(n + 1),
                 Some(_) => {}
@@ -241,24 +382,23 @@ impl App {
             KeyCode::Esc => self.interrupt(),
             KeyCode::Enter => self.submit(),
             KeyCode::BackTab => self.set_mode(self.mode.toggle()),
-            KeyCode::Char(c) => {
-                let at = self.byte_pos();
-                self.input.insert(at, c);
-                self.cursor += 1;
-            }
-            KeyCode::Backspace if self.cursor > 0 => {
-                self.cursor -= 1;
-                let at = self.byte_pos();
-                self.input.remove(at);
-            }
-            KeyCode::Delete if self.cursor < self.input.chars().count() => {
-                let at = self.byte_pos();
-                self.input.remove(at);
-            }
+            KeyCode::Char('w') if ctrl => self.delete(self.word_back(), self.cursor),
+            KeyCode::Backspace if alt || ctrl => self.delete(self.word_back(), self.cursor),
+            KeyCode::Char('u') if ctrl => self.delete(self.line_bounds().0, self.cursor),
+            KeyCode::Char('k') if ctrl => self.delete(self.cursor, self.line_bounds().1),
+            KeyCode::Char('a') if ctrl => self.cursor = self.line_bounds().0,
+            KeyCode::Char('e') if ctrl => self.cursor = self.line_bounds().1,
+            KeyCode::Char('b') if alt => self.cursor = self.word_back(),
+            KeyCode::Char('f') if alt => self.cursor = self.word_forward(),
+            KeyCode::Left if ctrl || alt => self.cursor = self.word_back(),
+            KeyCode::Right if ctrl || alt => self.cursor = self.word_forward(),
+            KeyCode::Char(c) if !ctrl && !alt => self.insert(c.encode_utf8(&mut [0; 4])),
+            KeyCode::Backspace if self.cursor > 0 => self.delete(self.cursor - 1, self.cursor),
+            KeyCode::Delete => self.delete(self.cursor, self.cursor + 1),
             KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
             KeyCode::Right => self.cursor = (self.cursor + 1).min(self.input.chars().count()),
-            KeyCode::Home => self.cursor = 0,
-            KeyCode::End => self.cursor = self.input.chars().count(),
+            KeyCode::Home => self.cursor = self.line_bounds().0,
+            KeyCode::End => self.cursor = self.line_bounds().1,
             // The terminal sends the mouse wheel as Up/Down (alternate scroll mode).
             KeyCode::Up => self.scroll = self.scroll.saturating_add(1),
             KeyCode::Down => self.scroll = self.scroll.saturating_sub(1),
@@ -336,20 +476,21 @@ impl App {
             self.command(commands::parse(&text));
             return;
         }
-        let blocked = if self.active.is_none() {
-            Some(NO_PROVIDERS)
-        } else if self.is_running() {
-            Some("agent is busy; Esc to interrupt")
-        } else {
-            None
-        };
-        if let Some(msg) = blocked {
-            self.log.push(Entry::Error(msg.into()));
+        if self.active.is_none() {
+            self.log.push(Entry::Error(NO_PROVIDERS.into()));
             self.input = text;
             self.cursor = self.input.chars().count();
             return;
         }
-        self.log.push(Entry::User(text.clone()));
+        if self.is_running() {
+            self.queued.push_back(text);
+            return;
+        }
+        self.send(text);
+    }
+
+    fn send(&mut self, text: String) {
+        self.push_log(Entry::User(text.clone()));
         self.history.push(Message::User(text));
         self.start_run();
     }
@@ -371,6 +512,13 @@ impl App {
             extra: self.think_patch(),
         };
         self.running = Some(tokio::spawn(agent::run(run, self.tx.clone(), self.run_id)));
+        self.phase = (Phase::Waiting, Instant::now());
+    }
+
+    fn set_phase(&mut self, phase: Phase) {
+        if self.phase.0 != phase {
+            self.phase = (phase, Instant::now());
+        }
     }
 
     fn think_patch(&self) -> Option<Value> {
@@ -393,6 +541,33 @@ impl App {
             self.run_id += 1;
             self.push_log(Entry::Info("interrupted".into()));
         }
+        // Hand queued messages back for editing rather than running them after an interrupt.
+        if !self.queued.is_empty() {
+            let mut parts: Vec<String> = self.queued.drain(..).collect();
+            if !self.input.is_empty() {
+                parts.push(std::mem::take(&mut self.input));
+            }
+            self.input = parts.join("\n");
+            self.cursor = self.input.chars().count();
+        }
+    }
+
+    /// Declining sends the typed input along as the reason.
+    fn answer(&mut self, a: Approval) {
+        let answer = match a.choice {
+            0 => Answer::Yes,
+            1 => {
+                self.always.insert(a.name);
+                Answer::Yes
+            }
+            _ => {
+                let reason = std::mem::take(&mut self.input).trim().to_string();
+                self.cursor = 0;
+                self.recall = None;
+                Answer::No((!reason.is_empty()).then_some(reason))
+            }
+        };
+        let _ = a.reply.send(answer);
     }
 
     fn set_mode(&mut self, mode: Mode) {
@@ -504,20 +679,21 @@ impl App {
             return;
         }
         match ev {
-            AgentEvent::TextDelta(t) => match self.log.last_mut() {
-                Some(Entry::Assistant(s)) => s.push_str(&t),
-                _ => self.push_log(Entry::Assistant(t)),
-            },
-            AgentEvent::Thinking => {
-                if !matches!(self.log.last(), Some(Entry::Thinking)) {
-                    self.log.push(Entry::Thinking)
+            AgentEvent::TextDelta(t) => {
+                self.set_phase(Phase::Writing);
+                match self.log.last_mut() {
+                    Some(Entry::Assistant(s)) => s.push_str(&t),
+                    _ => self.push_log(Entry::Assistant(t)),
                 }
             }
+            AgentEvent::Thinking => self.set_phase(Phase::Thinking),
             AgentEvent::ToolStart { name, arguments } => {
+                self.set_phase(Phase::Running(name.clone()));
                 self.push_log(Entry::Tool { name, arguments })
             }
             // Successful tool output is noise in the log; only errors are shown.
             AgentEvent::ToolResult { output, is_error } => {
+                self.set_phase(Phase::Waiting);
                 if is_error {
                     self.push_log(Entry::ToolOutput {
                         text: output,
@@ -540,28 +716,34 @@ impl App {
                     cached,
                 })
             }
-            AgentEvent::Approve(reply) if self.approve_all => {
-                let _ = reply.send(true);
+            AgentEvent::Approve { name, reply, .. } if self.always.contains(&name) => {
+                let _ = reply.send(Answer::Yes);
             }
-            AgentEvent::Approve(reply) => self.approval = Some(reply),
+            AgentEvent::Approve {
+                name,
+                arguments,
+                reply,
+            } => {
+                self.scroll = 0;
+                self.approval = Some(Approval {
+                    reply,
+                    name,
+                    arguments,
+                    choice: 0,
+                });
+            }
             AgentEvent::Error(e) => self.push_log(Entry::Error(e)),
             AgentEvent::Finished => {
-                self.drop_thinking();
-                self.running = None
+                self.running = None;
+                if !self.queued.is_empty() {
+                    let next = self.queued.drain(..).collect::<Vec<_>>().join("\n\n");
+                    self.send(next);
+                }
             }
-        }
-    }
-
-    /// `Thinking` is only a live indicator: whatever comes next replaces it, so a finished run
-    /// leaves no empty "thinking" lines between tool calls.
-    fn drop_thinking(&mut self) {
-        if matches!(self.log.last(), Some(Entry::Thinking)) {
-            self.log.pop();
         }
     }
 
     fn push_log(&mut self, entry: Entry) {
-        self.drop_thinking();
         self.log.push(entry);
     }
 }

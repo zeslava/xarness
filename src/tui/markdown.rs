@@ -1,4 +1,4 @@
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 
@@ -24,6 +24,13 @@ struct Renderer {
     in_code: bool,
     link: Option<(String, String)>,
     need_blank: bool,
+    table: Option<Table>,
+}
+
+/// Cells are buffered until the table ends, since column widths depend on every row.
+struct Table {
+    aligns: Vec<Alignment>,
+    rows: Vec<Vec<Vec<Span<'static>>>>,
 }
 
 impl Renderer {
@@ -118,10 +125,20 @@ impl Renderer {
                 );
                 self.link = Some((dest_url.into_string(), String::new()));
             }
-            Tag::Table(_) => self.flush(),
-            Tag::TableHead => self.styles.push(Style::new().add_modifier(Modifier::BOLD)),
-            Tag::TableCell if self.spans.iter().any(|s| !s.content.trim().is_empty()) => {
-                self.push(" │ ".into(), Style::new().add_modifier(Modifier::DIM));
+            Tag::Table(aligns) => {
+                self.flush();
+                self.table = Some(Table {
+                    aligns,
+                    rows: Vec::new(),
+                });
+            }
+            Tag::TableHead | Tag::TableRow => {
+                if let Some(t) = &mut self.table {
+                    t.rows.push(Vec::new());
+                }
+                if matches!(tag, Tag::TableHead) {
+                    self.styles.push(Style::new().add_modifier(Modifier::BOLD));
+                }
             }
             _ => {}
         }
@@ -133,7 +150,19 @@ impl Renderer {
                 self.styles.pop();
                 self.flush_block();
             }
-            TagEnd::Paragraph | TagEnd::Table => self.flush_block(),
+            TagEnd::Paragraph => self.flush_block(),
+            TagEnd::Table => {
+                if let Some(t) = self.table.take() {
+                    self.render_table(t);
+                }
+                self.need_blank = true;
+            }
+            TagEnd::TableCell => {
+                let cell = std::mem::take(&mut self.spans);
+                if let Some(row) = self.table.as_mut().and_then(|t| t.rows.last_mut()) {
+                    row.push(cell);
+                }
+            }
             TagEnd::BlockQuote(_) => {
                 self.flush_block();
                 self.quote -= 1;
@@ -167,9 +196,7 @@ impl Renderer {
             }
             TagEnd::TableHead => {
                 self.styles.pop();
-                self.flush_line(false);
             }
-            TagEnd::TableRow => self.flush_line(false),
             _ => {}
         }
     }
@@ -181,7 +208,7 @@ impl Renderer {
     }
 
     fn push(&mut self, text: String, style: Style) {
-        if self.spans.is_empty() {
+        if self.spans.is_empty() && self.table.is_none() {
             self.begin_line();
         }
         self.spans.push(Span::styled(text, style));
@@ -201,6 +228,58 @@ impl Renderer {
         }
         if self.in_code {
             self.spans.push(Span::raw("  "));
+        }
+    }
+
+    fn render_table(&mut self, t: Table) {
+        let cols = t.rows.iter().map(Vec::len).max().unwrap_or(0);
+        if cols == 0 {
+            return;
+        }
+        let cell_width = |c: &[Span]| c.iter().map(Span::width).sum::<usize>();
+        let widths: Vec<usize> = (0..cols)
+            .map(|i| {
+                t.rows
+                    .iter()
+                    .filter_map(|r| r.get(i))
+                    .map(|c| cell_width(c))
+                    .max()
+                    .unwrap_or(0)
+            })
+            .collect();
+        let border = Style::new().fg(Color::DarkGray);
+        let rule = |l: &str, m: &str, r: &str| {
+            let mid: Vec<String> = widths.iter().map(|w| "─".repeat(w + 2)).collect();
+            vec![Span::styled(format!("{l}{}{r}", mid.join(m)), border)]
+        };
+
+        let mut out = vec![rule("┌", "┬", "┐")];
+        for (i, mut row) in t.rows.into_iter().enumerate() {
+            row.resize_with(cols, Vec::new);
+            let mut line = vec![Span::styled("│", border)];
+            for (j, cell) in row.into_iter().enumerate() {
+                let pad = widths[j] - cell_width(&cell);
+                let left = match t.aligns.get(j) {
+                    Some(Alignment::Right) => pad,
+                    Some(Alignment::Center) => pad / 2,
+                    _ => 0,
+                };
+                line.push(Span::raw(" ".repeat(left + 1)));
+                line.extend(cell);
+                line.push(Span::raw(" ".repeat(pad - left + 1)));
+                line.push(Span::styled("│", border));
+            }
+            out.push(line);
+            if i == 0 {
+                out.push(rule("├", "┼", "┤"));
+            }
+        }
+        out.push(rule("└", "┴", "┘"));
+
+        for line in out {
+            self.begin_line();
+            self.spans.extend(line);
+            self.flush_line(false);
         }
     }
 
@@ -267,6 +346,22 @@ mod tests {
     #[test]
     fn nested_and_ordered_lists() {
         assert_eq!(plain("1. a\n   - b\n2. c"), ["1. a", "  • b", "2. c"]);
+    }
+
+    #[test]
+    fn table_columns_are_aligned() {
+        assert_eq!(
+            plain("| a | bbb |\n|---|--:|\n| long | 1 |\n\nend"),
+            [
+                "┌──────┬─────┐",
+                "│ a    │ bbb │",
+                "├──────┼─────┤",
+                "│ long │   1 │",
+                "└──────┴─────┘",
+                "",
+                "end",
+            ]
+        );
     }
 
     #[test]
