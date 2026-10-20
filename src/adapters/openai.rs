@@ -120,8 +120,8 @@ async fn pump(
 const MAX_RETRIES: u32 = 5;
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
-/// Retries rate-limit errors (429 or a "too many tokens" body), honoring `Retry-After`
-/// (seconds) or falling back to exponential backoff.
+/// Retries rate-limit errors (429 or a "too many tokens" body) and connect errors,
+/// honoring `Retry-After` (seconds) or falling back to exponential backoff.
 async fn send_with_retry(
     http: reqwest::RequestBuilder,
     tx: &mpsc::Sender<Result<LlmEvent>>,
@@ -131,26 +131,33 @@ async fn send_with_retry(
         let req = http
             .try_clone()
             .ok_or_else(|| anyhow!("request body is not cloneable"))?;
-        let resp = req.send().await?;
-        let status = resp.status();
-        if status.is_success() {
-            return Ok(resp);
-        }
-        let retry_after = resp
-            .headers()
-            .get(RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map(Duration::from_secs);
-        let body = resp.text().await.unwrap_or_default();
-        if let Some(e) = context_overflow(&body) {
-            return Err(e.into());
-        }
-        let rate_limited = status == StatusCode::TOO_MANY_REQUESTS
-            || body.to_lowercase().contains("too many tokens");
-        if !rate_limited || attempt >= MAX_RETRIES {
-            bail!("HTTP {status}: {body}");
-        }
+        let retry_after = match req.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    return Ok(resp);
+                }
+                let retry_after = resp
+                    .headers()
+                    .get(RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .map(Duration::from_secs);
+                let body = resp.text().await.unwrap_or_default();
+                if let Some(e) = context_overflow(&body) {
+                    return Err(e.into());
+                }
+                let rate_limited = status == StatusCode::TOO_MANY_REQUESTS
+                    || body.to_lowercase().contains("too many tokens");
+                if !rate_limited || attempt >= MAX_RETRIES {
+                    bail!("HTTP {status}: {body}");
+                }
+                retry_after
+            }
+            // Transient socket failures, e.g. EADDRNOTAVAIL when ephemeral ports run out.
+            Err(e) if e.is_connect() && attempt < MAX_RETRIES => None,
+            Err(e) => return Err(e.into()),
+        };
         let delay = retry_after
             .unwrap_or(Duration::from_secs(1 << attempt))
             .min(MAX_BACKOFF);
