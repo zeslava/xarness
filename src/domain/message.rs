@@ -33,6 +33,8 @@ pub enum Message {
     User(String),
     Assistant {
         content: String,
+        /// Sent back only within the current turn, as the models' chat templates expect.
+        reasoning: String,
         tool_calls: Vec<ToolCall>,
     },
     Tool {

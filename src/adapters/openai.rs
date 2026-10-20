@@ -238,12 +238,16 @@ fn message_json(m: &Message) -> Value {
         Message::User(c) => json!({ "role": "user", "content": c }),
         Message::Assistant {
             content,
+            reasoning,
             tool_calls,
         } => {
             let mut v = json!({
                 "role": "assistant",
                 "content": if content.is_empty() { Value::Null } else { content.as_str().into() },
             });
+            if !reasoning.is_empty() {
+                v["reasoning_content"] = reasoning.as_str().into();
+            }
             if !tool_calls.is_empty() {
                 v["tool_calls"] = tool_calls
                     .iter()
@@ -308,7 +312,7 @@ impl DeltaAccumulator {
         // llama.cpp/vLLM put thinking in `reasoning_content`, some servers use `reasoning`.
         let reasoning = text("reasoning_content").or_else(|| text("reasoning"));
         reasoning
-            .map(|_| LlmEvent::Reasoning)
+            .map(LlmEvent::ReasoningDelta)
             .into_iter()
             .chain(text("content").map(LlmEvent::TextDelta))
             .collect()

@@ -114,6 +114,7 @@ pub async fn run(mut r: Run, tx: UnboundedSender<(u64, AgentEvent)>, run_id: u64
 
         let mut stream = r.provider.stream(req);
         let mut text = String::new();
+        let mut reasoning = String::new();
         let mut calls = Vec::new();
         let mut truncated = false;
         while let Some(ev) = stream.next().await {
@@ -122,7 +123,10 @@ pub async fn run(mut r: Run, tx: UnboundedSender<(u64, AgentEvent)>, run_id: u64
                     text.push_str(&t);
                     send(AgentEvent::TextDelta(t));
                 }
-                Ok(LlmEvent::Reasoning) => send(AgentEvent::Thinking),
+                Ok(LlmEvent::ReasoningDelta(t)) => {
+                    reasoning.push_str(&t);
+                    send(AgentEvent::Thinking);
+                }
                 Ok(LlmEvent::Done {
                     tool_calls,
                     prompt_tokens,
@@ -164,6 +168,7 @@ pub async fn run(mut r: Run, tx: UnboundedSender<(u64, AgentEvent)>, run_id: u64
         retried = false;
         let mut batch = vec![Message::Assistant {
             content: text,
+            reasoning,
             tool_calls: calls.clone(),
         }];
         for c in &calls {
@@ -278,7 +283,7 @@ pub async fn compact(
                 summary.push_str(&t);
                 send(AgentEvent::TextDelta(t));
             }
-            Ok(LlmEvent::Reasoning) => send(AgentEvent::Thinking),
+            Ok(LlmEvent::ReasoningDelta(_)) => send(AgentEvent::Thinking),
             Ok(LlmEvent::Done { truncated: t, .. }) => truncated = t,
             Err(e) => {
                 send(AgentEvent::Error(format!("compaction failed: {e:#}")));
@@ -296,6 +301,7 @@ pub async fn compact(
             Message::User(COMPACT_REQUEST.into()),
             Message::Assistant {
                 content: summary,
+                reasoning: String::new(),
                 tool_calls: Vec::new(),
             },
         ]));
@@ -319,9 +325,11 @@ fn message_tokens(m: &Message) -> usize {
         }
         Message::Assistant {
             content,
+            reasoning,
             tool_calls,
         } => {
             estimate_tokens(content)
+                + estimate_tokens(reasoning)
                 + tool_calls
                     .iter()
                     .map(|c| estimate_tokens(&c.name) + estimate_tokens(&c.arguments))
@@ -490,8 +498,9 @@ fn trim(history: &[Message], budget: usize) -> ContextCut {
 }
 
 /// Tool outputs from finished turns (followed by a later user message) longer than this are
-/// replaced with `ELIDED_MARK`. The view changes only when a new turn starts, so within a turn
-/// the sent prefix stays byte-identical and the server's KV cache stays valid.
+/// replaced with `ELIDED_MARK`, and their reasoning is dropped. The view changes only when a new
+/// turn starts, so within a turn the sent prefix stays byte-identical and the server's KV cache
+/// stays valid.
 const ELIDE_MIN_BYTES: usize = 200;
 const ELIDED_MARK: &str = "[output from an earlier turn elided; re-run the tool if needed]";
 
@@ -512,6 +521,15 @@ fn elide_old_outputs(history: &[Message]) -> Vec<Message> {
                     content: ELIDED_MARK.into(),
                 }
             }
+            Message::Assistant {
+                content,
+                reasoning,
+                tool_calls,
+            } if i < last_user && !reasoning.is_empty() => Message::Assistant {
+                content: content.clone(),
+                reasoning: String::new(),
+                tool_calls: tool_calls.clone(),
+            },
             _ => m.clone(),
         })
         .collect()
@@ -559,6 +577,12 @@ fn system_prompt(
          Do exactly what the user asked — nothing more. If you have ideas, improvements or noticed \
          other problems, mention them briefly at the end and ask whether to act on them; do not act \
          on them yourself. If the user asks a question, answer it without changing anything.\n\
+         Ground every claim about the code in what you have read in this session; if you have not \
+         read it, read or search first instead of guessing. Before building on an assumption, \
+         state it in one sentence and verify it with a tool.\n\
+         When the user says you are wrong, do not apologize or agree yet: re-check with tools, then \
+         state what the code shows. If you were wrong, say so in one line and fix it; if you were \
+         right, say so and cite the evidence.\n\
          Be concise. When showing code from files, quote it verbatim; put explanations \
          outside the code block."
     );
@@ -588,6 +612,7 @@ mod tests {
             Message::User(format!("q{n}")),
             Message::Assistant {
                 content: "a".repeat(300),
+                reasoning: String::new(),
                 tool_calls: Vec::new(),
             },
         ]

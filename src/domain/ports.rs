@@ -26,8 +26,7 @@ pub struct ChatRequest {
 #[derive(Debug)]
 pub enum LlmEvent {
     TextDelta(String),
-    /// The model is producing reasoning; its text isn't needed downstream.
-    Reasoning,
+    ReasoningDelta(String),
     Done {
         tool_calls: Vec<ToolCall>,
         /// Exact prompt size as counted by the server, if it reports usage.
