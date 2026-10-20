@@ -697,6 +697,9 @@ mod tests {
         assert!(matches!(&elided[4], Message::Tool { content, .. } if content == ELIDED_MARK));
 
         let cut = trim(&history[..5], 1100);
-        assert_eq!(cut.truncated.iter().map(|&(i, _)| i).collect::<Vec<_>>(), [4]);
+        assert_eq!(
+            cut.truncated.iter().map(|&(i, _)| i).collect::<Vec<_>>(),
+            [4]
+        );
     }
 }
