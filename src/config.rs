@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use indexmap::IndexMap;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -31,6 +31,8 @@ pub struct ProviderConfig {
     pub api_key_env: Option<String>,
     #[serde(default)]
     pub models: Vec<ModelConfig>,
+    /// Inherited by models that set no `think` of their own.
+    pub think: Option<ThinkConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -45,12 +47,67 @@ pub struct ModelConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(try_from = "ThinkSpec")]
 pub struct ThinkConfig {
     /// Level used when the model is selected; absent = server default.
     pub default: Option<String>,
     /// Level name → fields merged into the request body as-is, since every
     /// server/model spells reasoning control differently.
     pub levels: IndexMap<String, Value>,
+}
+
+/// `think` is a full `{ default, levels }` table, the name of a built-in preset, or a list of
+/// `reasoning_effort` values.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ThinkSpec {
+    Preset(String),
+    Efforts(Vec<String>),
+    Full {
+        default: Option<String>,
+        levels: IndexMap<String, Value>,
+    },
+}
+
+impl TryFrom<ThinkSpec> for ThinkConfig {
+    type Error = String;
+
+    fn try_from(spec: ThinkSpec) -> Result<Self, String> {
+        Ok(match spec {
+            ThinkSpec::Full { default, levels } => Self { default, levels },
+            ThinkSpec::Preset(name) => Self {
+                default: None,
+                levels: think_preset(&name)
+                    .ok_or_else(|| format!("unknown think preset `{name}`; available: qwen"))?,
+            },
+            ThinkSpec::Efforts(efforts) => Self {
+                default: None,
+                levels: efforts
+                    .into_iter()
+                    .map(|e| {
+                        let patch = json!({ "reasoning_effort": e });
+                        (e, patch)
+                    })
+                    .collect(),
+            },
+        })
+    }
+}
+
+fn think_preset(name: &str) -> Option<IndexMap<String, Value>> {
+    match name {
+        // llama.cpp chat templates with a thinking switch (Qwen3 and alike).
+        "qwen" => Some(
+            [("on", true), ("off", false)]
+                .into_iter()
+                .map(|(l, on)| {
+                    let patch = json!({ "chat_template_kwargs": { "enable_thinking": on } });
+                    (l.to_string(), patch)
+                })
+                .collect(),
+        ),
+        _ => None,
+    }
 }
 
 /// One MCP server: `command` (stdio) or `url` (streamable HTTP), checked when connecting.
@@ -96,6 +153,15 @@ impl ProviderConfig {
                 .as_ref()
                 .and_then(|v| std::env::var(v).ok())
         })
+    }
+
+    /// `m` with provider-wide settings filled in where it has none.
+    fn model(&self, m: &ModelConfig) -> ModelConfig {
+        let mut m = m.clone();
+        if m.think.is_none() {
+            m.think = self.think.clone();
+        }
+        m
     }
 }
 
@@ -158,7 +224,7 @@ impl Config {
             .iter()
             .find(|m| m.id == model)
             .ok_or_else(|| anyhow!("unknown model `{model}` in provider `{provider}`"))?;
-        Ok((provider.to_string(), m.clone()))
+        Ok((provider.to_string(), p.model(m)))
     }
 
     /// `None` when no models are configured at all.
@@ -169,7 +235,7 @@ impl Config {
         Ok(self
             .providers
             .iter()
-            .find_map(|(name, p)| p.models.first().map(|m| (name.clone(), m.clone()))))
+            .find_map(|(name, p)| p.models.first().map(|m| (name.clone(), p.model(m)))))
     }
 
     pub fn all_models(&self) -> impl Iterator<Item = String> + '_ {
