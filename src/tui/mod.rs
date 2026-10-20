@@ -23,6 +23,8 @@ use app::App;
 pub async fn run(config: Config, tools: ToolRegistry) -> Result<()> {
     let (tx, rx) = mpsc::unbounded_channel();
     let (mcp_tx, mcp_rx) = mpsc::unbounded_channel();
+    let (job_tx, job_rx) = mpsc::unbounded_channel();
+    tools.watch_jobs(job_tx);
     if !config.mcp.is_empty() {
         let servers = config.mcp.clone();
         let root = tools.root().to_path_buf();
@@ -44,7 +46,7 @@ pub async fn run(config: Config, tools: ToolRegistry) -> Result<()> {
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         )?;
     }
-    let res = event_loop(&mut terminal, app, rx, mcp_rx).await;
+    let res = event_loop(&mut terminal, app, rx, mcp_rx, job_rx).await;
     if enhanced {
         let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     }
@@ -68,6 +70,7 @@ async fn event_loop(
     mut app: App,
     mut rx: mpsc::UnboundedReceiver<(u64, crate::agent::AgentEvent)>,
     mut mcp_rx: mpsc::UnboundedReceiver<mcp::Connected>,
+    mut job_rx: mpsc::UnboundedReceiver<String>,
 ) -> Result<()> {
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(100));
@@ -77,6 +80,7 @@ async fn event_loop(
             Some(ev) = events.next() => app.on_term_event(ev?),
             Some((id, ev)) = rx.recv() => app.on_agent_event(id, ev),
             Some(servers) = mcp_rx.recv() => app.on_mcp(servers),
+            Some(report) = job_rx.recv() => app.on_job(report),
             // Only animates the spinner, so no redraws while idle.
             _ = ticker.tick(), if app.is_running() => app.tick = app.tick.wrapping_add(1),
         }

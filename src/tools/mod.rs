@@ -13,6 +13,7 @@ use std::sync::{Arc, PoisonError, RwLock};
 use anyhow::{Result, anyhow, bail};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::domain::message::Mode;
 use crate::domain::ports::{Tool, ToolSpec};
@@ -20,6 +21,7 @@ use crate::domain::ports::{Tool, ToolSpec};
 pub struct ToolRegistry {
     root: PathBuf,
     tools: Vec<Arc<dyn Tool>>,
+    jobs: Arc<jobs::Jobs>,
     /// Added once MCP servers connect, after startup.
     mcp: RwLock<Vec<Arc<dyn Tool>>>,
 }
@@ -39,14 +41,22 @@ impl ToolRegistry {
                 Arc::new(run::RunCommand {
                     jobs: Arc::clone(&jobs),
                 }),
-                Arc::new(jobs::JobTool { jobs }),
+                Arc::new(jobs::JobTool {
+                    jobs: Arc::clone(&jobs),
+                }),
             ],
+            jobs,
             mcp: RwLock::default(),
         }
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// `tx` receives a report for each background job that exits.
+    pub fn watch_jobs(&self, tx: UnboundedSender<String>) {
+        self.jobs.notify(tx);
     }
 
     pub fn add_mcp(&self, tools: Vec<Arc<dyn Tool>>) {

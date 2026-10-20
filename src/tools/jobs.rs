@@ -1,27 +1,31 @@
 use std::path::Path;
 use std::process::{Child, ExitStatus};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedSender;
 
 use super::run::{self, TIMEOUT};
 use futures::FutureExt;
-use futures::future::{self, BoxFuture};
+use futures::future::BoxFuture;
 
 use crate::domain::ports::{Tool, ToolSpec};
 
 /// A long-running server must not grow memory without bound; only the tail is ever shown.
 const OUTPUT_CAP: usize = 1 << 20;
 const TAIL_LINES: usize = 40;
+const WATCH_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Background commands started by `run`. Jobs outlive agent turns, so an aborted turn
 /// leaves them running; they are killed when the registry is dropped on exit.
 #[derive(Default)]
 pub struct Jobs {
     list: Mutex<Vec<Job>>,
+    /// Receives the report of each job that exits, unless the model already saw it via `job`.
+    notify: Mutex<Option<UnboundedSender<String>>>,
 }
 
 struct Job {
@@ -30,6 +34,8 @@ struct Job {
     output: Arc<Mutex<Vec<u8>>>,
     started: Instant,
     status: Option<ExitStatus>,
+    /// The exit was shown to the model, either by `job` or by a notification.
+    reported: bool,
 }
 
 impl Job {
@@ -54,11 +60,32 @@ impl Job {
             Some(s) => exit_label(s),
         }
     }
+
+    fn report(&mut self, id: usize, killed: bool) -> String {
+        let bytes = self
+            .output
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let text = String::from_utf8_lossy(&bytes);
+        let output = match self.poll() {
+            Some(s) if !s.success() && !killed => run::condense(&text),
+            _ => run::tail(&text, TAIL_LINES),
+        };
+        if self.status.is_some() {
+            self.reported = true;
+        }
+        format!("#{id} {}: {}\n{output}", self.state(), self.command)
+    }
 }
 
 impl Jobs {
+    pub fn notify(&self, tx: UnboundedSender<String>) {
+        *self.notify.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    }
+
     /// Returns the 1-based job id.
-    pub fn start(&self, command: &str, root: &Path) -> Result<usize> {
+    pub fn start(self: &Arc<Self>, command: &str, root: &Path) -> Result<usize> {
         let mut cmd = run::shell(command, root);
         // Its own process group, so a kill also reaches whatever the shell spawned.
         #[cfg(unix)]
@@ -66,15 +93,59 @@ impl Jobs {
         let mut child = cmd.spawn().context("spawning sh")?;
         let stdout = child.stdout.take().context("no stdout")?;
         let (output, _) = run::collect(stdout, OUTPUT_CAP);
-        let mut list = self.list.lock().unwrap_or_else(|e| e.into_inner());
-        list.push(Job {
-            command: command.to_string(),
-            child,
-            output,
-            started: Instant::now(),
-            status: None,
-        });
-        Ok(list.len())
+        let id = {
+            let mut list = self.lock();
+            list.push(Job {
+                command: command.to_string(),
+                child,
+                output,
+                started: Instant::now(),
+                status: None,
+                reported: false,
+            });
+            list.len()
+        };
+        tokio::spawn(watch(Arc::downgrade(self), id));
+        Ok(id)
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Vec<Job>> {
+        self.list.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn get(&self, id: usize) -> Result<MutexGuard<'_, Vec<Job>>> {
+        let list = self.lock();
+        if id == 0 || id > list.len() {
+            bail!("no job #{id}");
+        }
+        Ok(list)
+    }
+
+    fn running(&self, id: usize) -> Result<bool> {
+        Ok(self.get(id)?[id - 1].poll().is_none())
+    }
+}
+
+/// Weak, so a watcher doesn't keep the registry alive and its `Drop` still kills the jobs.
+async fn watch(jobs: Weak<Jobs>, id: usize) {
+    loop {
+        tokio::time::sleep(WATCH_INTERVAL).await;
+        let Some(jobs) = jobs.upgrade() else { return };
+        let report = {
+            let mut list = jobs.lock();
+            let job = &mut list[id - 1];
+            if job.poll().is_none() {
+                continue;
+            }
+            if job.reported {
+                return;
+            }
+            job.report(id, false)
+        };
+        if let Some(tx) = &*jobs.notify.lock().unwrap_or_else(|e| e.into_inner()) {
+            let _ = tx.send(report);
+        }
+        return;
     }
 }
 
@@ -122,7 +193,7 @@ impl Tool for JobTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "job".into(),
-            description: "Inspect background commands started with `run` and `background: true`. Without `id`, lists all jobs. With `id`, shows the job's status and the last lines of its output; `wait` first waits up to that many seconds (at most 120) for it to exit, `kill` stops it.".into(),
+            description: "Inspect background jobs (exits are reported automatically, no need to poll). Without `id`, lists jobs. With `id`, shows status and output tail; `wait` waits up to N seconds (max 120) for exit, `kill` stops it.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -140,50 +211,36 @@ impl Tool for JobTool {
     }
 
     fn run(&self, args: Value, _root: &Path) -> BoxFuture<'static, Result<String>> {
-        future::ready(self.call(args, _root)).boxed()
+        let jobs = Arc::clone(&self.jobs);
+        async move { call(&jobs, args).await }.boxed()
     }
 }
 
-impl JobTool {
-    fn call(&self, args: Value, _root: &Path) -> Result<String> {
-        let a: Args = super::parse(args)?;
-        let Some(id) = a.id else {
-            let mut list = self.jobs.list.lock().unwrap_or_else(|e| e.into_inner());
-            if list.is_empty() {
-                return Ok("no jobs".into());
-            }
-            return Ok(list
-                .iter_mut()
-                .enumerate()
-                .map(|(i, j)| format!("#{} {}: {}\n", i + 1, j.state(), j.command))
-                .collect());
-        };
+async fn call(jobs: &Jobs, args: Value) -> Result<String> {
+    let a: Args = super::parse(args)?;
+    let Some(id) = a.id else {
+        let mut list = jobs.lock();
+        if list.is_empty() {
+            return Ok("no jobs".into());
+        }
+        return Ok(list
+            .iter_mut()
+            .enumerate()
+            .map(|(i, j)| format!("#{} {}: {}\n", i + 1, j.state(), j.command))
+            .collect());
+    };
 
-        let lookup = || {
-            let list = self.jobs.list.lock().unwrap_or_else(|e| e.into_inner());
-            if id == 0 || id > list.len() {
-                bail!("no job #{id}");
-            }
-            Ok(list)
-        };
-        if let Some(secs) = a.wait {
-            let deadline = Instant::now() + Duration::from_secs(secs).min(TIMEOUT);
-            // The lock is released between polls so other calls aren't blocked meanwhile.
-            while lookup()?[id - 1].poll().is_none() && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(100));
-            }
+    if let Some(secs) = a.wait {
+        let deadline = Instant::now() + Duration::from_secs(secs).min(TIMEOUT);
+        // Async, so Esc can abort the wait.
+        while jobs.running(id)? && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let mut list = lookup()?;
-        let job = &mut list[id - 1];
-        if a.kill {
-            job.kill();
-        }
-        let bytes = job.output.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let text = String::from_utf8_lossy(&bytes);
-        let output = match job.poll() {
-            Some(s) if !s.success() && !a.kill => run::condense(&text),
-            _ => run::tail(&text, TAIL_LINES),
-        };
-        Ok(format!("#{id} {}: {}\n{output}", job.state(), job.command))
     }
+    let mut list = jobs.get(id)?;
+    let job = &mut list[id - 1];
+    if a.kill {
+        job.kill();
+    }
+    Ok(job.report(id, a.kill))
 }

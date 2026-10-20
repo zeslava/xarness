@@ -119,6 +119,9 @@ pub struct App {
     pub phase: (Phase, Instant),
     /// Messages submitted while a run was active, sent together as one turn when it finishes.
     pub queued: VecDeque<String>,
+    /// Reports of exited background jobs not yet sent to the model. They start a turn of their
+    /// own when idle, otherwise they ride along with the next message.
+    notices: Vec<String>,
     approval: Option<Approval>,
     /// Tools answered with "always": approved without asking until the app exits.
     pub always: BTreeSet<String>,
@@ -172,6 +175,7 @@ impl App {
             running: None,
             phase: (Phase::Waiting, Instant::now()),
             queued: VecDeque::new(),
+            notices: Vec::new(),
             approval: None,
             always: BTreeSet::new(),
             run_id: 0,
@@ -495,8 +499,45 @@ impl App {
 
     fn send(&mut self, text: String) {
         self.push_log(Entry::User(text.clone()));
-        self.history.push(Message::User(text));
+        let content = match self.take_notices() {
+            Some(notices) => format!("{notices}\n\n{text}"),
+            None => text,
+        };
+        self.history.push(Message::User(content));
         self.start_run();
+    }
+
+    fn send_notices(&mut self) {
+        if let Some(notices) = self.take_notices() {
+            self.history.push(Message::User(notices));
+            self.start_run();
+        }
+    }
+
+    fn take_notices(&mut self) -> Option<String> {
+        if self.notices.is_empty() {
+            return None;
+        }
+        Some(
+            self.notices
+                .drain(..)
+                .map(|r| {
+                    format!(
+                        "[automatic notice, not written by the user] Background job exited:\n{r}"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        )
+    }
+
+    pub fn on_job(&mut self, report: String) {
+        let summary = report.lines().next().unwrap_or_default();
+        self.push_log(Entry::Info(format!("job {summary}")));
+        self.notices.push(report);
+        if !self.is_running() && self.active.is_some() {
+            self.send_notices();
+        }
     }
 
     fn start_run(&mut self) {
@@ -776,6 +817,8 @@ impl App {
                 if !self.queued.is_empty() {
                     let next = self.queued.drain(..).collect::<Vec<_>>().join("\n\n");
                     self.send(next);
+                } else {
+                    self.send_notices();
                 }
             }
         }

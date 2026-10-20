@@ -36,7 +36,7 @@ impl Tool for RunCommand {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "run".into(),
-            description: "Run a shell command in the working directory, e.g. the build, test or lint commands from the project instructions. Run it after editing code to check your changes. Output is condensed: on failure the error lines (at most 60), on success the last lines. Times out after 120s. For commands that keep running, such as dev servers or watchers, set `background` and check on them with the `job` tool.".into(),
+            description: "Run a shell command in the working directory, e.g. the build, test or lint commands from the project instructions. Run it after editing code to check your changes. Output is condensed: on failure the error lines (at most 60), on success the last lines. Times out after 120s. Set `background` for dev servers, watchers, or long builds and tests: it returns at once, and the result arrives as a message when the command exits.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
