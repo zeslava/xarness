@@ -13,6 +13,26 @@ pub struct Config {
     pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
     pub mcp: BTreeMap<String, McpServerConfig>,
+    #[serde(default)]
+    pub skills: SkillsConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct SkillsConfig {
+    /// Other agents whose skill dirs are searched too, as `.<name>/skills` in the project and home.
+    pub compat: Vec<String>,
+    /// Skill names to skip.
+    pub disabled: Vec<String>,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            compat: vec!["agents".into(), "claude".into()],
+            disabled: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Default)]

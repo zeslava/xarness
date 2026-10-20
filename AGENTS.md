@@ -4,18 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`xarness` — a terminal (ratatui) coding agent that talks to OpenAI-compatible chat-completions endpoints (e.g. local llama.cpp). Single binary crate, Rust edition 2024.
-
-## Commands
-
-```sh
-cargo build
-cargo run                      # launches the TUI in the current dir (needs a config, see below)
-cargo test                     # unit tests
-cargo test <name>              # single test by name substring
-cargo clippy --all-targets
-cargo fmt
-```
+`xarness` — a terminal (ratatui) coding agent that talks to OpenAI-compatible chat-completions endpoints (e.g. local llama.cpp).
 
 The working directory at launch becomes the sandbox root for all tools.
 
@@ -33,6 +22,7 @@ The schema is defined in `src/config.rs`.
 - `context_window` enables history trimming; without it, the provider is asked (llama.cpp `/props` → `n_ctx`, fetched each turn), and if that fails full history is sent.
 - `think.levels` maps a level name to raw JSON merged into the request body (`ChatRequest.extra`) — reasoning control is provider-specific, so it is pure config, not code. `think` may instead be a list of `reasoning_effort` values (`["low", "high"]`) or a preset name (`qwen`, see `think_preset`), and may be set on the provider, where models without their own inherit it.
 - `mcp.<server>` configures an MCP server: `command`/`args`/`env` (stdio) or `url`/`headers`/`headers_env` (streamable HTTP), plus `enabled`, `approval` (`auto` | `always` | `never`) and an optional `tools` allowlist.
+- `skills.compat` (default `["agents", "claude"]`) adds other agents' skill dirs `.<name>/skills`; `skills.disabled` lists skill names to skip.
 
 ## Architecture
 
@@ -51,3 +41,4 @@ Hexagonal layout:
 - **Background jobs report back** (`tools/jobs.rs`): `run` with `background` starts a job whose watcher sends its report to the TUI when it exits (skipped if the model already saw the exit via `job`). The report becomes a `User` message marked as an automatic notice: it starts a turn when idle, otherwise it is sent with the next turn after `Finished`. It is never injected mid-turn.
 - The system prompt is rebuilt each turn from the current `Mode`. `AGENTS.md` from the working directory (only there, no parent/subdir lookup) is read once in `App::new` and appended to it.
 - `repomap.rs` builds a repo map (files + tree-sitter tag definitions, Rust/Go/JS/TS) appended to the system prompt. It is built only in `App::new` and on `/map`, never per turn, so the prompt prefix stays byte-identical for the server's KV cache. Over budget it degrades by `Depth` (trait-impl methods → all members → paths only → truncated paths).
+- `skills.rs` loads Agent Skills (`<dir>/<name>/SKILL.md`, YAML frontmatter parsed by a minimal subset parser) once at startup from `./.xarness/skills`, project compat dirs, `~/.config/xarness/skills`, then home compat dirs; the first skill of a name wins. Only the catalog (name + description) goes into the system prompt; the model loads a body with the `skill` tool, the user with `/<name> [args]`. `skill` reads extra files with the skill dir as the `resolve` root, so global skills don't widen the sandbox. `skill` outputs are never elided or truncated by context fitting, only dropped with their whole turn.

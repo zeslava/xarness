@@ -16,6 +16,7 @@ use crate::config::{Config, ModelConfig};
 use crate::domain::message::{Message, Mode};
 use crate::domain::ports::LlmProvider;
 use crate::repomap;
+use crate::skills::{Skill, Skills};
 use crate::tools::ToolRegistry;
 
 pub enum Entry {
@@ -41,6 +42,11 @@ pub struct ContextUsage {
     pub used: u32,
     pub window: Option<u32>,
     pub cached: Option<u32>,
+}
+
+/// Skills available as `/name`; built-in commands take precedence.
+fn is_command(skill: &Skill) -> bool {
+    skill.user_invocable && !commands::is_builtin(&skill.name)
 }
 
 fn default_think(model: &ModelConfig) -> Option<String> {
@@ -86,6 +92,9 @@ pub struct App {
     tools: Arc<ToolRegistry>,
     /// Contents of AGENTS.md in the working directory, read once at startup.
     instructions: Option<Arc<str>>,
+    skills: Arc<Skills>,
+    /// Built at startup only, so the system prompt prefix stays cacheable.
+    skill_catalog: Option<Arc<str>>,
     /// Per server: tool count or connection error; `None` while connecting.
     mcp: Option<Vec<(String, Result<usize, String>)>>,
     /// Built at startup and on `/map` only, so the system prompt prefix stays cacheable.
@@ -136,6 +145,7 @@ impl App {
     pub fn new(
         config: Config,
         tools: ToolRegistry,
+        skills: Arc<Skills>,
         tx: UnboundedSender<(u64, AgentEvent)>,
     ) -> anyhow::Result<Self> {
         let active = config
@@ -156,6 +166,8 @@ impl App {
             tools: Arc::new(tools),
             mcp: None,
             instructions,
+            skill_catalog: skills.catalog().map(Arc::from),
+            skills,
             repo_map,
             mode: Mode::Plan,
             history: Vec::new(),
@@ -417,7 +429,15 @@ impl App {
     }
 
     pub fn completions(&self) -> Vec<Completion> {
-        commands::complete(&self.input, |name| self.arg_candidates(name))
+        let skills = self
+            .user_skills()
+            .map(|s| (s.name.clone(), s.short_description(60)))
+            .collect();
+        commands::complete(&self.input, skills, |name| self.arg_candidates(name))
+    }
+
+    fn user_skills(&self) -> impl Iterator<Item = &Skill> {
+        self.skills.list.iter().filter(|s| is_command(s))
     }
 
     fn arg_candidates(&self, command: &str) -> Vec<(String, String)> {
@@ -498,7 +518,12 @@ impl App {
     }
 
     fn send(&mut self, text: String) {
-        self.push_log(Entry::User(text.clone()));
+        self.send_as(text.clone(), text);
+    }
+
+    /// `shown` goes to the log, `text` to the model.
+    fn send_as(&mut self, shown: String, text: String) {
+        self.push_log(Entry::User(shown));
         let content = match self.take_notices() {
             Some(notices) => format!("{notices}\n\n{text}"),
             None => text,
@@ -558,6 +583,7 @@ impl App {
             cut: self.cut.clone(),
             tools: self.tools.clone(),
             instructions: self.instructions.clone(),
+            skills: self.skill_catalog.clone(),
             repo_map: self.repo_map.clone(),
             extra: self.think_patch(),
         };
@@ -713,6 +739,10 @@ impl App {
                 let msg = self.mcp_status();
                 self.log.push(Entry::Info(msg));
             }
+            Command::Skills => {
+                let msg = self.skills_status();
+                self.log.push(Entry::Info(msg));
+            }
             Command::Clear => {
                 self.interrupt();
                 self.history.clear();
@@ -741,9 +771,20 @@ impl App {
             }
             Command::Help => self.log.push(Entry::Info(commands::HELP.into())),
             Command::Quit => self.quit = true,
-            Command::Unknown(name) => self
-                .log
-                .push(Entry::Error(format!("unknown command /{name}; /help"))),
+            Command::Other { name, arg } => {
+                let skills = Arc::clone(&self.skills);
+                match skills.get(&name).filter(|s| is_command(s)) {
+                    Some(skill) => self.invoke_skill(skill, arg),
+                    None => {
+                        let name = match arg {
+                            Some(a) => format!("{name} {a}"),
+                            None => name,
+                        };
+                        self.log
+                            .push(Entry::Error(format!("unknown command /{name}; /help")))
+                    }
+                }
+            }
         }
     }
 
@@ -839,6 +880,67 @@ impl App {
         self.mcp = Some(status);
         let msg = self.mcp_status();
         self.push_log(Entry::Info(msg));
+    }
+
+    fn invoke_skill(&mut self, skill: &Skill, arg: Option<String>) {
+        if self.active.is_none() {
+            self.log.push(Entry::Error(NO_PROVIDERS.into()));
+            return;
+        }
+        if self.is_running() {
+            self.log.push(Entry::Error(
+                "a run is active; wait for it or interrupt (Esc)".into(),
+            ));
+            return;
+        }
+        let body = match skill.body() {
+            Ok(b) => b,
+            Err(e) => {
+                self.log.push(Entry::Error(format!("{e:#}")));
+                return;
+            }
+        };
+        let mut text = format!("[skill `{}` invoked by the user]\n\n{body}", skill.name);
+        let mut shown = format!("/{}", skill.name);
+        if let Some(a) = arg {
+            text.push_str(&format!("\n\nArguments: {a}"));
+            shown.push_str(&format!(" {a}"));
+        }
+        self.send_as(shown, text);
+    }
+
+    fn skills_status(&self) -> String {
+        let mut lines: Vec<String> = self
+            .skills
+            .list
+            .iter()
+            .map(|s| {
+                let mut flags = Vec::new();
+                if !s.model_invocable {
+                    flags.push("user only".to_string());
+                }
+                if !s.user_invocable {
+                    flags.push("model only".to_string());
+                } else if commands::is_builtin(&s.name) {
+                    flags.push(format!("/{} is built in", s.name));
+                }
+                let flags = match flags.is_empty() {
+                    true => String::new(),
+                    false => format!(" ({})", flags.join(", ")),
+                };
+                format!(
+                    "{}{flags}: {}\n  {}",
+                    s.name,
+                    s.short_description(100),
+                    s.dir.display()
+                )
+            })
+            .collect();
+        if lines.is_empty() {
+            lines.push("skills: none found".into());
+        }
+        lines.extend(self.skills.warnings.iter().map(|w| format!("! {w}")));
+        lines.join("\n")
     }
 
     fn mcp_status(&self) -> String {

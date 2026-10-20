@@ -6,14 +6,19 @@ pub enum Command {
     Map,
     MapShow,
     Mcp,
+    Skills,
     Compact(Option<String>),
     Clear,
     Help,
     Quit,
-    Unknown(String),
+    /// Not built in: a skill, or unknown.
+    Other {
+        name: String,
+        arg: Option<String>,
+    },
 }
 
-pub const HELP: &str = "/clear  /compact [focus]  /plan  /build  /model [provider/model]  /think [level]  /map [show]  /mcp  /help  /quit\n\
+pub const HELP: &str = "/clear  /compact [focus]  /plan  /build  /model [provider/model]  /think [level]  /map [show]  /mcp  /skills  /<skill> [args]  /help  /quit\n\
 Tab — complete command, Shift+Tab — toggle mode, Esc — interrupt, Up/Down/PgUp/PgDn/wheel — scroll, Ctrl+P/Ctrl+N — input history, Ctrl+C — interrupt or clear input, twice to quit\n\
 Shift+Enter/Alt+Enter/Ctrl+J — new line, Ctrl+W/Alt+Backspace — delete word, Ctrl+U/Ctrl+K — delete to line start/end, \
 Ctrl+A/Ctrl+E — line start/end, Ctrl+←→/Alt+B/Alt+F — move by word\n\
@@ -28,6 +33,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("think", "list or set reasoning level"),
     ("map", "rebuild repo map"),
     ("mcp", "MCP server status"),
+    ("skills", "list skills"),
     ("help", "show help"),
     ("quit", "exit"),
 ];
@@ -41,15 +47,21 @@ pub struct Completion {
 
 /// Completions for a `/name` or `/name arg` being typed: exact, then prefix, then fuzzy
 /// (subsequence) matches. Argument candidates come from `args(name)`, since some are
-/// only known at run time (config). Empty past the first argument.
-pub fn complete(input: &str, args: impl Fn(&str) -> Vec<(String, String)>) -> Vec<Completion> {
+/// only known at run time (config). `extra` are commands added at run time (skills). Empty past
+/// the first argument.
+pub fn complete(
+    input: &str,
+    extra: Vec<(String, String)>,
+    args: impl Fn(&str) -> Vec<(String, String)>,
+) -> Vec<Completion> {
     let Some(typed) = input.strip_prefix('/') else {
         return Vec::new();
     };
     let Some((name, arg)) = typed.split_once(char::is_whitespace) else {
         let commands = COMMANDS
             .iter()
-            .map(|&(name, desc)| (name.to_string(), desc.to_string()));
+            .map(|&(name, desc)| (name.to_string(), desc.to_string()))
+            .chain(extra);
         return ranked(typed, commands)
             .into_iter()
             .map(|(name, desc)| Completion {
@@ -100,6 +112,10 @@ fn is_subsequence(needle: &str, haystack: &str) -> bool {
     needle.chars().all(|c| hay.any(|h| h == c))
 }
 
+pub fn is_builtin(name: &str) -> bool {
+    COMMANDS.iter().any(|&(n, _)| n == name) || matches!(name, "exit" | "q")
+}
+
 pub fn parse(input: &str) -> Command {
     let mut parts = input.trim_start_matches('/').splitn(2, char::is_whitespace);
     let name = parts.next().unwrap_or_default();
@@ -112,13 +128,20 @@ pub fn parse(input: &str) -> Command {
         "map" => match arg {
             None => Command::Map,
             Some("show") => Command::MapShow,
-            Some(other) => Command::Unknown(format!("map {other}")),
+            Some(other) => Command::Other {
+                name: "map".into(),
+                arg: Some(other.into()),
+            },
         },
         "mcp" => Command::Mcp,
+        "skills" => Command::Skills,
         "compact" => Command::Compact(arg.map(str::to_string)),
         "clear" => Command::Clear,
         "help" => Command::Help,
         "quit" | "exit" | "q" => Command::Quit,
-        other => Command::Unknown(other.to_string()),
+        other => Command::Other {
+            name: other.to_string(),
+            arg: arg.map(str::to_string),
+        },
     }
 }

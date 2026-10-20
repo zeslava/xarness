@@ -4,6 +4,7 @@ mod markdown;
 mod ui;
 
 use std::io::Write;
+use std::sync::Arc;
 
 use anyhow::Result;
 use crossterm::event::{
@@ -17,10 +18,11 @@ use tokio::sync::mpsc;
 
 use crate::adapters::mcp;
 use crate::config::Config;
+use crate::skills::Skills;
 use crate::tools::ToolRegistry;
 use app::App;
 
-pub async fn run(config: Config, tools: ToolRegistry) -> Result<()> {
+pub async fn run(config: Config, tools: ToolRegistry, skills: Arc<Skills>) -> Result<()> {
     let (tx, rx) = mpsc::unbounded_channel();
     let (mcp_tx, mcp_rx) = mpsc::unbounded_channel();
     let (job_tx, job_rx) = mpsc::unbounded_channel();
@@ -33,7 +35,7 @@ pub async fn run(config: Config, tools: ToolRegistry) -> Result<()> {
             let _ = mcp_tx.send(mcp::connect_all(servers, root).await);
         });
     }
-    let app = App::new(config, tools, tx)?;
+    let app = App::new(config, tools, skills, tx)?;
     let mut terminal = ratatui::init();
     set_alternate_scroll(true)?;
     // Without it a pasted newline arrives as Enter and submits the first line.

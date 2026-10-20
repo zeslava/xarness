@@ -3,8 +3,11 @@ mod agent;
 mod config;
 mod domain;
 mod repomap;
+mod skills;
 mod tools;
 mod tui;
+
+use std::sync::Arc;
 
 use anyhow::Result;
 
@@ -12,5 +15,11 @@ use anyhow::Result;
 async fn main() -> Result<()> {
     let config = config::Config::load()?;
     let root = std::env::current_dir()?.canonicalize()?;
-    tui::run(config, tools::ToolRegistry::new(root)).await
+    let skills = Arc::new(skills::Skills::discover(&root, &config.skills));
+    tui::run(
+        config,
+        tools::ToolRegistry::new(root, Arc::clone(&skills)),
+        skills,
+    )
+    .await
 }

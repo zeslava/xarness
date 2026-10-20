@@ -4,6 +4,7 @@ mod jobs;
 mod ls;
 mod read;
 mod run;
+mod skill;
 mod symbol;
 mod write;
 
@@ -17,6 +18,9 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::domain::message::Mode;
 use crate::domain::ports::{Tool, ToolSpec};
+use crate::skills::Skills;
+
+pub(crate) use skill::NAME as SKILL_TOOL;
 
 pub struct ToolRegistry {
     root: PathBuf,
@@ -27,24 +31,28 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
-    pub fn new(root: PathBuf) -> Self {
+    pub fn new(root: PathBuf, skills: Arc<Skills>) -> Self {
         let jobs = Arc::new(jobs::Jobs::default());
+        let mut tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(read::ReadFile),
+            Arc::new(symbol::ReadSymbol),
+            Arc::new(ls::ListDir),
+            Arc::new(grep::Grep),
+            Arc::new(write::WriteFile),
+            Arc::new(edit::EditFile),
+            Arc::new(run::RunCommand {
+                jobs: Arc::clone(&jobs),
+            }),
+            Arc::new(jobs::JobTool {
+                jobs: Arc::clone(&jobs),
+            }),
+        ];
+        if !skills.list.is_empty() {
+            tools.push(Arc::new(skill::SkillTool { skills }));
+        }
         Self {
             root,
-            tools: vec![
-                Arc::new(read::ReadFile),
-                Arc::new(symbol::ReadSymbol),
-                Arc::new(ls::ListDir),
-                Arc::new(grep::Grep),
-                Arc::new(write::WriteFile),
-                Arc::new(edit::EditFile),
-                Arc::new(run::RunCommand {
-                    jobs: Arc::clone(&jobs),
-                }),
-                Arc::new(jobs::JobTool {
-                    jobs: Arc::clone(&jobs),
-                }),
-            ],
+            tools,
             jobs,
             mcp: RwLock::default(),
         }

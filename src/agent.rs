@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -8,7 +9,7 @@ use tokio::sync::oneshot;
 use crate::config::ModelConfig;
 use crate::domain::message::{Message, Mode};
 use crate::domain::ports::{ChatRequest, ContextOverflow, LlmEvent, LlmProvider};
-use crate::tools::ToolRegistry;
+use crate::tools::{SKILL_TOOL, ToolRegistry};
 
 pub enum AgentEvent {
     TextDelta(String),
@@ -59,6 +60,8 @@ pub struct Run {
     pub cut: ContextCut,
     pub tools: Arc<ToolRegistry>,
     pub instructions: Option<Arc<str>>,
+    /// Skill catalog, built at startup only, like the repo map.
+    pub skills: Option<Arc<str>>,
     pub repo_map: Option<Arc<str>>,
     pub extra: Option<Value>,
 }
@@ -79,6 +82,7 @@ pub async fn run(mut r: Run, tx: UnboundedSender<(u64, AgentEvent)>, run_id: u64
             r.mode,
             &r.tools,
             r.instructions.as_deref(),
+            r.skills.as_deref(),
             r.repo_map.as_deref(),
         );
         let tools = r.tools.specs(r.mode);
@@ -461,16 +465,17 @@ fn trim(history: &[Message], budget: usize) -> ContextCut {
         };
     }
     let mut excess = total - (budget as f64 * TRUNCATE_TARGET) as usize;
+    let pinned = skill_calls(view);
     let mut keeps: Vec<Option<usize>> = vec![None; view.len()];
     for floor in [MIN_KEEP, 0] {
         for (i, m) in view.iter().enumerate() {
             if excess == 0 {
                 break;
             }
-            let Message::Tool { content, .. } = m else {
+            let Message::Tool { call_id, content } = m else {
                 continue;
             };
-            if content.len() <= MIN_KEEP {
+            if content.len() <= MIN_KEEP || pinned.contains(call_id.as_str()) {
                 continue;
             }
             let cur = match keeps[i] {
@@ -505,6 +510,7 @@ const ELIDE_MIN_BYTES: usize = 200;
 const ELIDED_MARK: &str = "[output from an earlier turn elided; re-run the tool if needed]";
 
 fn elide_old_outputs(history: &[Message]) -> Vec<Message> {
+    let pinned = skill_calls(history);
     let last_user = history
         .iter()
         .rposition(|m| matches!(m, Message::User(_)))
@@ -514,7 +520,9 @@ fn elide_old_outputs(history: &[Message]) -> Vec<Message> {
         .enumerate()
         .map(|(i, m)| match m {
             Message::Tool { call_id, content }
-                if i < last_user && content.len() > ELIDE_MIN_BYTES =>
+                if i < last_user
+                    && content.len() > ELIDE_MIN_BYTES
+                    && !pinned.contains(call_id.as_str()) =>
             {
                 Message::Tool {
                     call_id: call_id.clone(),
@@ -532,6 +540,20 @@ fn elide_old_outputs(history: &[Message]) -> Vec<Message> {
             },
             _ => m.clone(),
         })
+        .collect()
+}
+
+/// Ids of `skill` calls. Their outputs are instructions the model keeps following, so they are
+/// never elided or cut, only dropped with their whole turn.
+fn skill_calls(history: &[Message]) -> HashSet<&str> {
+    history
+        .iter()
+        .flat_map(|m| match m {
+            Message::Assistant { tool_calls, .. } => tool_calls.as_slice(),
+            _ => &[],
+        })
+        .filter(|c| c.name == SKILL_TOOL)
+        .map(|c| c.id.as_str())
         .collect()
 }
 
@@ -556,6 +578,7 @@ fn system_prompt(
     mode: Mode,
     tools: &ToolRegistry,
     instructions: Option<&str>,
+    skills: Option<&str>,
     repo_map: Option<&str>,
 ) -> String {
     let cwd = tools.root().display();
@@ -590,6 +613,14 @@ fn system_prompt(
         prompt.push_str("\n\n# Project instructions (AGENTS.md)\n\n");
         prompt.push_str(text.trim());
     }
+    if let Some(list) = skills {
+        prompt.push_str(
+            "\n\n# Skills\n\nInstructions for specific tasks. When a task matches a skill's \
+             description, call `skill` with its name before starting and follow what it returns. \
+             Skills may name other agents' tools (Bash, Read, Edit, …): use your equivalent tool.\n\n",
+        );
+        prompt.push_str(list);
+    }
     if let Some(map) = repo_map {
         prompt.push_str(
             "\n\n# Repository map\n\nFiles with line counts and their definitions as `line: declaration`. \
@@ -606,6 +637,7 @@ fn system_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::message::ToolCall;
 
     fn turn(n: usize) -> [Message; 2] {
         [
@@ -635,5 +667,36 @@ mod tests {
         history.extend((11..20).flat_map(turn));
         fit_context(&history, budget, &mut cut);
         assert_ne!(cut, kept);
+    }
+
+    #[test]
+    fn skill_outputs_are_not_elided_or_cut() {
+        let call = |id: &str, name: &str| Message::Assistant {
+            content: String::new(),
+            reasoning: String::new(),
+            tool_calls: vec![ToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments: "{}".into(),
+            }],
+        };
+        let output = |id: &str| Message::Tool {
+            call_id: id.into(),
+            content: "x".repeat(3000),
+        };
+        let history = vec![
+            Message::User("q".into()),
+            call("s", SKILL_TOOL),
+            output("s"),
+            call("r", "read_file"),
+            output("r"),
+            Message::User("next".into()),
+        ];
+        let elided = elide_old_outputs(&history);
+        assert!(matches!(&elided[2], Message::Tool { content, .. } if content.len() == 3000));
+        assert!(matches!(&elided[4], Message::Tool { content, .. } if content == ELIDED_MARK));
+
+        let cut = trim(&history[..5], 1100);
+        assert_eq!(cut.truncated.iter().map(|&(i, _)| i).collect::<Vec<_>>(), [4]);
     }
 }
