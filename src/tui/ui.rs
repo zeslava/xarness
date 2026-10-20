@@ -156,7 +156,7 @@ fn panel_lines(app: &App, width: usize, cap: usize, accent: Color) -> (Vec<Line<
 /// The preview is cut to fit `cap` so the options always stay visible.
 fn approval_lines(a: &Approval, width: usize, cap: usize, accent: Color) -> Vec<Line<'static>> {
     let mut title = vec![Span::styled(
-        format!("Allow {}?", a.name),
+        format!("Allow {}?", display_name(&a.name)),
         Style::new().fg(Color::Magenta).bold(),
     )];
     // For `run` the summary is the command itself, already shown in full below.
@@ -367,7 +367,10 @@ fn log_text(app: &App) -> Text<'static> {
             }
             Entry::Assistant(t) => lines.extend(markdown::render(t).lines),
             Entry::Tool { name, arguments } => lines.push(Line::from(vec![
-                Span::styled(format!("⚙ {name} "), Style::new().fg(Color::Magenta).bold()),
+                Span::styled(
+                    format!("⚙ {} ", display_name(name)),
+                    Style::new().fg(Color::Magenta).bold(),
+                ),
                 Span::styled(
                     truncate(&tool_summary(name, arguments), 200),
                     Style::new().dim(),
@@ -456,7 +459,34 @@ fn tool_summary(name: &str, arguments: &str) -> String {
             Some(c) => c.trim().replace('\n', " ↵ "),
             None => arguments.to_string(),
         },
+        (n, _) if n.contains("__") => mcp_summary(&v).unwrap_or_else(|| arguments.to_string()),
         _ => arguments.to_string(),
+    }
+}
+
+/// MCP tools have arbitrary schemas: a lone argument is shown as its bare
+/// value, several as `key=value` pairs.
+fn mcp_summary(v: &serde_json::Value) -> Option<String> {
+    let obj = v.as_object()?;
+    let flat = |x: &serde_json::Value| match x {
+        serde_json::Value::String(s) => s.trim().replace('\n', " ↵ "),
+        other => other.to_string(),
+    };
+    Some(match obj.len() {
+        1 => flat(obj.values().next()?),
+        _ => obj
+            .iter()
+            .map(|(k, x)| format!("{k}={}", flat(x)))
+            .collect::<Vec<_>>()
+            .join("  "),
+    })
+}
+
+/// `server__tool` → `server: tool`; built-in names are returned as is.
+fn display_name(name: &str) -> String {
+    match name.split_once("__") {
+        Some((server, tool)) => format!("{server}: {tool}"),
+        None => name.to_string(),
     }
 }
 
