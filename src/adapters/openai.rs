@@ -170,7 +170,10 @@ async fn send_with_retry(
     }
 }
 
-async fn finish(acc: DeltaAccumulator, tx: &mut mpsc::Sender<Result<LlmEvent>>) -> Result<()> {
+async fn finish(mut acc: DeltaAccumulator, tx: &mut mpsc::Sender<Result<LlmEvent>>) -> Result<()> {
+    if let Some(ev) = acc.flush_think() {
+        tx.send(Ok(ev)).await?;
+    }
     let prompt_tokens = acc.prompt_tokens;
     let completion_tokens = acc.completion_tokens;
     let cached_tokens = acc.cached_tokens;
@@ -276,6 +279,8 @@ struct DeltaAccumulator {
     completion_tokens: Option<u32>,
     cached_tokens: Option<u32>,
     truncated: bool,
+    in_think: bool,
+    think_tail: String,
 }
 
 impl DeltaAccumulator {
@@ -311,11 +316,64 @@ impl DeltaAccumulator {
         };
         // llama.cpp/vLLM put thinking in `reasoning_content`, some servers use `reasoning`.
         let reasoning = text("reasoning_content").or_else(|| text("reasoning"));
-        reasoning
-            .map(LlmEvent::ReasoningDelta)
-            .into_iter()
-            .chain(text("content").map(LlmEvent::TextDelta))
-            .collect()
+        let mut events: Vec<_> = reasoning.map(LlmEvent::ReasoningDelta).into_iter().collect();
+        if let Some(content) = text("content") {
+            events.extend(self.split_think(&content));
+        }
+        events
+    }
+
+    /// Routes `<think>` blocks the server left in `content` to reasoning and drops stray
+    /// `</think>` (the opening tag was in the prompt). A trailing partial tag is held back
+    /// until the next chunk.
+    fn split_think(&mut self, s: &str) -> Vec<LlmEvent> {
+        const OPEN: &str = "<think>";
+        const CLOSE: &str = "</think>";
+        let mut buf = std::mem::take(&mut self.think_tail) + s;
+        let mut events = Vec::new();
+        let mut emit = |in_think: bool, t: &str| {
+            if !t.is_empty() {
+                events.push(if in_think {
+                    LlmEvent::ReasoningDelta(t.to_string())
+                } else {
+                    LlmEvent::TextDelta(t.to_string())
+                });
+            }
+        };
+        loop {
+            let open = (!self.in_think).then(|| buf.find(OPEN)).flatten();
+            let close = buf.find(CLOSE);
+            let tag = match (open, close) {
+                (Some(o), Some(c)) if c < o => Some((c, CLOSE)),
+                (Some(o), _) => Some((o, OPEN)),
+                (None, Some(c)) => Some((c, CLOSE)),
+                (None, None) => None,
+            };
+            let Some((i, tag)) = tag else { break };
+            emit(self.in_think, &buf[..i]);
+            self.in_think = tag == OPEN;
+            buf.drain(..i + tag.len());
+        }
+        let partial = |tag: &str| (1..tag.len()).rev().find(|&k| buf.ends_with(&tag[..k]));
+        let held = partial(CLOSE)
+            .max((!self.in_think).then(|| partial(OPEN)).flatten())
+            .unwrap_or(0);
+        let tail = buf.split_off(buf.len() - held);
+        emit(self.in_think, &buf);
+        self.think_tail = tail;
+        events
+    }
+
+    /// Text held back by `split_think` that never became a tag.
+    fn flush_think(&mut self) -> Option<LlmEvent> {
+        let t = std::mem::take(&mut self.think_tail);
+        (!t.is_empty()).then(|| {
+            if self.in_think {
+                LlmEvent::ReasoningDelta(t)
+            } else {
+                LlmEvent::TextDelta(t)
+            }
+        })
     }
 
     fn finish(self) -> Vec<ToolCall> {
