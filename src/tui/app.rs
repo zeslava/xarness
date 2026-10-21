@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -26,6 +26,20 @@ use crate::skills::{Skill, Skills};
 use crate::tools::ToolRegistry;
 
 const WHEEL_LINES: u16 = 3;
+const FLASH_TTL: Duration = Duration::from_millis(1500);
+
+#[derive(Clone, Copy)]
+pub enum FlashKind {
+    Info,
+    Ok,
+    Error,
+}
+
+/// Short-lived notification shown at the right of the status line.
+pub struct Flash {
+    pub text: String,
+    pub kind: FlashKind,
+}
 
 /// Mouse selection in the log, in content coordinates (wrapped line from the top, column),
 /// so it stays on the same text while the log scrolls.
@@ -152,6 +166,11 @@ pub struct App {
     mcp: Option<Vec<(String, Result<usize, String>)>>,
     /// Built at startup and on `/map` only, so the system prompt prefix stays cacheable.
     repo_map: Option<Arc<str>>,
+    /// Maps are built in the background and arrive through the event loop.
+    map_tx: UnboundedSender<Option<repomap::RepoMap>>,
+    /// Shown one at a time, each for `FLASH_TTL`; the front one is on screen since `flash_at`.
+    flashes: VecDeque<Flash>,
+    flash_at: Instant,
     pub mode: Mode,
     history: Vec<Message>,
     /// `None` after a failed write, until `/clear` or `/resume` starts over.
@@ -206,6 +225,7 @@ impl App {
         tools: ToolRegistry,
         skills: Arc<Skills>,
         tx: UnboundedSender<(u64, AgentEvent)>,
+        map_tx: UnboundedSender<Option<repomap::RepoMap>>,
         resume: bool,
     ) -> anyhow::Result<Self> {
         let active = config
@@ -218,7 +238,6 @@ impl App {
         let instructions = std::fs::read_to_string(tools.root().join("AGENTS.md"))
             .ok()
             .map(Arc::from);
-        let repo_map = repomap::build(tools.root()).map(|m| Arc::from(m.text));
         let session = Session::new(tools.root());
         let mut app = Self {
             think: active.as_ref().and_then(|a| default_think(&a.model)),
@@ -229,7 +248,10 @@ impl App {
             instructions,
             skill_catalog: skills.catalog().map(Arc::from),
             skills,
-            repo_map,
+            repo_map: None,
+            map_tx,
+            flashes: VecDeque::new(),
+            flash_at: Instant::now(),
             mode: Mode::Plan,
             history: Vec::new(),
             session: Some(session),
@@ -260,6 +282,7 @@ impl App {
             quit_armed: false,
             quit: false,
         };
+        app.build_map();
         if resume {
             match session::list(app.tools.root()).into_iter().next() {
                 Some(s) => app.resume(s.path),
@@ -892,19 +915,7 @@ impl App {
                     }
                 }
             }
-            Command::Map => {
-                let map = repomap::build(self.tools.root());
-                let msg = match &map {
-                    Some(m) => format!(
-                        "repo map rebuilt: {} files, ~{} tokens",
-                        m.files,
-                        m.text.len() / 3
-                    ),
-                    None => "repo map: no files".into(),
-                };
-                self.repo_map = map.map(|m| Arc::from(m.text));
-                self.log.push(Entry::Info(msg));
-            }
+            Command::Map => self.build_map(),
             Command::MapShow => {
                 let msg = match &self.repo_map {
                     Some(m) => m.to_string(),
@@ -1078,7 +1089,7 @@ impl App {
     }
 
     pub fn on_mcp(&mut self, servers: mcp::Connected) {
-        let status = servers
+        let status: Vec<_> = servers
             .into_iter()
             .map(|(name, res)| match res {
                 Ok(tools) => {
@@ -1089,9 +1100,60 @@ impl App {
                 Err(e) => (name, Err(format!("{e:#}"))),
             })
             .collect();
+        let total = status.len();
+        let ok = status.iter().filter(|(_, r)| r.is_ok()).count();
+        let tools: usize = status.iter().filter_map(|(_, r)| r.as_ref().ok()).sum();
         self.mcp = Some(status);
-        let msg = self.mcp_status();
-        self.push_log(Entry::Info(msg));
+        if total == 0 {
+            return;
+        }
+        if ok == total {
+            self.notify(FlashKind::Info, format!("mcp: {total} · {tools} tools"));
+        } else {
+            self.notify(
+                FlashKind::Error,
+                format!("mcp: {ok}/{total} · {tools} tools ✗"),
+            );
+        }
+    }
+
+    fn build_map(&self) {
+        let root = self.tools.root().to_path_buf();
+        let tx = self.map_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ = tx.send(repomap::build(&root));
+        });
+    }
+
+    pub fn on_repo_map(&mut self, map: Option<repomap::RepoMap>) {
+        let msg = match &map {
+            Some(m) => format!("map: {} files", m.files),
+            None => "map: no files".into(),
+        };
+        self.repo_map = map.map(|m| Arc::from(m.text));
+        self.notify(FlashKind::Info, msg);
+    }
+
+    pub fn notify(&mut self, kind: FlashKind, text: impl Into<String>) {
+        if self.flashes.is_empty() {
+            self.flash_at = Instant::now();
+        }
+        self.flashes.push_back(Flash {
+            text: text.into(),
+            kind,
+        });
+    }
+
+    pub fn flash(&self) -> Option<&Flash> {
+        self.flashes.front()
+    }
+
+    pub fn on_tick(&mut self) {
+        self.tick = self.tick.wrapping_add(1);
+        if !self.flashes.is_empty() && self.flash_at.elapsed() >= FLASH_TTL {
+            self.flashes.pop_front();
+            self.flash_at = Instant::now();
+        }
     }
 
     fn invoke_skill(&mut self, skill: &Skill, arg: Option<String>) {

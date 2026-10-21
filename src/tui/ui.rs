@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
 use unicode_width::UnicodeWidthStr;
 
-use super::app::{APPROVAL_OPTIONS, App, Approval, Entry, Phase, Selection};
+use super::app::{APPROVAL_OPTIONS, App, Approval, Entry, FlashKind, Phase, Selection};
 use super::markdown;
 use crate::domain::message::Mode;
 
@@ -62,7 +62,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         && let Some(sel) = app.selection
     {
         let text = selected_text(&log, log_area.width, sel);
-        app.clipboard.copy(&text);
+        if !text.is_empty() {
+            app.clipboard.copy(&text);
+            app.notify(FlashKind::Ok, "✓ copied");
+        }
     }
     f.render_widget(log.scroll((offset, 0)), log_area);
     if let Some(sel) = app.selection {
@@ -116,6 +119,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         input_area.y + 1 + (cur_row - first) as u16,
     ));
     f.render_widget(status_line(app), status_area);
+    if let Some(flash) = app.flash() {
+        let color = match flash.kind {
+            FlashKind::Info => Color::DarkGray,
+            FlashKind::Ok => Color::Green,
+            FlashKind::Error => Color::LightRed,
+        };
+        let line = Line::styled(format!("{} ", flash.text), Style::new().fg(color));
+        f.render_widget(line.right_aligned(), status_area);
+    }
 }
 
 fn highlight(buf: &mut Buffer, area: Rect, offset: u16, sel: Selection) {
