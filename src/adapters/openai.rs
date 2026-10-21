@@ -280,6 +280,10 @@ struct DeltaAccumulator {
     cached_tokens: Option<u32>,
     truncated: bool,
     in_think: bool,
+    /// Visible text arrived, so a later `<think>` is literal.
+    text_seen: bool,
+    /// The think block closed; the rest of `content` is literal.
+    think_done: bool,
     think_tail: String,
 }
 
@@ -323,13 +327,28 @@ impl DeltaAccumulator {
         events
     }
 
-    /// Routes `<think>` blocks the server left in `content` to reasoning and drops stray
-    /// `</think>` (the opening tag was in the prompt). A trailing partial tag is held back
+    /// Routes a `<think>` block the server left in `content` to reasoning and drops a stray
+    /// `</think>` (the opening tag was in the prompt). Tags count only at the start of the
+    /// response: after the first `</think>`, or once text began without `<think>`, the rest passes
+    /// through, so an answer that mentions the tags is not mangled. A partial tag is held back
     /// until the next chunk.
     fn split_think(&mut self, s: &str) -> Vec<LlmEvent> {
         const OPEN: &str = "<think>";
         const CLOSE: &str = "</think>";
+        if self.think_done {
+            return vec![LlmEvent::TextDelta(s.to_string())];
+        }
         let mut buf = std::mem::take(&mut self.think_tail) + s;
+        if !self.in_think && !self.text_seen {
+            let rest = buf.trim_start();
+            if let Some(r) = rest.strip_prefix(OPEN) {
+                buf = r.to_string();
+                self.in_think = true;
+            } else if OPEN.starts_with(rest) {
+                self.think_tail = buf;
+                return Vec::new();
+            }
+        }
         let mut events = Vec::new();
         let mut emit = |in_think: bool, t: &str| {
             if !t.is_empty() {
@@ -340,25 +359,19 @@ impl DeltaAccumulator {
                 });
             }
         };
-        loop {
-            let open = (!self.in_think).then(|| buf.find(OPEN)).flatten();
-            let close = buf.find(CLOSE);
-            let tag = match (open, close) {
-                (Some(o), Some(c)) if c < o => Some((c, CLOSE)),
-                (Some(o), _) => Some((o, OPEN)),
-                (None, Some(c)) => Some((c, CLOSE)),
-                (None, None) => None,
-            };
-            let Some((i, tag)) = tag else { break };
+        if let Some(i) = buf.find(CLOSE) {
             emit(self.in_think, &buf[..i]);
-            self.in_think = tag == OPEN;
-            buf.drain(..i + tag.len());
+            emit(false, &buf[i + CLOSE.len()..]);
+            self.in_think = false;
+            self.think_done = true;
+            return events;
         }
-        let partial = |tag: &str| (1..tag.len()).rev().find(|&k| buf.ends_with(&tag[..k]));
-        let held = partial(CLOSE)
-            .max((!self.in_think).then(|| partial(OPEN)).flatten())
+        let held = (1..CLOSE.len())
+            .rev()
+            .find(|&k| buf.ends_with(&CLOSE[..k]))
             .unwrap_or(0);
         let tail = buf.split_off(buf.len() - held);
+        self.text_seen |= !self.in_think && !buf.trim().is_empty();
         emit(self.in_think, &buf);
         self.think_tail = tail;
         events

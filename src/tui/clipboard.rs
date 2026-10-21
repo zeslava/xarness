@@ -15,6 +15,14 @@ impl Clipboard {
     }
 
     pub fn copy(&mut self, text: &str) {
+        // On macOS the process is always local, so the pasteboard suffices; also writing it via
+        // OSC 52 races the terminal's own write, and AppKit logs the failure onto the screen.
+        if cfg!(target_os = "macos")
+            && let Some(c) = &mut self.native
+            && c.set_text(text).is_ok()
+        {
+            return;
+        }
         let mut out = std::io::stdout();
         let _ = write!(out, "\x1b]52;c;{}\x07", base64(text.as_bytes()));
         let _ = out.flush();
