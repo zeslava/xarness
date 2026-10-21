@@ -1,10 +1,12 @@
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
+use unicode_width::UnicodeWidthStr;
 
-use super::app::{APPROVAL_OPTIONS, App, Approval, Entry, Phase};
+use super::app::{APPROVAL_OPTIONS, App, Approval, Entry, Phase, Selection};
 use super::markdown;
 use crate::domain::message::Mode;
 
@@ -54,9 +56,18 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let max_scroll = total.saturating_sub(log_area.height);
     // Clamp so scrolling past the top doesn't need as many presses to come back.
     app.scroll = app.scroll.min(max_scroll);
-    app.log_height = log_area.height;
+    app.log_area = log_area;
     let offset = max_scroll.saturating_sub(app.scroll);
+    if std::mem::take(&mut app.copy)
+        && let Some(sel) = app.selection
+    {
+        let text = selected_text(&log, log_area.width, sel);
+        app.clipboard.copy(&text);
+    }
     f.render_widget(log.scroll((offset, 0)), log_area);
+    if let Some(sel) = app.selection {
+        highlight(f.buffer_mut(), log_area, offset, sel);
+    }
     if live {
         // Follows the text while it fits, then stays pinned to the bottom, scrolled or not.
         let row = Rect {
@@ -105,6 +116,53 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         input_area.y + 1 + (cur_row - first) as u16,
     ));
     f.render_widget(status_line(app), status_area);
+}
+
+fn highlight(buf: &mut Buffer, area: Rect, offset: u16, sel: Selection) {
+    let ((l0, c0), (l1, c1)) = sel.range();
+    for row in 0..area.height {
+        let line = offset as usize + row as usize;
+        if line < l0 || line > l1 {
+            continue;
+        }
+        let from = if line == l0 { c0 } else { 0 };
+        let to = if line == l1 { c1 } else { area.width - 1 };
+        buf.set_style(
+            Rect::new(area.x + from, area.y + row, to - from + 1, 1),
+            Style::new().add_modifier(Modifier::REVERSED),
+        );
+    }
+}
+
+/// Renders only the selected wrapped lines off-screen and reads the cells back, so the text
+/// matches what was highlighted even where it has scrolled out of view.
+fn selected_text(log: &Paragraph, width: u16, sel: Selection) -> String {
+    let ((l0, c0), (l1, c1)) = sel.range();
+    let height = (l1 - l0 + 1).min(u16::MAX as usize) as u16;
+    let area = Rect::new(0, 0, width, height);
+    let mut buf = Buffer::empty(area);
+    log.clone().scroll((l0 as u16, 0)).render(area, &mut buf);
+    let mut lines = Vec::new();
+    for y in 0..height {
+        let from = if y == 0 { c0 } else { 0 };
+        let to = if y == height - 1 { c1 } else { width - 1 };
+        let mut line = String::new();
+        // Cells covered by a wide char hold a placeholder space.
+        let mut hidden = 0;
+        for x in 0..width {
+            let sym = buf[(x, y)].symbol();
+            if hidden > 0 {
+                hidden -= 1;
+                continue;
+            }
+            hidden = sym.width().saturating_sub(1);
+            if (from..=to).contains(&x) {
+                line.push_str(sym);
+            }
+        }
+        lines.push(line.trim_end().to_string());
+    }
+    lines.join("\n")
 }
 
 /// The panel between the log and the input shows one thing at a time, by priority:

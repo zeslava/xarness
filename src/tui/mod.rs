@@ -1,15 +1,16 @@
 mod app;
+mod clipboard;
 mod commands;
 mod markdown;
 mod ui;
 
-use std::io::Write;
 use std::sync::Arc;
 
 use anyhow::Result;
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, EventStream, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    EventStream, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::supports_keyboard_enhancement;
 use futures::StreamExt;
@@ -22,7 +23,12 @@ use crate::skills::Skills;
 use crate::tools::ToolRegistry;
 use app::App;
 
-pub async fn run(config: Config, tools: ToolRegistry, skills: Arc<Skills>) -> Result<()> {
+pub async fn run(
+    config: Config,
+    tools: ToolRegistry,
+    skills: Arc<Skills>,
+    resume: bool,
+) -> Result<()> {
     let (tx, rx) = mpsc::unbounded_channel();
     let (mcp_tx, mcp_rx) = mpsc::unbounded_channel();
     let (job_tx, job_rx) = mpsc::unbounded_channel();
@@ -35,9 +41,11 @@ pub async fn run(config: Config, tools: ToolRegistry, skills: Arc<Skills>) -> Re
             let _ = mcp_tx.send(mcp::connect_all(servers, root).await);
         });
     }
-    let app = App::new(config, tools, skills, tx)?;
+    let app = App::new(config, tools, skills, tx, resume)?;
     let mut terminal = ratatui::init();
-    set_alternate_scroll(true)?;
+    // Wheel and drag arrive as mouse events, apart from the arrow keys; selection is ours
+    // to draw and copy (native one needs Shift).
+    crossterm::execute!(std::io::stdout(), EnableMouseCapture)?;
     // Without it a pasted newline arrives as Enter and submits the first line.
     crossterm::execute!(std::io::stdout(), EnableBracketedPaste)?;
     // Kitty keyboard protocol, so Shift+Enter is distinguishable from Enter.
@@ -53,18 +61,9 @@ pub async fn run(config: Config, tools: ToolRegistry, skills: Arc<Skills>) -> Re
         let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     }
     let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
-    let _ = set_alternate_scroll(false);
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     res
-}
-
-/// Alternate scroll mode: the terminal sends the wheel as Up/Down keys. Unlike mouse capture,
-/// this leaves native text selection working without Shift.
-fn set_alternate_scroll(on: bool) -> std::io::Result<()> {
-    let seq: &[u8] = if on { b"\x1b[?1007h" } else { b"\x1b[?1007l" };
-    let mut out = std::io::stdout();
-    out.write_all(seq)?;
-    out.flush()
 }
 
 async fn event_loop(

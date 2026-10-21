@@ -9,6 +9,7 @@ pub enum Command {
     Skills,
     Compact(Option<String>),
     Clear,
+    Resume(Option<String>),
     Help,
     Quit,
     /// Not built in: a skill, or unknown.
@@ -18,8 +19,8 @@ pub enum Command {
     },
 }
 
-pub const HELP: &str = "/clear  /compact [focus]  /plan  /build  /model [provider/model]  /think [level]  /map [show]  /mcp  /skills  /<skill> [args]  /help  /quit\n\
-Tab — complete command, Shift+Tab — toggle mode, Esc — interrupt, Up/Down/PgUp/PgDn/wheel — scroll, Ctrl+P/Ctrl+N — input history, Ctrl+C — interrupt or clear input, twice to quit\n\
+pub const HELP: &str = "/clear  /compact [focus]  /resume [n]  /plan  /build  /model [provider/model]  /think [level]  /map [show]  /mcp  /skills  /<skill> [args]  /help  /quit\n\
+Tab — complete command or cycle its arguments, Shift+Tab — toggle mode, Esc — interrupt, PgUp/PgDn/wheel — scroll, Up/Down/Ctrl+P/Ctrl+N — input history, drag — select and copy (Shift+drag — native selection), Ctrl+C — interrupt or clear input, twice to quit\n\
 Shift+Enter/Alt+Enter/Ctrl+J — new line, Ctrl+W/Alt+Backspace — delete word, Ctrl+U/Ctrl+K — delete to line start/end, \
 Ctrl+A/Ctrl+E — line start/end, Ctrl+←→/Alt+B/Alt+F — move by word\n\
 Approval: ←→/Tab + Enter; type a reason, pick no and Enter to decline with it; Esc interrupts";
@@ -27,6 +28,7 @@ Approval: ←→/Tab + Enter; type a reason, pick no and Enter to decline with i
 pub const COMMANDS: &[(&str, &str)] = &[
     ("clear", "clear history"),
     ("compact", "replace history with a summary"),
+    ("resume", "list or resume saved sessions"),
     ("plan", "read-only mode"),
     ("build", "mode with mutating tools"),
     ("model", "list or switch model"),
@@ -137,6 +139,7 @@ pub fn parse(input: &str) -> Command {
         "skills" => Command::Skills,
         "compact" => Command::Compact(arg.map(str::to_string)),
         "clear" => Command::Clear,
+        "resume" => Command::Resume(arg.map(str::to_string)),
         "help" => Command::Help,
         "quit" | "exit" | "q" => Command::Quit,
         other => Command::Other {

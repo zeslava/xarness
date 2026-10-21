@@ -1,13 +1,18 @@
 use std::collections::{BTreeSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::{Position, Rect};
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+use super::clipboard::Clipboard;
 use super::commands::{self, Command, Completion};
 use crate::adapters::build_provider;
 use crate::adapters::mcp;
@@ -16,8 +21,31 @@ use crate::config::{Config, ModelConfig};
 use crate::domain::message::{Message, Mode};
 use crate::domain::ports::LlmProvider;
 use crate::repomap;
+use crate::session::{self, Session};
 use crate::skills::{Skill, Skills};
 use crate::tools::ToolRegistry;
+
+const WHEEL_LINES: u16 = 3;
+
+/// Mouse selection in the log, in content coordinates (wrapped line from the top, column),
+/// so it stays on the same text while the log scrolls.
+#[derive(Clone, Copy)]
+pub struct Selection {
+    anchor: (usize, u16),
+    head: (usize, u16),
+    dragged: bool,
+}
+
+impl Selection {
+    /// Start and end, both inclusive, in reading order.
+    pub fn range(&self) -> ((usize, u16), (usize, u16)) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+}
 
 pub enum Entry {
     User(String),
@@ -51,6 +79,31 @@ fn is_command(skill: &Skill) -> bool {
 
 fn default_think(model: &ModelConfig) -> Option<String> {
     model.think.as_ref().and_then(|t| t.default.clone())
+}
+
+/// The log of a restored session. Tool outputs are left out, as successful ones are live.
+fn history_log(history: &[Message]) -> Vec<Entry> {
+    let mut log = Vec::new();
+    for m in history {
+        match m {
+            Message::User(t) => log.push(Entry::User(t.clone())),
+            Message::Assistant {
+                content,
+                tool_calls,
+                ..
+            } => {
+                if !content.is_empty() {
+                    log.push(Entry::Assistant(content.clone()));
+                }
+                log.extend(tool_calls.iter().map(|c| Entry::Tool {
+                    name: c.name.clone(),
+                    arguments: c.arguments.clone(),
+                }));
+            }
+            Message::System(_) | Message::Tool { .. } => {}
+        }
+    }
+    log
 }
 
 struct Active {
@@ -101,6 +154,8 @@ pub struct App {
     repo_map: Option<Arc<str>>,
     pub mode: Mode,
     history: Vec<Message>,
+    /// `None` after a failed write, until `/clear` or `/resume` starts over.
+    session: Option<Session>,
     cut: ContextCut,
     pub usage: Option<ContextUsage>,
     pub log: Vec<Entry>,
@@ -109,18 +164,22 @@ pub struct App {
     pub cursor: usize,
     /// Submitted inputs, slash commands included; survives `/clear` like shell history.
     sent: Vec<String>,
-    /// While browsing `sent` with Ctrl+P/Ctrl+N: how many entries back from the newest (0 = newest).
+    /// While browsing `sent` with Up/Down or Ctrl+P/Ctrl+N: how many entries back from the newest (0 = newest).
     recall: Option<usize>,
     /// Selected row of the slash-command completion popup.
     pub completion: usize,
     /// Lines scrolled up from the bottom of the log.
     pub scroll: u16,
-    /// Log viewport height from the last draw, for page scrolling.
-    pub log_height: u16,
+    /// Log viewport from the last draw, for page scrolling and mapping the mouse.
+    pub log_area: Rect,
     /// Wrapped log height from the last draw, to keep a scrolled view in place as it grows.
     pub log_total: usize,
     /// Lines added below the view since it was scrolled up.
     pub unseen: usize,
+    pub selection: Option<Selection>,
+    /// Set when a drag ends; the next draw copies the selection, as it has the rendered log.
+    pub copy: bool,
+    pub clipboard: Clipboard,
     /// Spinner frame counter, advanced only while a run is active.
     pub tick: usize,
     running: Option<JoinHandle<()>>,
@@ -147,6 +206,7 @@ impl App {
         tools: ToolRegistry,
         skills: Arc<Skills>,
         tx: UnboundedSender<(u64, AgentEvent)>,
+        resume: bool,
     ) -> anyhow::Result<Self> {
         let active = config
             .default_model()?
@@ -159,7 +219,8 @@ impl App {
             .ok()
             .map(Arc::from);
         let repo_map = repomap::build(tools.root()).map(|m| Arc::from(m.text));
-        Ok(Self {
+        let session = Session::new(tools.root());
+        let mut app = Self {
             think: active.as_ref().and_then(|a| default_think(&a.model)),
             active,
             config,
@@ -171,6 +232,7 @@ impl App {
             repo_map,
             mode: Mode::Plan,
             history: Vec::new(),
+            session: Some(session),
             cut: ContextCut::default(),
             usage: None,
             log,
@@ -180,9 +242,12 @@ impl App {
             recall: None,
             completion: 0,
             scroll: 0,
-            log_height: 0,
+            log_area: Rect::default(),
             log_total: 0,
             unseen: 0,
+            selection: None,
+            copy: false,
+            clipboard: Clipboard::new(),
             tick: 0,
             running: None,
             phase: (Phase::Waiting, Instant::now()),
@@ -194,7 +259,47 @@ impl App {
             tx,
             quit_armed: false,
             quit: false,
-        })
+        };
+        if resume {
+            match session::list(app.tools.root()).into_iter().next() {
+                Some(s) => app.resume(s.path),
+                None => app.log.push(Entry::Info("no saved sessions".into())),
+            }
+        }
+        Ok(app)
+    }
+
+    fn resume(&mut self, path: PathBuf) {
+        match Session::open(path) {
+            Ok((session, history)) => {
+                self.log = history_log(&history);
+                self.log.push(Entry::Info("session resumed".into()));
+                self.history = history;
+                self.session = Some(session);
+                self.cut = ContextCut::default();
+                self.usage = None;
+                self.scroll = 0;
+            }
+            Err(e) => self
+                .log
+                .push(Entry::Error(format!("can't load session: {e}"))),
+        }
+    }
+
+    /// Appends new history to the session file; `rewrite` after history was replaced.
+    fn persist(&mut self, rewrite: bool) {
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        let res = if rewrite {
+            session.rewrite(&self.history)
+        } else {
+            session.save(&self.history)
+        };
+        if let Err(e) = res {
+            self.session = None;
+            self.push_log(Entry::Error(format!("session not saved: {e}")));
+        }
     }
 
     pub fn approval(&self) -> Option<&Approval> {
@@ -220,8 +325,58 @@ impl App {
         match ev {
             Event::Key(key) if key.kind != KeyEventKind::Release => self.on_key(key),
             Event::Paste(text) => self.paste(&text),
+            Event::Mouse(m) => self.on_mouse(m),
+            // Content coordinates depend on the wrap width.
+            Event::Resize(..) => self.selection = None,
             _ => {}
         }
+    }
+
+    fn on_mouse(&mut self, m: MouseEvent) {
+        let area = self.log_area;
+        match m.kind {
+            MouseEventKind::ScrollUp => self.scroll = self.scroll.saturating_add(WHEEL_LINES),
+            MouseEventKind::ScrollDown => self.scroll = self.scroll.saturating_sub(WHEEL_LINES),
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.selection = area.contains(Position::new(m.column, m.row)).then(|| {
+                    let at = self.log_pos(m.column, m.row);
+                    Selection {
+                        anchor: at,
+                        head: at,
+                        dragged: false,
+                    }
+                });
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.selection.is_some() => {
+                // Past the edges the log scrolls, so a selection can span more than a screen.
+                if m.row < area.y {
+                    self.scroll = self.scroll.saturating_add(1);
+                } else if m.row >= area.bottom() {
+                    self.scroll = self.scroll.saturating_sub(1);
+                }
+                let head = self.log_pos(m.column, m.row);
+                if let Some(s) = &mut self.selection {
+                    s.head = head;
+                    s.dragged = true;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => match self.selection {
+                Some(s) if s.dragged => self.copy = true,
+                // A plain click clears the selection.
+                _ => self.selection = None,
+            },
+            _ => {}
+        }
+    }
+
+    /// Screen cell to content coordinates, clamped into the log viewport.
+    fn log_pos(&self, col: u16, row: u16) -> (usize, u16) {
+        let area = self.log_area;
+        let row = row.clamp(area.y, area.bottom().saturating_sub(1)) - area.y;
+        let col = col.clamp(area.x, area.right().saturating_sub(1)) - area.x;
+        let max_scroll = self.log_total.saturating_sub(area.height as usize);
+        let offset = max_scroll.saturating_sub(self.scroll as usize);
+        (offset + row as usize, col)
     }
 
     fn paste(&mut self, text: &str) {
@@ -319,8 +474,7 @@ impl App {
                 KeyCode::Esc => return self.interrupt(),
                 _ => {}
             }
-            // Left/Right move the input cursor once a reason is being typed; Up/Down stay
-            // scrolling, since the terminal sends the mouse wheel as them.
+            // Left/Right move the input cursor once a reason is being typed.
             let empty = self.input.is_empty();
             let step = match key.code {
                 KeyCode::Tab => Some(1),
@@ -352,12 +506,20 @@ impl App {
         if !completions.is_empty() && self.approval.is_none() {
             let n = completions.len();
             let selected = &completions[self.completion.min(n - 1)].insert;
+            // A recalled slash command shows completions too; Up/Down keep browsing history.
+            let browsing = self.recall.is_some();
             match key.code {
-                KeyCode::Up => {
+                KeyCode::Up if !browsing => {
                     self.completion = (self.completion + n - 1) % n;
                     return;
                 }
-                KeyCode::Down => {
+                KeyCode::Down if !browsing => {
+                    self.completion = (self.completion + 1) % n;
+                    return;
+                }
+                // Arguments are cycled rather than inserted: inserting one would filter the
+                // list down to it. Enter takes the selected one.
+                KeyCode::Tab if self.input.contains(char::is_whitespace) => {
                     self.completion = (self.completion + 1) % n;
                     return;
                 }
@@ -383,22 +545,10 @@ impl App {
                 }
                 self.quit_armed = !self.quit;
             }
-            KeyCode::Char('p') if ctrl => match self.recall {
-                Some(n) if n + 1 < self.sent.len() => self.show_recalled(n + 1),
-                Some(_) => {}
-                // Don't clobber text being typed.
-                None if self.input.is_empty() && !self.sent.is_empty() => self.show_recalled(0),
-                None => {}
-            },
-            KeyCode::Char('n') if ctrl => match self.recall {
-                Some(0) => {
-                    self.recall = None;
-                    self.input.clear();
-                    self.cursor = 0;
-                }
-                Some(n) => self.show_recalled(n - 1),
-                None => {}
-            },
+            KeyCode::Char('p') if ctrl => self.recall_older(),
+            KeyCode::Char('n') if ctrl => self.recall_newer(),
+            KeyCode::Up => self.recall_older(),
+            KeyCode::Down => self.recall_newer(),
             KeyCode::Esc => self.interrupt(),
             KeyCode::Enter => self.submit(),
             KeyCode::BackTab => self.set_mode(self.mode.toggle()),
@@ -419,9 +569,6 @@ impl App {
             KeyCode::Right => self.cursor = (self.cursor + 1).min(self.input.chars().count()),
             KeyCode::Home => self.cursor = self.line_bounds().0,
             KeyCode::End => self.cursor = self.line_bounds().1,
-            // The terminal sends the mouse wheel as Up/Down (alternate scroll mode).
-            KeyCode::Up => self.scroll = self.scroll.saturating_add(1),
-            KeyCode::Down => self.scroll = self.scroll.saturating_sub(1),
             KeyCode::PageUp => self.scroll = self.scroll.saturating_add(self.page()),
             KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(self.page()),
             _ => {}
@@ -468,12 +615,39 @@ impl App {
                     .collect()
             }
             "map" => vec![("show".into(), "print the current map".into())],
+            "resume" => session::list(self.tools.root())
+                .into_iter()
+                .enumerate()
+                .map(|(i, s)| ((i + 1).to_string(), format!("{}  {}", s.age(), s.title)))
+                .collect(),
             _ => Vec::new(),
         }
     }
 
     fn page(&self) -> u16 {
-        self.log_height.saturating_sub(1).max(1)
+        self.log_area.height.saturating_sub(1).max(1)
+    }
+
+    fn recall_older(&mut self) {
+        match self.recall {
+            Some(n) if n + 1 < self.sent.len() => self.show_recalled(n + 1),
+            Some(_) => {}
+            // Don't clobber text being typed.
+            None if self.input.is_empty() && !self.sent.is_empty() => self.show_recalled(0),
+            None => {}
+        }
+    }
+
+    fn recall_newer(&mut self) {
+        match self.recall {
+            Some(0) => {
+                self.recall = None;
+                self.input.clear();
+                self.cursor = 0;
+            }
+            Some(n) => self.show_recalled(n - 1),
+            None => {}
+        }
     }
 
     fn show_recalled(&mut self, n: usize) {
@@ -529,12 +703,14 @@ impl App {
             None => text,
         };
         self.history.push(Message::User(content));
+        self.persist(false);
         self.start_run();
     }
 
     fn send_notices(&mut self) {
         if let Some(notices) = self.take_notices() {
             self.history.push(Message::User(notices));
+            self.persist(false);
             self.start_run();
         }
     }
@@ -746,9 +922,42 @@ impl App {
             Command::Clear => {
                 self.interrupt();
                 self.history.clear();
+                self.session = Some(Session::new(self.tools.root()));
                 self.cut = ContextCut::default();
                 self.usage = None;
                 self.log.clear();
+            }
+            Command::Resume(None) => {
+                let list = session::list(self.tools.root());
+                let msg = if list.is_empty() {
+                    "no saved sessions".into()
+                } else {
+                    list.iter()
+                        .enumerate()
+                        .map(|(i, s)| format!("{:>2}  {:>9}  {}", i + 1, s.age(), s.title))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                self.log.push(Entry::Info(msg));
+            }
+            Command::Resume(Some(arg)) => {
+                let list = session::list(self.tools.root());
+                let picked = arg
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|n| n.checked_sub(1))
+                    .and_then(|i| list.into_iter().nth(i));
+                if self.is_running() {
+                    self.log.push(Entry::Error(
+                        "a run is active; wait for it or interrupt (Esc)".into(),
+                    ));
+                } else if let Some(s) = picked {
+                    self.resume(s.path);
+                } else {
+                    self.log.push(Entry::Error(format!(
+                        "no session `{arg}`; /resume lists them"
+                    )));
+                }
             }
             Command::Compact(focus) => {
                 if self.is_running() {
@@ -817,10 +1026,12 @@ impl App {
             }
             AgentEvent::Commit { messages, cut } => {
                 self.history.extend(messages);
+                self.persist(false);
                 self.cut = cut;
             }
             AgentEvent::Compacted(messages) => {
                 self.history = messages;
+                self.persist(true);
                 self.cut = ContextCut::default();
                 self.usage = None;
                 self.push_log(Entry::Info("history compacted".into()));

@@ -26,3 +26,5 @@ tree-sitter-javascript = "0.25.0"
 pulldown-cmark = { version = "0.13.4", default-features = false }
 rmcp = { version = "3.5.1", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
 http = "1"
+arboard = { version = "3.7.0", default-features = false, features = ["wayland-data-control"] }
+unicode-width = "0.2"

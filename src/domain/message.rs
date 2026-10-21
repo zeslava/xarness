@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Plan,
@@ -20,20 +22,23 @@ impl Mode {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Message {
     System(String),
     User(String),
     Assistant {
         content: String,
         /// Sent back only within the current turn, as the models' chat templates expect.
+        /// Not persisted: a restored turn is never the current one.
+        #[serde(skip)]
         reasoning: String,
         tool_calls: Vec<ToolCall>,
     },
