@@ -454,6 +454,7 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) {
+        let key = latin_shortcut(key);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let quit_armed = std::mem::take(&mut self.quit_armed);
@@ -1177,4 +1178,22 @@ impl App {
     fn push_log(&mut self, entry: Entry) {
         self.log.push(entry);
     }
+}
+
+/// With the kitty protocol a shortcut typed in a non-Latin layout arrives as that layout's char
+/// (Ctrl+с, not Ctrl+c), and crossterm drops the base-layout key, so map Russian ЙЦУКЕН back.
+fn latin_shortcut(mut key: KeyEvent) -> KeyEvent {
+    const RU: &str = "йцукенгшщзфывапролдячсмитьбю";
+    const EN: &str = "qwertyuiopasdfghjklzxcvbnm,.";
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        && let KeyCode::Char(c) = key.code
+        && let Some(i) = RU
+            .chars()
+            .position(|r| r == c.to_lowercase().next().unwrap_or(c))
+    {
+        key.code = KeyCode::Char(EN.as_bytes()[i] as char);
+    }
+    key
 }
