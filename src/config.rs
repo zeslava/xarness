@@ -15,6 +15,9 @@ pub struct Config {
     pub mcp: BTreeMap<String, McpServerConfig>,
     #[serde(default)]
     pub skills: SkillsConfig,
+    /// Fraction of the context window (e.g. `0.8`) at which history is compacted after a turn;
+    /// absent = off.
+    pub auto_compact: Option<f32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,6 +67,8 @@ pub struct ModelConfig {
     pub context_window: Option<u32>,
     pub temperature: Option<f32>,
     pub think: Option<ThinkConfig>,
+    /// Overrides the top-level `auto_compact` for this model.
+    pub auto_compact: Option<f32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -202,6 +202,8 @@ pub struct App {
     /// Spinner frame counter, advanced only while a run is active.
     pub tick: usize,
     running: Option<JoinHandle<()>>,
+    /// The active run is a compaction; its `Finished` must not trigger another one.
+    compacting: bool,
     /// Current phase of the active run and when it began.
     pub phase: (Phase, Instant),
     /// Messages submitted while a run was active, sent together as one turn when it finishes.
@@ -272,6 +274,7 @@ impl App {
             clipboard: Clipboard::new(),
             tick: 0,
             running: None,
+            compacting: false,
             phase: (Phase::Waiting, Instant::now()),
             queued: VecDeque::new(),
             notices: Vec::new(),
@@ -770,7 +773,35 @@ impl App {
             return;
         };
         self.running = Some(tokio::spawn(agent::run(run, self.tx.clone(), self.run_id)));
+        self.compacting = false;
         self.phase = (Phase::Waiting, Instant::now());
+    }
+
+    fn start_compact(&mut self, focus: Option<String>) {
+        let Some(run) = self.new_run() else {
+            self.log.push(Entry::Error(NO_PROVIDERS.into()));
+            return;
+        };
+        self.running = Some(tokio::spawn(agent::compact(
+            run,
+            focus,
+            self.tx.clone(),
+            self.run_id,
+        )));
+        self.compacting = true;
+        self.phase = (Phase::Waiting, Instant::now());
+    }
+
+    /// Context fill after the last response, if it crossed `auto_compact`.
+    fn auto_compact_due(&self) -> Option<f32> {
+        let threshold = self
+            .active
+            .as_ref()
+            .and_then(|a| a.model.auto_compact)
+            .or(self.config.auto_compact)?;
+        let usage = self.usage.as_ref()?;
+        let fill = usage.used as f32 / usage.window? as f32;
+        (fill >= threshold).then_some(fill)
     }
 
     fn new_run(&mut self) -> Option<Run> {
@@ -978,16 +1009,8 @@ impl App {
                     ));
                 } else if self.history.is_empty() {
                     self.log.push(Entry::Info("nothing to compact".into()));
-                } else if let Some(run) = self.new_run() {
-                    self.running = Some(tokio::spawn(agent::compact(
-                        run,
-                        focus,
-                        self.tx.clone(),
-                        self.run_id,
-                    )));
-                    self.phase = (Phase::Waiting, Instant::now());
                 } else {
-                    self.log.push(Entry::Error(NO_PROVIDERS.into()));
+                    self.start_compact(focus);
                 }
             }
             Command::Help => self.log.push(Entry::Info(commands::HELP.into())),
@@ -1078,7 +1101,16 @@ impl App {
             AgentEvent::Error(e) => self.push_log(Entry::Error(e)),
             AgentEvent::Finished => {
                 self.running = None;
-                if !self.queued.is_empty() {
+                // Queued messages and notices wait for the compaction's own `Finished`.
+                if !std::mem::take(&mut self.compacting)
+                    && let Some(fill) = self.auto_compact_due()
+                {
+                    self.push_log(Entry::Info(format!(
+                        "context {:.0}% full, compacting",
+                        fill * 100.0
+                    )));
+                    self.start_compact(None);
+                } else if !self.queued.is_empty() {
                     let next = self.queued.drain(..).collect::<Vec<_>>().join("\n\n");
                     self.send(next);
                 } else {

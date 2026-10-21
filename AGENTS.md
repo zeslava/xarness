@@ -20,6 +20,7 @@ The schema is defined in `src/config.rs`.
 
 - Models are addressed as `provider/model`; split on the **first** `/` only, since model ids may contain `/`.
 - `context_window` enables history trimming; without it, the provider is asked (llama.cpp `/props` → `n_ctx`, fetched each turn), and if that fails full history is sent.
+- `auto_compact` (e.g. `0.8`, absent = off): after a turn whose server-reported usage reaches that fraction of the context window, history is compacted like `/compact`; queued messages are sent after it. A model's own `auto_compact` overrides the top-level one.
 - `think.levels` maps a level name to raw JSON merged into the request body (`ChatRequest.extra`) — reasoning control is provider-specific, so it is pure config, not code. `think` may instead be a list of `reasoning_effort` values (`["low", "high"]`) or a preset name (`qwen`, see `think_preset`), and may be set on the provider, where models without their own inherit it.
 - `mcp.<server>` configures an MCP server: `command`/`args`/`env` (stdio) or `url`/`headers`/`headers_env` (streamable HTTP), plus `enabled`, `approval` (`auto` | `always` | `never`) and an optional `tools` allowlist.
 - `skills.compat` (default `["agents", "claude"]`) adds other agents' skill dirs `.<name>/skills`; `skills.disabled` lists skill names to skip.
