@@ -320,7 +320,10 @@ impl DeltaAccumulator {
         };
         // llama.cpp/vLLM put thinking in `reasoning_content`, some servers use `reasoning`.
         let reasoning = text("reasoning_content").or_else(|| text("reasoning"));
-        let mut events: Vec<_> = reasoning.map(LlmEvent::ReasoningDelta).into_iter().collect();
+        let mut events: Vec<_> = reasoning
+            .map(LlmEvent::ReasoningDelta)
+            .into_iter()
+            .collect();
         if let Some(content) = text("content") {
             events.extend(self.split_think(&content));
         }
@@ -380,12 +383,10 @@ impl DeltaAccumulator {
     /// Text held back by `split_think` that never became a tag.
     fn flush_think(&mut self) -> Option<LlmEvent> {
         let t = std::mem::take(&mut self.think_tail);
-        (!t.is_empty()).then(|| {
-            if self.in_think {
-                LlmEvent::ReasoningDelta(t)
-            } else {
-                LlmEvent::TextDelta(t)
-            }
+        (!t.is_empty()).then_some(if self.in_think {
+            LlmEvent::ReasoningDelta(t)
+        } else {
+            LlmEvent::TextDelta(t)
         })
     }
 

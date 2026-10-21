@@ -127,7 +127,7 @@ pub fn list(root: &Path) -> Vec<Summary> {
             })
         })
         .collect();
-    found.sort_by(|a, b| b.modified.cmp(&a.modified));
+    found.sort_by_key(|b| std::cmp::Reverse(b.modified));
     found
 }
 
