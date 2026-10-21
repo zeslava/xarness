@@ -27,7 +27,7 @@ struct Args {
     background: bool,
 }
 
-pub(super) const TIMEOUT: Duration = Duration::from_secs(120);
+const TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_LINES: usize = 60;
 const OK_TAIL_LINES: usize = 10;
 const MAX_LINE_CHARS: usize = 300;
@@ -66,7 +66,9 @@ impl RunCommand {
         let a: Args = super::parse(args)?;
         if a.background {
             let id = self.jobs.start(&a.command, root)?;
-            return Ok(format!("started job #{id}"));
+            return Ok(format!(
+                "started job #{id}. Its result arrives as a new message when it exits. Do not wait or poll for it: continue with work that does not depend on it, or end your turn now."
+            ));
         }
         let mut child = shell(&a.command, root).spawn().context("spawning sh")?;
 

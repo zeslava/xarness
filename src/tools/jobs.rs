@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::run::{self, TIMEOUT};
+use super::run;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 
@@ -120,10 +120,6 @@ impl Jobs {
         }
         Ok(list)
     }
-
-    fn running(&self, id: usize) -> Result<bool> {
-        Ok(self.get(id)?[id - 1].poll().is_none())
-    }
 }
 
 /// Weak, so a watcher doesn't keep the registry alive and its `Drop` still kills the jobs.
@@ -186,19 +182,17 @@ struct Args {
     id: Option<usize>,
     #[serde(default)]
     kill: bool,
-    wait: Option<u64>,
 }
 
 impl Tool for JobTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "job".into(),
-            description: "Inspect background jobs (exits are reported automatically, no need to poll). Without `id`, lists jobs. With `id`, shows status and output tail; `wait` waits up to N seconds (max 120) for exit, `kill` stops it.".into(),
+            description: "Inspect background jobs. Exits are reported automatically as a new message, so never poll: to wait for a job, end your turn. Without `id`, lists jobs. With `id`, shows status and output tail (e.g. a dev server's log); `kill` stops it.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "id": { "type": "integer", "description": "Job id returned by `run`" },
-                    "wait": { "type": "integer", "description": "Seconds to wait for the job to exit" },
                     "kill": { "type": "boolean", "description": "Stop the job and everything it spawned" }
                 }
             }),
@@ -230,17 +224,16 @@ async fn call(jobs: &Jobs, args: Value) -> Result<String> {
             .collect());
     };
 
-    if let Some(secs) = a.wait {
-        let deadline = Instant::now() + Duration::from_secs(secs).min(TIMEOUT);
-        // Async, so Esc can abort the wait.
-        while jobs.running(id)? && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    }
     let mut list = jobs.get(id)?;
     let job = &mut list[id - 1];
     if a.kill {
         job.kill();
     }
-    Ok(job.report(id, a.kill))
+    let mut report = job.report(id, a.kill);
+    if job.poll().is_none() {
+        report.push_str(
+            "\n(still running; its exit will be reported automatically, end your turn instead of polling)",
+        );
+    }
+    Ok(report)
 }
