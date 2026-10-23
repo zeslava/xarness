@@ -7,7 +7,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 
 use crate::config::ModelConfig;
-use crate::domain::message::{Message, Mode};
+use crate::domain::message::{Message, Mode, ToolCall};
 use crate::domain::ports::{ChatRequest, ContextOverflow, LlmEvent, LlmProvider};
 use crate::tools::{SKILL_TOOL, ToolRegistry};
 
@@ -502,12 +502,15 @@ fn trim(history: &[Message], budget: usize) -> ContextCut {
     ContextCut { start, truncated }
 }
 
-/// Tool outputs from finished turns (followed by a later user message) longer than this are
-/// replaced with `ELIDED_MARK`, and their reasoning is dropped. The view changes only when a new
-/// turn starts, so within a turn the sent prefix stays byte-identical and the server's KV cache
-/// stays valid.
+/// Tool outputs and long string arguments of tool calls from finished turns (followed by a later
+/// user message) longer than this are replaced with a mark. Reasoning is kept only on the latest
+/// assistant message of the current turn: with a small context window, every step's thinking
+/// piling up within one turn fills it fast. This changes the previous step on each new step, so
+/// the server re-processes the prompt from there; outputs and arguments change only when a new
+/// turn starts.
 const ELIDE_MIN_BYTES: usize = 200;
 const ELIDED_MARK: &str = "[output from an earlier turn elided; re-run the tool if needed]";
+const ELIDED_ARG: &str = "[argument from an earlier turn elided]";
 
 fn elide_old_outputs(history: &[Message]) -> Vec<Message> {
     let pinned = skill_calls(history);
@@ -515,6 +518,10 @@ fn elide_old_outputs(history: &[Message]) -> Vec<Message> {
         .iter()
         .rposition(|m| matches!(m, Message::User(_)))
         .unwrap_or(0);
+    let last_assistant = history
+        .iter()
+        .rposition(|m| matches!(m, Message::Assistant { .. }))
+        .filter(|&i| i > last_user);
     history
         .iter()
         .enumerate()
@@ -533,14 +540,42 @@ fn elide_old_outputs(history: &[Message]) -> Vec<Message> {
                 content,
                 reasoning,
                 tool_calls,
-            } if i < last_user && !reasoning.is_empty() => Message::Assistant {
+            } => Message::Assistant {
                 content: content.clone(),
-                reasoning: String::new(),
-                tool_calls: tool_calls.clone(),
+                reasoning: if Some(i) == last_assistant {
+                    reasoning.clone()
+                } else {
+                    String::new()
+                },
+                tool_calls: if i < last_user {
+                    tool_calls.iter().map(elide_arguments).collect()
+                } else {
+                    tool_calls.clone()
+                },
             },
             _ => m.clone(),
         })
         .collect()
+}
+
+/// Long string arguments of a finished turn's call (`edit_file`'s `old_string`/`new_string`,
+/// `write_file`'s `content`) are replaced with `ELIDED_ARG`; short ones such as `path`,
+/// `command` or `pattern` stay, so the model still sees what it did and where.
+fn elide_arguments(call: &ToolCall) -> ToolCall {
+    let mut call = call.clone();
+    if call.arguments.len() <= ELIDE_MIN_BYTES || call.name == SKILL_TOOL {
+        return call;
+    }
+    let Ok(Value::Object(mut args)) = serde_json::from_str::<Value>(&call.arguments) else {
+        return call;
+    };
+    for v in args.values_mut() {
+        if v.as_str().is_some_and(|s| s.len() > ELIDE_MIN_BYTES) {
+            *v = ELIDED_ARG.into();
+        }
+    }
+    call.arguments = Value::Object(args).to_string();
+    call
 }
 
 /// Ids of `skill` calls. Their outputs are instructions the model keeps following, so they are
@@ -623,11 +658,11 @@ fn system_prompt(
     }
     if let Some(map) = repo_map {
         prompt.push_str(
-            "\n\n# Repository map\n\nFiles with line counts and their definitions as `line: declaration`. \
+            "\n\n# Repository map\n\nFiles with line counts and the declarations they define. \
              Consult it before searching: if a symbol you need is listed, go straight to read_symbol with \
              its name instead of grepping for it. Use grep only for what the map does not show \
-             (usages, string literals, symbols missing from the map). It may be stale: if the line \
-             does not match, fall back to grep.\n\n",
+             (usages, string literals, symbols missing from the map). It may not reflect edits made in \
+             this session: if read_symbol does not find a name, fall back to grep.\n\n",
         );
         prompt.push_str(map);
     }
@@ -701,5 +736,69 @@ mod tests {
             cut.truncated.iter().map(|&(i, _)| i).collect::<Vec<_>>(),
             [4]
         );
+    }
+
+    #[test]
+    fn reasoning_kept_only_on_latest_step() {
+        let step = |id: &str| Message::Assistant {
+            content: String::new(),
+            reasoning: "think".into(),
+            tool_calls: vec![ToolCall {
+                id: id.into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            }],
+        };
+        let output = |id: &str| Message::Tool {
+            call_id: id.into(),
+            content: "x".into(),
+        };
+        let reasoning = |m: &Message| match m {
+            Message::Assistant { reasoning, .. } => reasoning.clone(),
+            _ => unreachable!(),
+        };
+        let mut history = vec![
+            Message::User("q".into()),
+            step("a"),
+            output("a"),
+            step("b"),
+            output("b"),
+        ];
+        let elided = elide_old_outputs(&history);
+        assert_eq!(reasoning(&elided[1]), "");
+        assert_eq!(reasoning(&elided[3]), "think");
+
+        history.push(Message::User("next".into()));
+        let elided = elide_old_outputs(&history);
+        assert_eq!(reasoning(&elided[3]), "");
+    }
+
+    #[test]
+    fn long_arguments_elided_after_turn() {
+        let args = serde_json::json!({ "path": "src/a.rs", "old_string": "x".repeat(300) });
+        let mut history = vec![
+            Message::User("q".into()),
+            Message::Assistant {
+                content: String::new(),
+                reasoning: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "e".into(),
+                    name: "edit_file".into(),
+                    arguments: args.to_string(),
+                }],
+            },
+        ];
+        let arguments = |h: &[Message]| match &elide_old_outputs(h)[1] {
+            Message::Assistant { tool_calls, .. } => {
+                serde_json::from_str::<Value>(&tool_calls[0].arguments).unwrap()
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(arguments(&history), args);
+
+        history.push(Message::User("next".into()));
+        let elided = arguments(&history);
+        assert_eq!(elided["path"], "src/a.rs");
+        assert_eq!(elided["old_string"], ELIDED_ARG);
     }
 }

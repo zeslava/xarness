@@ -1,6 +1,8 @@
 //! Repository map for the system prompt: every file with its line count and the definitions
 //! found by tree-sitter tag queries. Built once and kept byte-identical between requests so
-//! the server's KV cache stays valid; it is only rebuilt on demand (`/map`).
+//! the server's KV cache stays valid; it is only rebuilt on `/map` and on compaction. Definitions
+//! are listed without line numbers: those go stale with every edit, names rarely do, and
+//! `read_symbol` finds code by name.
 //!
 //! Over budget, definitions are kept by importance: files are ranked by PageRank over the
 //! graph "file references a name defined in file", and each definition scores by its file's
@@ -123,7 +125,7 @@ fn def_line(d: &Def) -> String {
     } else {
         "    "
     };
-    format!("{indent}{}: {}\n", d.line, d.text)
+    format!("{indent}{}\n", d.text)
 }
 
 /// Takes definitions in priority order while they fit. Stops at the first one that doesn't,

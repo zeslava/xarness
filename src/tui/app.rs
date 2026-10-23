@@ -164,7 +164,8 @@ pub struct App {
     skill_catalog: Option<Arc<str>>,
     /// Per server: tool count or connection error; `None` while connecting.
     mcp: Option<Vec<(String, Result<usize, String>)>>,
-    /// Built at startup and on `/map` only, so the system prompt prefix stays cacheable.
+    /// Built at startup, on `/map` and on compaction only, so the system prompt prefix stays
+    /// cacheable.
     repo_map: Option<Arc<str>>,
     /// Maps are built in the background and arrive through the event loop.
     map_tx: UnboundedSender<Option<repomap::RepoMap>>,
@@ -790,6 +791,10 @@ impl App {
         )));
         self.compacting = true;
         self.phase = (Phase::Waiting, Instant::now());
+        // Compaction rewrites the history, so the next request misses the KV cache anyway: a fresh
+        // map costs nothing extra then. Started now, it is ready before the next turn; the
+        // compaction request itself already took the old one.
+        self.build_map();
     }
 
     /// Context fill after the last response, if it crossed `auto_compact`.
