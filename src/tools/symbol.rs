@@ -82,7 +82,7 @@ impl Tool for ReadSymbol {
 impl ReadSymbol {
     fn call(&self, args: Value, root: &Path) -> Result<String> {
         let a: Args = super::parse(args)?;
-        let path = super::resolve(root, &a.path)?;
+        let path = super::resolve_read(root, &a.path)?;
         let Some(config) = repomap::languages().for_path(&a.path) else {
             bail!("unsupported language for {}; use read_file", a.path);
         };

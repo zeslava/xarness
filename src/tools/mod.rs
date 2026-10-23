@@ -22,6 +22,9 @@ use crate::skills::Skills;
 
 pub(crate) use skill::NAME as SKILL_TOOL;
 
+/// Tools whose `path` goes through `resolve_read`.
+const PATH_READERS: [&str; 4] = ["read_file", "read_symbol", "list_dir", "grep"];
+
 pub struct ToolRegistry {
     root: PathBuf,
     tools: Vec<Arc<dyn Tool>>,
@@ -94,9 +97,19 @@ impl ToolRegistry {
         self.available(mode).iter().map(|t| t.spec()).collect()
     }
 
-    pub fn needs_approval(&self, name: &str) -> bool {
-        self.find(Mode::Build, name)
-            .is_some_and(|t| t.needs_approval())
+    /// Besides tools that always ask, a read-only tool asks when its `path` leaves the working
+    /// directory (`resolve_read` lets it into the home directory).
+    pub fn needs_approval(&self, name: &str, arguments: &str) -> bool {
+        let Some(tool) = self.find(Mode::Build, name) else {
+            return false;
+        };
+        tool.needs_approval()
+            || (PATH_READERS.contains(&name)
+                && serde_json::from_str::<Value>(arguments)
+                    .ok()
+                    .as_ref()
+                    .and_then(|a| a.get("path")?.as_str())
+                    .is_some_and(|p| !lexical(&self.root, p).starts_with(&self.root)))
     }
 
     pub async fn run(&self, mode: Mode, name: &str, arguments: &str) -> Result<String> {
@@ -118,8 +131,35 @@ pub(crate) fn parse<T: DeserializeOwned>(args: Value) -> Result<T> {
 
 /// Lexical resolution: the target may not exist yet, so no canonicalize. Symlinks are not followed.
 pub(crate) fn resolve(root: &Path, path: &str) -> Result<PathBuf> {
-    let mut out = root.to_path_buf();
-    for c in Path::new(path).components() {
+    let out = lexical(root, path);
+    if !out.starts_with(root) {
+        bail!(
+            "path `{path}` is outside the working directory; only files inside it are accessible"
+        );
+    }
+    Ok(out)
+}
+
+/// For read-only tools: the home directory is readable too, e.g. dependency sources in
+/// `~/.cargo/registry` or `~/go/pkg/mod`. Writes stay inside the working directory.
+pub(crate) fn resolve_read(root: &Path, path: &str) -> Result<PathBuf> {
+    let out = lexical(root, path);
+    let home = dirs::home_dir();
+    if !out.starts_with(root) && !home.is_some_and(|h| out.starts_with(h)) {
+        bail!("path `{path}` is outside the working directory and the home directory");
+    }
+    Ok(out)
+}
+
+/// Relative paths start at `root`; a leading `~` is the home directory.
+fn lexical(root: &Path, path: &str) -> PathBuf {
+    let (mut out, rest) = match (path.strip_prefix('~'), dirs::home_dir()) {
+        (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') => {
+            (home, rest.trim_start_matches('/'))
+        }
+        _ => (root.to_path_buf(), path),
+    };
+    for c in Path::new(rest).components() {
         match c {
             Component::RootDir | Component::Prefix(_) => out = PathBuf::from(c.as_os_str()),
             Component::CurDir => {}
@@ -129,10 +169,7 @@ pub(crate) fn resolve(root: &Path, path: &str) -> Result<PathBuf> {
             Component::Normal(p) => out.push(p),
         }
     }
-    if !out.starts_with(root) {
-        bail!("path `{path}` is outside the working directory");
-    }
-    Ok(out)
+    out
 }
 
 pub(crate) fn clip(line: &str, max_chars: usize) -> std::borrow::Cow<'_, str> {

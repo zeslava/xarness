@@ -50,7 +50,7 @@ impl Tool for ReadFile {
 impl ReadFile {
     fn call(&self, args: Value, root: &Path) -> Result<String> {
         let a: Args = super::parse(args)?;
-        let path = super::resolve(root, &a.path)?;
+        let path = super::resolve_read(root, &a.path)?;
         let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", a.path))?;
         let start = a.offset.unwrap_or(1).max(1);
         let limit = a.limit.unwrap_or(DEFAULT_LIMIT);

@@ -125,7 +125,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             FlashKind::Ok => Color::Green,
             FlashKind::Error => Color::LightRed,
         };
-        let line = Line::styled(format!("{} ", flash.text), Style::new().fg(color));
+        let line = Line::from(Span::styled(
+            format!("{} ", flash.text),
+            Style::new().fg(color),
+        ));
         f.render_widget(line.right_aligned(), status_area);
     }
 }

@@ -20,6 +20,7 @@ use crate::agent::{self, AgentEvent, Answer, ContextCut, Run};
 use crate::config::{Config, ModelConfig};
 use crate::domain::message::{Message, Mode};
 use crate::domain::ports::LlmProvider;
+use crate::metrics;
 use crate::repomap;
 use crate::session::{self, Session};
 use crate::skills::{Skill, Skills};
@@ -176,6 +177,8 @@ pub struct App {
     history: Vec<Message>,
     /// `None` after a failed write, until `/clear` or `/resume` starts over.
     session: Option<Session>,
+    /// Requests of the current session, for `/stats`; not persisted.
+    metrics: Vec<metrics::Request>,
     cut: ContextCut,
     pub usage: Option<ContextUsage>,
     pub log: Vec<Entry>,
@@ -257,6 +260,7 @@ impl App {
             flash_at: Instant::now(),
             mode: Mode::Plan,
             history: Vec::new(),
+            metrics: Vec::new(),
             session: Some(session),
             cut: ContextCut::default(),
             usage: None,
@@ -302,6 +306,7 @@ impl App {
                 self.log = history_log(&history);
                 self.log.push(Entry::Info("session resumed".into()));
                 self.history = history;
+                self.metrics.clear();
                 self.session = Some(session);
                 self.cut = ContextCut::default();
                 self.usage = None;
@@ -971,6 +976,7 @@ impl App {
                 self.interrupt();
                 self.history.clear();
                 self.session = Some(Session::new(self.tools.root()));
+                self.metrics.clear();
                 self.cut = ContextCut::default();
                 self.usage = None;
                 self.log.clear();
@@ -986,6 +992,10 @@ impl App {
                         .collect::<Vec<_>>()
                         .join("\n")
                 };
+                self.log.push(Entry::Info(msg));
+            }
+            Command::Stats => {
+                let msg = metrics::summary(&self.metrics);
                 self.log.push(Entry::Info(msg));
             }
             Command::Resume(Some(arg)) => {
@@ -1086,6 +1096,10 @@ impl App {
                     window,
                     cached,
                 })
+            }
+            AgentEvent::Metrics(mut stats) => {
+                stats.model = self.model_label();
+                self.metrics.push(stats);
             }
             AgentEvent::Approve { name, reply, .. } if self.always.contains(&name) => {
                 let _ = reply.send(Answer::Yes);

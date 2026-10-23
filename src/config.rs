@@ -32,7 +32,7 @@ pub struct SkillsConfig {
 impl Default for SkillsConfig {
     fn default() -> Self {
         Self {
-            compat: vec!["agents".into(), "claude".into()],
+            compat: vec!["agents".into()],
             disabled: Vec::new(),
         }
     }

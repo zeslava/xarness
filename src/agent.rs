@@ -1,5 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use futures::StreamExt;
 use serde_json::Value;
@@ -9,6 +10,7 @@ use tokio::sync::oneshot;
 use crate::config::ModelConfig;
 use crate::domain::message::{Message, Mode, ToolCall};
 use crate::domain::ports::{ChatRequest, ContextOverflow, LlmEvent, LlmProvider};
+use crate::metrics;
 use crate::tools::{SKILL_TOOL, ToolRegistry};
 
 pub enum AgentEvent {
@@ -36,6 +38,8 @@ pub enum AgentEvent {
         window: Option<u32>,
         cached: Option<u32>,
     },
+    /// A request finished, with its tool calls run.
+    Metrics(metrics::Request),
     /// A tool call waits for the user's answer.
     Approve {
         name: String,
@@ -105,6 +109,31 @@ pub async fn run(mut r: Run, tx: UnboundedSender<(u64, AgentEvent)>, run_id: u64
             None => history,
         };
         let estimated = fixed + history.iter().map(message_tokens).sum::<usize>();
+        let part = |s: Option<&str>| s.map_or(0, estimate_tokens);
+        let parts = [
+            ("agents_md", part(r.instructions.as_deref())),
+            ("skills", part(r.skills.as_deref())),
+            ("repomap", part(r.repo_map.as_deref())),
+        ];
+        let base = estimate_tokens(&system).saturating_sub(parts.iter().map(|p| p.1).sum());
+        let mut stats = metrics::Request {
+            estimated,
+            dropped: r.cut.start,
+            cut_outputs: r.cut.truncated.len(),
+            retried,
+            context: breakdown(
+                &[
+                    &parts[..],
+                    &[
+                        ("system", base),
+                        ("tool_specs", fixed - estimate_tokens(&system)),
+                    ],
+                ]
+                .concat(),
+                &history,
+            ),
+            ..Default::default()
+        };
         let mut messages = vec![Message::System(system)];
         messages.extend(history);
         let req = ChatRequest {
@@ -116,12 +145,18 @@ pub async fn run(mut r: Run, tx: UnboundedSender<(u64, AgentEvent)>, run_id: u64
             extra: r.extra.clone(),
         };
 
+        let started = Instant::now();
         let mut stream = r.provider.stream(req);
         let mut text = String::new();
         let mut reasoning = String::new();
         let mut calls = Vec::new();
         let mut truncated = false;
         while let Some(ev) = stream.next().await {
+            if stats.first_token_ms.is_none()
+                && matches!(ev, Ok(LlmEvent::TextDelta(_) | LlmEvent::ReasoningDelta(_)))
+            {
+                stats.first_token_ms = Some(started.elapsed().as_millis() as u64);
+            }
             match ev {
                 Ok(LlmEvent::TextDelta(t)) => {
                     text.push_str(&t);
@@ -141,6 +176,9 @@ pub async fn run(mut r: Run, tx: UnboundedSender<(u64, AgentEvent)>, run_id: u64
                     // A cut-off tool call likely has incomplete arguments; don't run it.
                     calls = if t { Vec::new() } else { tool_calls };
                     truncated = t;
+                    stats.prompt_tokens = prompt_tokens;
+                    stats.completion_tokens = completion_tokens;
+                    stats.cached_tokens = cached_tokens;
                     if let Some(n) = prompt_tokens {
                         scale = n as f64 / estimated as f64;
                         send(AgentEvent::Usage {
@@ -169,6 +207,8 @@ pub async fn run(mut r: Run, tx: UnboundedSender<(u64, AgentEvent)>, run_id: u64
             }
         }
 
+        stats.duration_ms = started.elapsed().as_millis() as u64;
+        let tools_started = Instant::now();
         retried = false;
         let mut batch = vec![Message::Assistant {
             content: text,
@@ -180,29 +220,43 @@ pub async fn run(mut r: Run, tx: UnboundedSender<(u64, AgentEvent)>, run_id: u64
                 name: c.name.clone(),
                 arguments: c.arguments.clone(),
             });
-            let answer = if r.tools.needs_approval(&c.name) {
-                let (reply, answer) = oneshot::channel();
-                send(AgentEvent::Approve {
-                    name: c.name.clone(),
-                    arguments: c.arguments.clone(),
-                    reply,
-                });
-                answer.await.unwrap_or(Answer::No(None))
+            let result = if c.arguments.contains(ELIDED_ARG) {
+                // Models imitate the elided calls they see in history; running such a call would
+                // write the mark into a file instead of the content.
+                Err(anyhow::anyhow!(
+                    "`{ELIDED_ARG}` is a placeholder from elided history, not real content; \
+                     pass the actual text"
+                ))
             } else {
-                Answer::Yes
-            };
-            let result = match answer {
-                Answer::Yes => r.tools.run(r.mode, &c.name, &c.arguments).await,
-                Answer::No(None) => Err(anyhow::anyhow!("the user declined this call")),
-                Answer::No(Some(reason)) => Err(anyhow::anyhow!(
-                    "the user declined this call and said: {reason}"
-                )),
+                let answer = if r.tools.needs_approval(&c.name, &c.arguments) {
+                    let (reply, answer) = oneshot::channel();
+                    send(AgentEvent::Approve {
+                        name: c.name.clone(),
+                        arguments: c.arguments.clone(),
+                        reply,
+                    });
+                    answer.await.unwrap_or(Answer::No(None))
+                } else {
+                    Answer::Yes
+                };
+                match answer {
+                    Answer::Yes => r.tools.run(r.mode, &c.name, &c.arguments).await,
+                    Answer::No(None) => Err(anyhow::anyhow!("the user declined this call")),
+                    Answer::No(Some(reason)) => Err(anyhow::anyhow!(
+                        "the user declined this call and said: {reason}"
+                    )),
+                }
             };
             let (output, is_error) = match result {
                 Ok(out) => (out, false),
                 Err(e) => (format!("error: {e:#}"), true),
             };
             let output = cap_output(output);
+            stats.tools.push(metrics::ToolRun {
+                name: c.name.clone(),
+                error: is_error,
+                bytes: output.len(),
+            });
             send(AgentEvent::ToolResult {
                 output: output.clone(),
                 is_error,
@@ -212,6 +266,8 @@ pub async fn run(mut r: Run, tx: UnboundedSender<(u64, AgentEvent)>, run_id: u64
                 content: output,
             });
         }
+        stats.tools_ms = tools_started.elapsed().as_millis() as u64;
+        send(AgentEvent::Metrics(stats));
         r.history.extend(batch.iter().cloned());
         send(AgentEvent::Commit {
             messages: batch,
@@ -266,6 +322,14 @@ pub async fn compact(
         }
         None => history,
     };
+    let mut stats = metrics::Request {
+        compact: true,
+        estimated: estimate_tokens(COMPACT_PROMPT)
+            + history.iter().map(message_tokens).sum::<usize>()
+            + message_tokens(&request),
+        context: breakdown(&[("system", estimate_tokens(COMPACT_PROMPT))], &history),
+        ..Default::default()
+    };
     let mut messages = vec![Message::System(COMPACT_PROMPT.into())];
     messages.extend(history);
     messages.push(request);
@@ -278,17 +342,34 @@ pub async fn compact(
         extra: r.extra.clone(),
     };
 
+    let started = Instant::now();
     let mut stream = r.provider.stream(req);
     let mut summary = String::new();
     let mut truncated = false;
     while let Some(ev) = stream.next().await {
+        if stats.first_token_ms.is_none()
+            && matches!(ev, Ok(LlmEvent::TextDelta(_) | LlmEvent::ReasoningDelta(_)))
+        {
+            stats.first_token_ms = Some(started.elapsed().as_millis() as u64);
+        }
         match ev {
             Ok(LlmEvent::TextDelta(t)) => {
                 summary.push_str(&t);
                 send(AgentEvent::TextDelta(t));
             }
             Ok(LlmEvent::ReasoningDelta(_)) => send(AgentEvent::Thinking),
-            Ok(LlmEvent::Done { truncated: t, .. }) => truncated = t,
+            Ok(LlmEvent::Done {
+                truncated: t,
+                prompt_tokens,
+                completion_tokens,
+                cached_tokens,
+                ..
+            }) => {
+                truncated = t;
+                stats.prompt_tokens = prompt_tokens;
+                stats.completion_tokens = completion_tokens;
+                stats.cached_tokens = cached_tokens;
+            }
             Err(e) => {
                 send(AgentEvent::Error(format!("compaction failed: {e:#}")));
                 send(AgentEvent::Finished);
@@ -296,6 +377,8 @@ pub async fn compact(
             }
         }
     }
+    stats.duration_ms = started.elapsed().as_millis() as u64;
+    send(AgentEvent::Metrics(stats));
     if truncated || summary.trim().is_empty() {
         send(AgentEvent::Error(
             "compaction failed: summary empty or cut off at max_tokens; history kept".into(),
@@ -425,6 +508,49 @@ fn shorten(content: &str, keep: usize, label: &str) -> String {
     s
 }
 
+/// Estimated tokens per part of a request: the given system parts, then the history by role,
+/// with tool outputs keyed by tool name. Adds up to the `message_tokens` total.
+fn breakdown(system: &[(&str, usize)], history: &[Message]) -> BTreeMap<String, usize> {
+    let mut out: BTreeMap<String, usize> = system
+        .iter()
+        .filter(|p| p.1 > 0)
+        .map(|&(k, n)| (k.to_string(), n))
+        .collect();
+    let mut add = |k: &str, n: usize| *out.entry(k.to_string()).or_default() += n;
+    let mut names: HashMap<&str, &str> = HashMap::new();
+    for m in history {
+        match m {
+            Message::System(c) => add("system", 4 + estimate_tokens(c)),
+            Message::User(c) => add("user", 4 + estimate_tokens(c)),
+            Message::Tool { call_id, content } => {
+                let name = names.get(call_id.as_str()).copied().unwrap_or("?");
+                add(&format!("tool:{name}"), 4 + estimate_tokens(content));
+            }
+            Message::Assistant {
+                content,
+                reasoning,
+                tool_calls,
+            } => {
+                let reasoning = estimate_tokens(reasoning);
+                if reasoning > 1 {
+                    add("reasoning", reasoning);
+                    add("assistant", 4 + estimate_tokens(content));
+                } else {
+                    add("assistant", 4 + estimate_tokens(content) + reasoning);
+                }
+                for c in tool_calls {
+                    names.insert(&c.id, &c.name);
+                    add(
+                        "tool_args",
+                        estimate_tokens(&c.name) + estimate_tokens(&c.arguments),
+                    );
+                }
+            }
+        }
+    }
+    out
+}
+
 fn total_tokens(h: &[Message]) -> usize {
     h.iter().map(message_tokens).sum()
 }
@@ -513,7 +639,6 @@ const ELIDED_MARK: &str = "[output from an earlier turn elided; re-run the tool 
 const ELIDED_ARG: &str = "[argument from an earlier turn elided]";
 
 fn elide_old_outputs(history: &[Message]) -> Vec<Message> {
-    let pinned = skill_calls(history);
     let last_user = history
         .iter()
         .rposition(|m| matches!(m, Message::User(_)))
@@ -527,9 +652,7 @@ fn elide_old_outputs(history: &[Message]) -> Vec<Message> {
         .enumerate()
         .map(|(i, m)| match m {
             Message::Tool { call_id, content }
-                if i < last_user
-                    && content.len() > ELIDE_MIN_BYTES
-                    && !pinned.contains(call_id.as_str()) =>
+                if i < last_user && content.len() > ELIDE_MIN_BYTES =>
             {
                 Message::Tool {
                     call_id: call_id.clone(),
@@ -579,7 +702,9 @@ fn elide_arguments(call: &ToolCall) -> ToolCall {
 }
 
 /// Ids of `skill` calls. Their outputs are instructions the model keeps following, so they are
-/// never elided or cut, only dropped with their whole turn.
+/// never cut within their turn. Once it is finished they are elided like other outputs: a body
+/// pulled along through every later turn costs thousands of tokens per request, and the model
+/// can load it again.
 fn skill_calls(history: &[Message]) -> HashSet<&str> {
     history
         .iter()
@@ -631,7 +756,8 @@ fn system_prompt(
         }
     };
     let mut prompt = format!(
-        "You are a coding agent working in `{cwd}`. All paths are relative to it.\n{task}\n\
+        "You are a coding agent working in `{cwd}`. All paths are relative to it; read-only tools \
+         also accept paths under the home directory (`~/…`), e.g. dependency sources.\n{task}\n\
          Do exactly what the user asked — nothing more. If you have ideas, improvements or noticed \
          other problems, mention them briefly at the end and ask whether to act on them; do not act \
          on them yourself. If the user asks a question, answer it without changing anything.\n\
@@ -705,7 +831,7 @@ mod tests {
     }
 
     #[test]
-    fn skill_outputs_are_not_elided_or_cut() {
+    fn skill_outputs_are_cut_only_in_finished_turns() {
         let call = |id: &str, name: &str| Message::Assistant {
             content: String::new(),
             reasoning: String::new(),
@@ -728,7 +854,7 @@ mod tests {
             Message::User("next".into()),
         ];
         let elided = elide_old_outputs(&history);
-        assert!(matches!(&elided[2], Message::Tool { content, .. } if content.len() == 3000));
+        assert!(matches!(&elided[2], Message::Tool { content, .. } if content == ELIDED_MARK));
         assert!(matches!(&elided[4], Message::Tool { content, .. } if content == ELIDED_MARK));
 
         let cut = trim(&history[..5], 1100);

@@ -24,6 +24,8 @@ struct Args {
 
 const MAX_MATCHES: usize = 50;
 const MAX_LINE_CHARS: usize = 200;
+/// Outside the working directory (e.g. `~/.cargo`) a broad path can mean walking a huge tree.
+const MAX_FILES_OUTSIDE: usize = 2000;
 
 impl Tool for Grep {
     fn spec(&self) -> ToolSpec {
@@ -54,12 +56,25 @@ impl Grep {
     fn call(&self, args: Value, root: &Path) -> Result<String> {
         let a: Args = super::parse(args)?;
         let re = Regex::new(&a.pattern)?;
-        let base = super::resolve(root, a.path.as_deref().unwrap_or("."))?;
+        let path = a.path.as_deref().unwrap_or(".");
+        let base = super::resolve_read(root, path)?;
+        // The walk skips unreadable entries, so a wrong path would otherwise read as "no matches".
+        if !base.exists() {
+            anyhow::bail!("path `{path}` does not exist");
+        }
         let mut out = String::new();
         let mut count = 0;
+        let mut files = 0;
+        let outside = !base.starts_with(root);
+        let mut cut = false;
         for entry in WalkBuilder::new(&base).build().filter_map(|e| e.ok()) {
             if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
+            }
+            files += 1;
+            if outside && files > MAX_FILES_OUTSIDE {
+                cut = true;
+                break;
             }
             let Ok(text) = std::fs::read_to_string(entry.path()) else {
                 continue;
@@ -94,6 +109,12 @@ impl Grep {
             let _ = writeln!(
                 out,
                 "[showing {MAX_MATCHES} of {count} matches; narrow the pattern or path]"
+            );
+        }
+        if cut {
+            let _ = writeln!(
+                out,
+                "[stopped after {MAX_FILES_OUTSIDE} files outside the working directory; narrow the path to the package you need]"
             );
         }
         Ok(if out.is_empty() {
