@@ -22,12 +22,15 @@ use crate::domain::message::{Message, Mode};
 use crate::domain::ports::LlmProvider;
 use crate::metrics;
 use crate::repomap;
-use crate::session::{self, Session};
+use crate::session::{self, Session, Shown};
 use crate::skills::{Skill, Skills};
 use crate::tools::ToolRegistry;
 
 const WHEEL_LINES: u16 = 3;
 const FLASH_TTL: Duration = Duration::from_millis(1500);
+/// Pastes over either limit are shown in the input as a `[Pasted #n]` placeholder.
+const PASTE_MAX_LINES: usize = 5;
+const PASTE_MAX_CHARS: usize = 1000;
 
 #[derive(Clone, Copy)]
 pub enum FlashKind {
@@ -97,11 +100,11 @@ fn default_think(model: &ModelConfig) -> Option<String> {
 }
 
 /// The log of a restored session. Tool outputs are left out, as successful ones are live.
-fn history_log(history: &[Message]) -> Vec<Entry> {
+fn history_log(history: &[Message], shown: &Shown) -> Vec<Entry> {
     let mut log = Vec::new();
-    for m in history {
+    for (i, m) in history.iter().enumerate() {
         match m {
-            Message::User(t) => log.push(Entry::User(t.clone())),
+            Message::User(t) => log.push(Entry::User(shown.get(&i).unwrap_or(t).clone())),
             Message::Assistant {
                 content,
                 tool_calls,
@@ -175,6 +178,7 @@ pub struct App {
     flash_at: Instant,
     pub mode: Mode,
     history: Vec<Message>,
+    shown: Shown,
     /// `None` after a failed write, until `/clear` or `/resume` starts over.
     session: Option<Session>,
     /// Requests of the current session, for `/stats`; not persisted.
@@ -212,6 +216,9 @@ pub struct App {
     pub phase: (Phase, Instant),
     /// Messages submitted while a run was active, sent together as one turn when it finishes.
     pub queued: VecDeque<String>,
+    /// Large pastes, the nth shown as `paste_label(n)` and expanded when sent. Kept for the whole
+    /// session so recalled and queued inputs still expand.
+    pastes: Vec<String>,
     /// Reports of exited background jobs not yet sent to the model. They start a turn of their
     /// own when idle, otherwise they ride along with the next message.
     notices: Vec<String>,
@@ -260,6 +267,7 @@ impl App {
             flash_at: Instant::now(),
             mode: Mode::Plan,
             history: Vec::new(),
+            shown: Shown::new(),
             metrics: Vec::new(),
             session: Some(session),
             cut: ContextCut::default(),
@@ -282,6 +290,7 @@ impl App {
             compacting: false,
             phase: (Phase::Waiting, Instant::now()),
             queued: VecDeque::new(),
+            pastes: Vec::new(),
             notices: Vec::new(),
             approval: None,
             always: BTreeSet::new(),
@@ -302,10 +311,11 @@ impl App {
 
     fn resume(&mut self, path: PathBuf) {
         match Session::open(path) {
-            Ok((session, history)) => {
-                self.log = history_log(&history);
+            Ok((session, history, shown)) => {
+                self.log = history_log(&history, &shown);
                 self.log.push(Entry::Info("session resumed".into()));
                 self.history = history;
+                self.shown = shown;
                 self.metrics.clear();
                 self.session = Some(session);
                 self.cut = ContextCut::default();
@@ -324,9 +334,9 @@ impl App {
             return;
         };
         let res = if rewrite {
-            session.rewrite(&self.history)
+            session.rewrite(&self.history, &self.shown)
         } else {
-            session.save(&self.history)
+            session.save(&self.history, &self.shown)
         };
         if let Err(e) = res {
             self.session = None;
@@ -417,7 +427,24 @@ impl App {
             .replace("\r\n", "\n")
             .replace('\r', "\n")
             .replace('\t', "    ");
-        self.insert(&text);
+        if text.lines().count() > PASTE_MAX_LINES || text.chars().count() > PASTE_MAX_CHARS {
+            self.pastes.push(text);
+            let label = self.paste_label(self.pastes.len() - 1);
+            self.insert(&label);
+        } else {
+            self.insert(&text);
+        }
+    }
+
+    fn paste_label(&self, n: usize) -> String {
+        format!("[Pasted #{} +{} lines]", n + 1, self.pastes[n].lines().count())
+    }
+
+    /// Replaces paste placeholders with their text; a placeholder edited by hand stays as typed.
+    fn expand_pastes(&self, text: &str) -> String {
+        (0..self.pastes.len()).fold(text.to_string(), |acc, n| {
+            acc.replace(&self.paste_label(n), &self.pastes[n])
+        })
     }
 
     fn insert(&mut self, text: &str) {
@@ -708,7 +735,7 @@ impl App {
         }
         self.scroll = 0;
         if text.starts_with('/') {
-            self.command(commands::parse(&text));
+            self.command(commands::parse(&self.expand_pastes(&text)));
             return;
         }
         if self.active.is_none() {
@@ -724,17 +751,22 @@ impl App {
         self.send(text);
     }
 
+    /// The log keeps paste placeholders, the model gets them expanded.
     fn send(&mut self, text: String) {
-        self.send_as(text.clone(), text);
+        let full = self.expand_pastes(&text);
+        self.send_as(text, full);
     }
 
     /// `shown` goes to the log, `text` to the model.
     fn send_as(&mut self, shown: String, text: String) {
-        self.push_log(Entry::User(shown));
+        self.push_log(Entry::User(shown.clone()));
         let content = match self.take_notices() {
             Some(notices) => format!("{notices}\n\n{text}"),
             None => text,
         };
+        if shown != content {
+            self.shown.insert(self.history.len(), shown);
+        }
         self.history.push(Message::User(content));
         self.persist(false);
         self.start_run();
@@ -975,6 +1007,7 @@ impl App {
             Command::Clear => {
                 self.interrupt();
                 self.history.clear();
+                self.shown.clear();
                 self.session = Some(Session::new(self.tools.root()));
                 self.metrics.clear();
                 self.cut = ContextCut::default();
@@ -1081,6 +1114,7 @@ impl App {
             }
             AgentEvent::Compacted(messages) => {
                 self.history = messages;
+                self.shown.clear();
                 self.persist(true);
                 self.cut = ContextCut::default();
                 self.usage = None;

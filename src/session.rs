@@ -1,9 +1,24 @@
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+
 use crate::domain::message::Message;
+
+/// History index → how that user message appeared in the log, where it differs from its content
+/// (paste placeholders, `/skill args`).
+pub type Shown = HashMap<usize, String>;
+
+/// A file line: a history message, or the log text of the user message on the next line.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum Line<'a> {
+    Shown { shown: std::borrow::Cow<'a, str> },
+    Message(std::borrow::Cow<'a, Message>),
+}
 
 /// History persisted as JSONL in `.xarness/sessions/`, one file per session. The file is created
 /// on the first save, so empty sessions leave nothing behind.
@@ -49,20 +64,26 @@ impl Session {
         }
     }
 
-    pub fn open(path: PathBuf) -> io::Result<(Self, Vec<Message>)> {
+    pub fn open(path: PathBuf) -> io::Result<(Self, Vec<Message>, Shown)> {
         let mut history = Vec::new();
+        let mut shown = Shown::new();
         for line in BufReader::new(File::open(&path)?).lines() {
-            history.push(serde_json::from_str(&line?)?);
+            match serde_json::from_str(&line?)? {
+                Line::Shown { shown: s } => {
+                    shown.insert(history.len(), s.into_owned());
+                }
+                Line::Message(m) => history.push(m.into_owned()),
+            }
         }
         let session = Self {
             path,
             saved: history.len(),
         };
-        Ok((session, history))
+        Ok((session, history, shown))
     }
 
     /// Appends the messages added to `history` since the last save.
-    pub fn save(&mut self, history: &[Message]) -> io::Result<()> {
+    pub fn save(&mut self, history: &[Message], shown: &Shown) -> io::Result<()> {
         let Some(new) = history.get(self.saved..).filter(|m| !m.is_empty()) else {
             return Ok(());
         };
@@ -71,16 +92,16 @@ impl Session {
             .create(true)
             .append(true)
             .open(&self.path)?
-            .write_all(&lines(new)?)?;
+            .write_all(&lines(new, self.saved, shown)?)?;
         self.saved = history.len();
         Ok(())
     }
 
     /// For when history was replaced rather than extended (`/compact`).
-    pub fn rewrite(&mut self, history: &[Message]) -> io::Result<()> {
+    pub fn rewrite(&mut self, history: &[Message], shown: &Shown) -> io::Result<()> {
         self.ensure_dir()?;
         let tmp = self.path.with_extension("tmp");
-        fs::write(&tmp, lines(history)?)?;
+        fs::write(&tmp, lines(history, 0, shown)?)?;
         fs::rename(&tmp, &self.path)?;
         self.saved = history.len();
         Ok(())
@@ -99,10 +120,15 @@ impl Session {
     }
 }
 
-fn lines(messages: &[Message]) -> io::Result<Vec<u8>> {
+/// `messages` start at history index `first`.
+fn lines(messages: &[Message], first: usize, shown: &Shown) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
-    for m in messages {
-        serde_json::to_writer(&mut buf, m)?;
+    for (i, m) in messages.iter().enumerate() {
+        if let Some(s) = shown.get(&(first + i)) {
+            serde_json::to_writer(&mut buf, &Line::Shown { shown: s.into() })?;
+            buf.push(b'\n');
+        }
+        serde_json::to_writer(&mut buf, &Line::Message(std::borrow::Cow::Borrowed(m)))?;
         buf.push(b'\n');
     }
     Ok(buf)
@@ -132,12 +158,23 @@ pub fn list(root: &Path) -> Vec<Summary> {
 }
 
 fn title(path: &Path) -> Option<String> {
+    let mut shown = None;
     let text = BufReader::new(File::open(path).ok()?)
         .lines()
         .map_while(Result::ok)
         .find_map(|l| match serde_json::from_str(&l) {
-            Ok(Message::User(t)) => Some(t),
-            _ => None,
+            Ok(Line::Shown { shown: s }) => {
+                shown = Some(s.into_owned());
+                None
+            }
+            Ok(Line::Message(m)) => match m.into_owned() {
+                Message::User(t) => Some(shown.take().unwrap_or(t)),
+                _ => {
+                    shown = None;
+                    None
+                }
+            },
+            Err(_) => None,
         })?;
     let line = text.lines().next().unwrap_or_default();
     Some(match line.char_indices().nth(60) {
