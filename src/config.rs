@@ -82,7 +82,7 @@ pub struct ThinkConfig {
 }
 
 /// `think` is a full `{ default, levels }` table, the name of a built-in preset, or a list of
-/// `reasoning_effort` values.
+/// `reasoning_effort` values. In the full table `levels` may also be such a list.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum ThinkSpec {
@@ -90,8 +90,15 @@ enum ThinkSpec {
     Efforts(Vec<String>),
     Full {
         default: Option<String>,
-        levels: IndexMap<String, Value>,
+        levels: Levels,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Levels {
+    Efforts(Vec<String>),
+    Patches(IndexMap<String, Value>),
 }
 
 impl TryFrom<ThinkSpec> for ThinkConfig {
@@ -99,7 +106,13 @@ impl TryFrom<ThinkSpec> for ThinkConfig {
 
     fn try_from(spec: ThinkSpec) -> Result<Self, String> {
         Ok(match spec {
-            ThinkSpec::Full { default, levels } => Self { default, levels },
+            ThinkSpec::Full { default, levels } => Self {
+                default,
+                levels: match levels {
+                    Levels::Efforts(efforts) => effort_levels(efforts),
+                    Levels::Patches(levels) => levels,
+                },
+            },
             ThinkSpec::Preset(name) => Self {
                 default: None,
                 levels: think_preset(&name)
@@ -107,16 +120,20 @@ impl TryFrom<ThinkSpec> for ThinkConfig {
             },
             ThinkSpec::Efforts(efforts) => Self {
                 default: None,
-                levels: efforts
-                    .into_iter()
-                    .map(|e| {
-                        let patch = json!({ "reasoning_effort": e });
-                        (e, patch)
-                    })
-                    .collect(),
+                levels: effort_levels(efforts),
             },
         })
     }
+}
+
+fn effort_levels(efforts: Vec<String>) -> IndexMap<String, Value> {
+    efforts
+        .into_iter()
+        .map(|e| {
+            let patch = json!({ "reasoning_effort": e });
+            (e, patch)
+        })
+        .collect()
 }
 
 fn think_preset(name: &str) -> Option<IndexMap<String, Value>> {
