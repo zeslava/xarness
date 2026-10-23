@@ -293,6 +293,7 @@ fn tags(ctx: &mut TagsContext, config: &TagsConfiguration, src: &str) -> (Vec<De
     let line_of = |byte: usize| newlines.partition_point(|&i| i < byte) + 1;
     let mut tests: Vec<Range<usize>> = Vec::new();
     let mut trait_impls: Vec<Range<usize>> = Vec::new();
+    let mut classes: Vec<Range<usize>> = Vec::new();
     let mut containers: Vec<(Range<usize>, String)> = Vec::new();
     let mut found: Vec<(Range<usize>, Def)> = Vec::new();
     let mut refs: Vec<(Range<usize>, String)> = Vec::new();
@@ -319,10 +320,15 @@ fn tags(ctx: &mut TagsContext, config: &TagsConfiguration, src: &str) -> (Vec<De
         if kind == "implementation" && line.contains(" for ") {
             trait_impls.push(tag.range.clone());
         }
+        if kind == "class" {
+            classes.push(tag.range.clone());
+        }
         let depth = match kind {
             "implementation" => Depth::Member,
             "method" if within(&tag.range, &trait_impls) => Depth::TraitMember,
             "method" => Depth::Member,
+            // Python methods are tagged as plain functions.
+            "function" if within(&tag.range, &classes) => Depth::Member,
             _ => Depth::TopLevel,
         };
         let text = crate::tools::clip(line, MAX_LINE_CHARS).into_owned();
@@ -387,12 +393,17 @@ const RUST_REFS_QUERY: &str = r#"
 (type_identifier) @name @reference.type
 "#;
 
+/// The grammar crate ships no tags query.
+const BASH_QUERY: &str = "(function_definition name: (word) @name) @definition.function";
+
 pub(crate) struct Languages {
     rust: Option<TagsConfiguration>,
     go: Option<TagsConfiguration>,
     js: Option<TagsConfiguration>,
     ts: Option<TagsConfiguration>,
     tsx: Option<TagsConfiguration>,
+    python: Option<TagsConfiguration>,
+    bash: Option<TagsConfiguration>,
 }
 
 impl Languages {
@@ -424,6 +435,11 @@ impl Languages {
                 &ts_query,
             ),
             tsx: config(tree_sitter_typescript::LANGUAGE_TSX.into(), &ts_query),
+            python: config(
+                tree_sitter_python::LANGUAGE.into(),
+                tree_sitter_python::TAGS_QUERY,
+            ),
+            bash: config(tree_sitter_bash::LANGUAGE.into(), BASH_QUERY),
         }
     }
 
@@ -435,6 +451,8 @@ impl Languages {
             "js" | "jsx" | "mjs" | "cjs" => self.js.as_ref(),
             "ts" | "mts" | "cts" => self.ts.as_ref(),
             "tsx" => self.tsx.as_ref(),
+            "py" | "pyi" => self.python.as_ref(),
+            "sh" | "bash" => self.bash.as_ref(),
             _ => None,
         }
     }
@@ -452,6 +470,34 @@ mod tests {
         assert!(langs.js.is_some());
         assert!(langs.ts.is_some());
         assert!(langs.tsx.is_some());
+        assert!(langs.python.is_some());
+        assert!(langs.bash.is_some());
+    }
+
+    #[test]
+    fn python_and_bash_defs() {
+        let langs = Languages::new();
+        let src = "class A:\n    def m(self):\n        pass\n\ndef f():\n    pass\n";
+        let py = defs(&mut TagsContext::new(), langs.python.as_ref().unwrap(), src);
+        let got: Vec<_> = py
+            .iter()
+            .map(|d| (d.line, d.name.as_str(), d.depth))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (1, "A", Depth::TopLevel),
+                (2, "m", Depth::Member),
+                (5, "f", Depth::TopLevel),
+            ]
+        );
+        let src = "build() {\n  make\n}\nfunction run {\n  build\n}\n";
+        let sh = defs(&mut TagsContext::new(), langs.bash.as_ref().unwrap(), src);
+        let got: Vec<_> = sh
+            .iter()
+            .map(|d| (d.start, d.end, d.name.as_str()))
+            .collect();
+        assert_eq!(got, [(1, 3, "build"), (4, 6, "run")]);
     }
 
     #[test]

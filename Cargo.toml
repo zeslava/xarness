@@ -28,3 +28,5 @@ rmcp = { version = "3.5.1", default-features = false, features = ["client", "tra
 http = "1"
 arboard = { version = "3.7.0", default-features = false, features = ["wayland-data-control"] }
 unicode-width = "0.2"
+tree-sitter-python = "0.25.0"
+tree-sitter-bash = "0.25.1"

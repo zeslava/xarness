@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use ignore::WalkBuilder;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tree_sitter_tags::TagsContext;
@@ -52,11 +53,11 @@ impl Tool for ReadSymbol {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "read_symbol".into(),
-            description: "Read code by definition instead of by line range; much cheaper than read_file for Rust, Go, JS and TS. With `name`: returns the full source of those functions/methods/types (with its doc comments and attributes), line-numbered. The repo map in the system prompt already lists definition names, so pass `name` directly instead of asking for an outline first. Without `name`: returns the file's outline (every definition with its line range), or the whole file if it is under 150 lines.".into(),
+            description: "Read code by definition instead of by line range; much cheaper than read_file for Rust, Go, JS, TS, Python and Bash. With `name`: returns the full source of those functions/methods/types (with its doc comments and attributes), line-numbered. The repo map in the system prompt already lists definition names, so pass `name` directly instead of asking for an outline first. Without `name`: returns the file's outline (every definition with its line range), or the whole file if it is under 150 lines. With a directory `path` and `name`: searches every supported file under it.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Path relative to the working directory" },
+                    "path": { "type": "string", "description": "File or directory path relative to the working directory" },
                     "name": {
                         "anyOf": [
                             { "type": "string" },
@@ -83,6 +84,15 @@ impl ReadSymbol {
     fn call(&self, args: Value, root: &Path) -> Result<String> {
         let a: Args = super::parse(args)?;
         let path = super::resolve_read(root, &a.path)?;
+        if path.is_dir() {
+            let Some(names) = a.name else {
+                bail!(
+                    "{} is a directory; pass `name` to search it, or use list_dir",
+                    a.path
+                );
+            };
+            return search_dir(&path, root, &names.queries(), &a.path);
+        }
         let Some(config) = repomap::languages().for_path(&a.path) else {
             bail!("unsupported language for {}; use read_file", a.path);
         };
@@ -92,9 +102,70 @@ impl ReadSymbol {
             // An outline of a small file is about as long as the file and costs another round trip.
             None if src.lines().count() <= SMALL_FILE_LINES => Ok(numbered(&src)),
             None => Ok(outline(&defs)),
-            Some(names) => source(&src, &defs, &names.queries(), &a.path),
+            Some(names) => source(
+                &src,
+                &defs,
+                &names.queries(),
+                &a.path,
+                &mut MAX_LINES.clone(),
+            ),
         }
     }
+}
+
+fn search_dir(dir: &Path, root: &Path, queries: &[&str], dir_arg: &str) -> Result<String> {
+    let langs = repomap::languages();
+    let mut ctx = TagsContext::new();
+    let mut out = String::new();
+    let mut budget = MAX_LINES;
+    let mut seen: Vec<&str> = Vec::new();
+    let files = WalkBuilder::new(dir)
+        .sort_by_file_name(|a, b| a.cmp(b))
+        .build()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_some_and(|t| t.is_file()));
+    for entry in files {
+        let path = super::display(root, entry.path());
+        let Some(config) = langs.for_path(&path) else {
+            continue;
+        };
+        let Ok(src) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let defs = repomap::defs(&mut ctx, config, &src);
+        let hits: Vec<&str> = queries
+            .iter()
+            .copied()
+            .filter(|q| defs.iter().any(|d| matches(d, q)))
+            .collect();
+        if hits.is_empty() {
+            continue;
+        }
+        seen.extend(&hits);
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!("{path}:\n"));
+        out.push_str(&source(&src, &defs, &hits, &path, &mut budget)?);
+        if budget == 0 {
+            return Ok(out);
+        }
+    }
+    let missing: Vec<String> = queries
+        .iter()
+        .filter(|q| !seen.contains(q))
+        .map(|q| format!("`{q}`"))
+        .collect();
+    if out.is_empty() {
+        bail!("no definition {} under {dir_arg}", missing.join(", "));
+    }
+    if !missing.is_empty() {
+        out.push_str(&format!(
+            "\n[no definition {} under {dir_arg}]\n",
+            missing.join(", ")
+        ));
+    }
+    Ok(out)
 }
 
 fn numbered(src: &str) -> String {
@@ -116,7 +187,13 @@ fn outline(defs: &[Def]) -> String {
         .collect()
 }
 
-fn source(src: &str, defs: &[Def], queries: &[&str], path: &str) -> Result<String> {
+fn source(
+    src: &str,
+    defs: &[Def],
+    queries: &[&str],
+    path: &str,
+    budget: &mut usize,
+) -> Result<String> {
     let mut found: Vec<&Def> = Vec::new();
     let mut missing: Vec<&str> = Vec::new();
     for &query in queries {
@@ -150,18 +227,21 @@ fn source(src: &str, defs: &[Def], queries: &[&str], path: &str) -> Result<Strin
     }
 
     let lines: Vec<&str> = src.lines().collect();
+    let hash_comments = matches!(
+        Path::new(path).extension().and_then(|e| e.to_str()),
+        Some("py" | "pyi" | "sh" | "bash")
+    );
     let mut out = String::new();
-    let mut budget = MAX_LINES;
     for d in found {
         let mut start = d.start;
-        while start > 1 && is_preamble(lines[start - 2]) {
+        while start > 1 && is_preamble(lines[start - 2], hash_comments) {
             start -= 1;
         }
         if !out.is_empty() {
             out.push('\n');
         }
         for n in start..=d.end {
-            if budget == 0 {
+            if *budget == 0 {
                 out.push_str(&format!(
                     "[truncated; use read_file on {path} with offset={n} to continue]\n"
                 ));
@@ -169,7 +249,7 @@ fn source(src: &str, defs: &[Def], queries: &[&str], path: &str) -> Result<Strin
             }
             let line = lines.get(n - 1).copied().unwrap_or("");
             out.push_str(&format!("{n:>5}\t{}\n", super::clip(line, MAX_LINE_CHARS)));
-            budget -= 1;
+            *budget -= 1;
         }
     }
     if let Some(note) = not_found {
@@ -190,10 +270,13 @@ fn matches(d: &Def, query: &str) -> bool {
         })
 }
 
-/// Doc comments and attributes directly above a definition belong to it.
-fn is_preamble(line: &str) -> bool {
+/// Doc comments, attributes and decorators directly above a definition belong to it.
+fn is_preamble(line: &str, hash_comments: bool) -> bool {
     let t = line.trim_start();
-    t.starts_with("#[") || t.starts_with("//")
+    t.starts_with("#[")
+        || t.starts_with("//")
+        || t.starts_with('@')
+        || hash_comments && t.starts_with('#')
 }
 
 fn has_token(text: &str, token: &str) -> bool {
@@ -214,7 +297,7 @@ mod tests {
 
     #[test]
     fn qualified_name_picks_impl() {
-        let out = source(SRC, &defs(), &["A::new"], "x.rs").unwrap();
+        let out = source(SRC, &defs(), &["A::new"], "x.rs", &mut MAX_LINES.clone()).unwrap();
         assert_eq!(
             out,
             "    4\t    /// Makes one.\n    5\t    pub fn new() -> Self {\n    6\t        A\n    7\t    }\n"
@@ -223,7 +306,7 @@ mod tests {
 
     #[test]
     fn bare_name_returns_all_matches() {
-        let out = source(SRC, &defs(), &["new"], "x.rs").unwrap();
+        let out = source(SRC, &defs(), &["new"], "x.rs", &mut MAX_LINES.clone()).unwrap();
         assert!(out.contains("   11\t    fn new() {}"));
         assert!(out.contains("    5\t"));
     }
@@ -237,14 +320,21 @@ mod tests {
 
     #[test]
     fn missing_name_lists_defined() {
-        let err = source(SRC, &defs(), &["nope"], "x.rs").unwrap_err();
+        let err = source(SRC, &defs(), &["nope"], "x.rs", &mut MAX_LINES.clone()).unwrap_err();
         assert!(err.to_string().contains("defined there: A, B, new"));
     }
 
     #[test]
     fn several_names_with_partial_miss() {
         let names: Names = serde_json::from_value(json!("A, nope")).unwrap();
-        let out = source(SRC, &defs(), &names.queries(), "x.rs").unwrap();
+        let out = source(
+            SRC,
+            &defs(),
+            &names.queries(),
+            "x.rs",
+            &mut MAX_LINES.clone(),
+        )
+        .unwrap();
         assert!(out.starts_with("    1\tstruct A;\n"));
         assert!(out.contains("[no definition `nope` in x.rs"));
         let names: Names = serde_json::from_value(json!(["A", "B::new"])).unwrap();
