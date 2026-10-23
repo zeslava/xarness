@@ -215,7 +215,7 @@ fn walk(base: &Path, dir: &Path, depth: usize, out: &mut Vec<String>) {
 }
 
 /// (frontmatter between `---` lines, the rest).
-fn split_frontmatter(text: &str) -> (Option<&str>, &str) {
+pub(crate) fn split_frontmatter(text: &str) -> (Option<&str>, &str) {
     let text = text.trim_start_matches('\u{feff}');
     let Some(rest) = text
         .strip_prefix("---\n")
@@ -236,7 +236,7 @@ fn split_frontmatter(text: &str) -> (Option<&str>, &str) {
 /// Top-level `key: value` pairs of a YAML subset: plain, quoted and multi-line scalars, `|`/`>`
 /// blocks (chomping is ignored, values are trimmed). Nested values come out as text, since
 /// only scalar keys are read.
-fn parse_frontmatter(front: &str) -> Vec<(String, String)> {
+pub(crate) fn parse_frontmatter(front: &str) -> Vec<(String, String)> {
     let lines: Vec<&str> = front.lines().collect();
     let mut out = Vec::new();
     let mut i = 0;

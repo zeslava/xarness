@@ -1,28 +1,36 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 
-use futures::StreamExt;
+use anyhow::{anyhow, bail};
+use futures::future::{BoxFuture, join_all};
+use futures::{FutureExt, StreamExt};
+use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 
-use crate::config::ModelConfig;
+use crate::config::{ModelConfig, merge};
 use crate::domain::message::{Message, Mode, ToolCall};
 use crate::domain::ports::{ChatRequest, ContextOverflow, LlmEvent, LlmProvider};
 use crate::metrics;
+use crate::subagents::{self, Subagent, Subagents};
 use crate::tools::{SKILL_TOOL, ToolRegistry};
 
 pub enum AgentEvent {
     TextDelta(String),
     Thinking,
+    /// `agent` is the label of the subagent making the call, `None` for the main agent.
     ToolStart {
         name: String,
         arguments: String,
+        agent: Option<String>,
     },
     ToolResult {
         output: String,
         is_error: bool,
+        agent: Option<String>,
     },
     /// Assistant message plus its tool results, appended to history atomically so an
     /// interrupted run never leaves tool calls without results.
@@ -44,6 +52,7 @@ pub enum AgentEvent {
     Approve {
         name: String,
         arguments: String,
+        agent: Option<String>,
         reply: oneshot::Sender<Answer>,
     },
     Error(String),
@@ -68,12 +77,38 @@ pub struct Run {
     pub skills: Option<Arc<str>>,
     pub repo_map: Option<Arc<str>>,
     pub extra: Option<Value>,
+    pub agents: Arc<Subagents>,
+    /// Set when this run is a subagent's.
+    pub sub: Option<Arc<Subagent>>,
+}
+
+type Sink = Arc<dyn Fn(AgentEvent) + Send + Sync>;
+
+/// Requests with tool calls a subagent may make before it is stopped.
+const MAX_SUBAGENT_STEPS: usize = 40;
+
+struct Outcome {
+    /// Text of the final response.
+    text: String,
+    truncated: bool,
 }
 
 pub async fn run(mut r: Run, tx: UnboundedSender<(u64, AgentEvent)>, run_id: u64) {
-    let send = |ev| {
+    let sink: Sink = Arc::new(move |ev| {
         let _ = tx.send((run_id, ev));
-    };
+    });
+    match drive(&mut r, &sink).await {
+        Ok(o) if o.truncated => sink(AgentEvent::Error(
+            "response cut off at max_tokens (reasoning may have used it up)".into(),
+        )),
+        Ok(_) => {}
+        Err(e) => sink(AgentEvent::Error(format!("{e:#}"))),
+    }
+    sink(AgentEvent::Finished);
+}
+
+/// Requests and runs tool calls until the model answers without any.
+async fn drive(r: &mut Run, sink: &Sink) -> anyhow::Result<Outcome> {
     let mut context_window = match r.model.context_window {
         Some(c) => Some(c),
         None => r.provider.context_window().await,
@@ -81,6 +116,7 @@ pub async fn run(mut r: Run, tx: UnboundedSender<(u64, AgentEvent)>, run_id: u64
     // Server-reported prompt size / our char-based estimate; corrects the estimator per model.
     let mut scale = 1.0_f64;
     let mut retried = false;
+    let mut steps = 0;
     'turn: loop {
         let system = system_prompt(
             r.mode,
@@ -88,8 +124,14 @@ pub async fn run(mut r: Run, tx: UnboundedSender<(u64, AgentEvent)>, run_id: u64
             r.instructions.as_deref(),
             r.skills.as_deref(),
             r.repo_map.as_deref(),
+            r.sub.as_deref(),
         );
-        let tools = r.tools.specs(r.mode);
+        let mut tools = r
+            .tools
+            .specs(r.mode, r.sub.as_ref().and_then(|s| s.tools.as_deref()));
+        if r.sub.is_none() {
+            tools.extend(r.agents.spec());
+        }
         let fixed = estimate_tokens(&system)
             + tools
                 .iter()
@@ -160,11 +202,11 @@ pub async fn run(mut r: Run, tx: UnboundedSender<(u64, AgentEvent)>, run_id: u64
             match ev {
                 Ok(LlmEvent::TextDelta(t)) => {
                     text.push_str(&t);
-                    send(AgentEvent::TextDelta(t));
+                    sink(AgentEvent::TextDelta(t));
                 }
                 Ok(LlmEvent::ReasoningDelta(t)) => {
                     reasoning.push_str(&t);
-                    send(AgentEvent::Thinking);
+                    sink(AgentEvent::Thinking);
                 }
                 Ok(LlmEvent::Done {
                     tool_calls,
@@ -181,7 +223,7 @@ pub async fn run(mut r: Run, tx: UnboundedSender<(u64, AgentEvent)>, run_id: u64
                     stats.cached_tokens = cached_tokens;
                     if let Some(n) = prompt_tokens {
                         scale = n as f64 / estimated as f64;
-                        send(AgentEvent::Usage {
+                        sink(AgentEvent::Usage {
                             used: n + completion_tokens.unwrap_or(0),
                             window: context_window,
                             cached: cached_tokens,
@@ -200,9 +242,7 @@ pub async fn run(mut r: Run, tx: UnboundedSender<(u64, AgentEvent)>, run_id: u64
                         retried = true;
                         continue 'turn;
                     }
-                    send(AgentEvent::Error(format!("{e:#}")));
-                    send(AgentEvent::Finished);
-                    return;
+                    return Err(e);
                 }
             }
         }
@@ -210,56 +250,17 @@ pub async fn run(mut r: Run, tx: UnboundedSender<(u64, AgentEvent)>, run_id: u64
         stats.duration_ms = started.elapsed().as_millis() as u64;
         let tools_started = Instant::now();
         retried = false;
+        let final_text = calls.is_empty().then(|| text.clone());
         let mut batch = vec![Message::Assistant {
             content: text,
             reasoning,
             tool_calls: calls.clone(),
         }];
-        for c in &calls {
-            send(AgentEvent::ToolStart {
-                name: c.name.clone(),
-                arguments: c.arguments.clone(),
-            });
-            let result = if c.arguments.contains(ELIDED_ARG) {
-                // Models imitate the elided calls they see in history; running such a call would
-                // write the mark into a file instead of the content.
-                Err(anyhow::anyhow!(
-                    "`{ELIDED_ARG}` is a placeholder from elided history, not real content; \
-                     pass the actual text"
-                ))
-            } else {
-                let answer = if r.tools.needs_approval(&c.name, &c.arguments) {
-                    let (reply, answer) = oneshot::channel();
-                    send(AgentEvent::Approve {
-                        name: c.name.clone(),
-                        arguments: c.arguments.clone(),
-                        reply,
-                    });
-                    answer.await.unwrap_or(Answer::No(None))
-                } else {
-                    Answer::Yes
-                };
-                match answer {
-                    Answer::Yes => r.tools.run(r.mode, &c.name, &c.arguments).await,
-                    Answer::No(None) => Err(anyhow::anyhow!("the user declined this call")),
-                    Answer::No(Some(reason)) => Err(anyhow::anyhow!(
-                        "the user declined this call and said: {reason}"
-                    )),
-                }
-            };
-            let (output, is_error) = match result {
-                Ok(out) => (out, false),
-                Err(e) => (format!("error: {e:#}"), true),
-            };
-            let output = cap_output(output);
+        for (c, (output, is_error)) in calls.iter().zip(run_calls(r, &calls, sink).await) {
             stats.tools.push(metrics::ToolRun {
                 name: c.name.clone(),
                 error: is_error,
                 bytes: output.len(),
-            });
-            send(AgentEvent::ToolResult {
-                output: output.clone(),
-                is_error,
             });
             batch.push(Message::Tool {
                 call_id: c.id.clone(),
@@ -267,23 +268,251 @@ pub async fn run(mut r: Run, tx: UnboundedSender<(u64, AgentEvent)>, run_id: u64
             });
         }
         stats.tools_ms = tools_started.elapsed().as_millis() as u64;
-        send(AgentEvent::Metrics(stats));
+        sink(AgentEvent::Metrics(stats));
         r.history.extend(batch.iter().cloned());
-        send(AgentEvent::Commit {
+        sink(AgentEvent::Commit {
             messages: batch,
             cut: r.cut.clone(),
         });
 
-        if calls.is_empty() {
-            if truncated {
-                send(AgentEvent::Error(
-                    "response cut off at max_tokens (reasoning may have used it up)".into(),
-                ));
-            }
-            send(AgentEvent::Finished);
-            return;
+        if let Some(text) = final_text {
+            return Ok(Outcome { text, truncated });
+        }
+        steps += 1;
+        if r.sub.is_some() && steps >= MAX_SUBAGENT_STEPS {
+            bail!("stopped after {MAX_SUBAGENT_STEPS} steps without a final report");
         }
     }
+}
+
+/// With `parallel`, consecutive `agent` calls form one group and run in parallel; any other call
+/// is a group of its own, so calls with side effects keep their order.
+fn call_groups(calls: &[ToolCall], parallel: bool) -> Vec<Range<usize>> {
+    let mut groups: Vec<Range<usize>> = Vec::new();
+    for (i, c) in calls.iter().enumerate() {
+        match groups.last_mut() {
+            Some(g)
+                if parallel
+                    && c.name == subagents::TOOL
+                    && calls[g.start].name == subagents::TOOL =>
+            {
+                g.end = i + 1
+            }
+            _ => groups.push(i..i + 1),
+        }
+    }
+    groups
+}
+
+/// Outputs of `calls`, in order.
+async fn run_calls(r: &Run, calls: &[ToolCall], sink: &Sink) -> Vec<(String, bool)> {
+    let start = |c: &ToolCall| {
+        sink(AgentEvent::ToolStart {
+            name: c.name.clone(),
+            arguments: c.arguments.clone(),
+            agent: None,
+        })
+    };
+    let mut out = Vec::with_capacity(calls.len());
+    for group in call_groups(calls, r.agents.parallel) {
+        let group = &calls[group];
+        if group[0].name == subagents::TOOL && r.sub.is_none() {
+            group.iter().for_each(start);
+            let runs = group.iter().enumerate().map(|(k, c)| {
+                let label = (group.len() > 1).then(|| format!("#{}", k + 1));
+                delegate(r, c, label, sink)
+            });
+            for result in join_all(runs).await {
+                out.push(finish(result, sink));
+            }
+        } else {
+            for c in group {
+                start(c);
+                let result = call_tool(r, c, sink).await;
+                out.push(finish(result, sink));
+            }
+        }
+    }
+    out
+}
+
+fn finish(result: anyhow::Result<String>, sink: &Sink) -> (String, bool) {
+    let (output, is_error) = match result {
+        Ok(out) => (out, false),
+        Err(e) => (format!("error: {e:#}"), true),
+    };
+    let output = cap_output(output);
+    sink(AgentEvent::ToolResult {
+        output: output.clone(),
+        is_error,
+        agent: None,
+    });
+    (output, is_error)
+}
+
+fn check_elided(c: &ToolCall) -> anyhow::Result<()> {
+    if c.arguments.contains(ELIDED_ARG) {
+        // Models imitate the elided calls they see in history; running such a call would
+        // write the mark into a file instead of the content.
+        bail!(
+            "`{ELIDED_ARG}` is a placeholder from elided history, not real content; \
+             pass the actual text"
+        );
+    }
+    Ok(())
+}
+
+async fn call_tool(r: &Run, c: &ToolCall, sink: &Sink) -> anyhow::Result<String> {
+    check_elided(c)?;
+    if c.name == subagents::TOOL {
+        bail!("subagents cannot start other agents");
+    }
+    // A job's report arrives after the subagent has finished, as a notice to the main agent,
+    // which never saw the job start.
+    if r.sub.is_some()
+        && c.name == "run"
+        && serde_json::from_str::<serde_json::Value>(&c.arguments)
+            .is_ok_and(|a| a["background"] == true)
+    {
+        bail!("subagents cannot start background jobs; run the command without `background`");
+    }
+    let answer = if r.tools.needs_approval(&c.name, &c.arguments) {
+        let (reply, answer) = oneshot::channel();
+        sink(AgentEvent::Approve {
+            name: c.name.clone(),
+            arguments: c.arguments.clone(),
+            agent: None,
+            reply,
+        });
+        answer.await.unwrap_or(Answer::No(None))
+    } else {
+        Answer::Yes
+    };
+    let allow = r.sub.as_ref().and_then(|s| s.tools.as_deref());
+    match answer {
+        Answer::Yes => r.tools.run(r.mode, allow, &c.name, &c.arguments).await,
+        Answer::No(None) => Err(anyhow!("the user declined this call")),
+        Answer::No(Some(reason)) => Err(anyhow!("the user declined this call and said: {reason}")),
+    }
+}
+
+#[derive(Deserialize)]
+struct DelegateArgs {
+    agent: String,
+    task: String,
+}
+
+/// Runs an `agent` call: a subagent with a history of its own, starting from the task alone.
+/// Only its final response comes back. `suffix` tells parallel runs apart in the TUI.
+fn delegate<'a>(
+    r: &'a Run,
+    c: &'a ToolCall,
+    suffix: Option<String>,
+    sink: &'a Sink,
+) -> BoxFuture<'a, anyhow::Result<String>> {
+    async move {
+        check_elided(c)?;
+        let a: DelegateArgs =
+            serde_json::from_str(&c.arguments).map_err(|e| anyhow!("invalid arguments: {e}"))?;
+        let def = r
+            .agents
+            .get(&a.agent)
+            .ok_or_else(|| anyhow!("unknown agent `{}`", a.agent))?;
+        let (provider, model) = match &def.target {
+            Some(t) => (Arc::clone(&t.provider), t.model.clone()),
+            None => (Arc::clone(&r.provider), r.model.clone()),
+        };
+        // On the caller's model the caller's level applies unless one is set; an own model
+        // starts at its default level.
+        let level = match (&def.think, &def.target) {
+            (Some(l), _) => Some(l.clone()),
+            (None, Some(_)) => model.think.as_ref().and_then(|t| t.default.clone()),
+            (None, None) => None,
+        };
+        let mut extra = match level {
+            Some(l) => Some(
+                model
+                    .think
+                    .as_ref()
+                    .and_then(|t| t.levels.get(&l))
+                    .cloned()
+                    .ok_or_else(|| anyhow!("model `{}` has no think level `{l}`", model.id))?,
+            ),
+            None if def.target.is_some() => None,
+            None => r.extra.clone(),
+        };
+        if let Some(e) = &def.extra {
+            match &mut extra {
+                Some(x) => merge(x, e.clone()),
+                None => extra = Some(e.clone()),
+            }
+        }
+        let mut sub = Run {
+            provider,
+            model,
+            mode: r.mode,
+            history: vec![Message::User(a.task)],
+            cut: ContextCut::default(),
+            tools: Arc::clone(&r.tools),
+            instructions: r.instructions.clone(),
+            skills: r.skills.clone().filter(|_| def.allows(SKILL_TOOL)),
+            repo_map: r.repo_map.clone(),
+            extra,
+            agents: Arc::clone(&r.agents),
+            sub: Some(Arc::clone(def)),
+        };
+        let label = format!("{}{}", def.name, suffix.unwrap_or_default());
+        let out = drive(&mut sub, &sub_sink(sink, def, label)).await?;
+        if out.truncated {
+            bail!("the subagent's response was cut off at max_tokens");
+        }
+        if out.text.trim().is_empty() {
+            bail!("the subagent ended without a report");
+        }
+        Ok(out.text)
+    }
+    .boxed()
+}
+
+/// Passes on what the TUI shows of a subagent's work, tagged with `label`. Its text, history
+/// and context usage stay with it: only the final response reaches the caller.
+fn sub_sink(parent: &Sink, def: &Subagent, label: String) -> Sink {
+    let parent = Arc::clone(parent);
+    let name = def.name.clone();
+    let model = def.target.as_ref().map(|t| t.label.clone());
+    Arc::new(move |ev| match ev {
+        AgentEvent::ToolStart {
+            name, arguments, ..
+        } => parent(AgentEvent::ToolStart {
+            name,
+            arguments,
+            agent: Some(label.clone()),
+        }),
+        AgentEvent::ToolResult {
+            output, is_error, ..
+        } => parent(AgentEvent::ToolResult {
+            output,
+            is_error,
+            agent: Some(label.clone()),
+        }),
+        AgentEvent::Approve {
+            name,
+            arguments,
+            reply,
+            ..
+        } => parent(AgentEvent::Approve {
+            name,
+            arguments,
+            agent: Some(label.clone()),
+            reply,
+        }),
+        AgentEvent::Metrics(mut m) => {
+            m.model = model.clone().unwrap_or_default();
+            m.agent = Some(name.clone());
+            parent(AgentEvent::Metrics(m))
+        }
+        _ => {}
+    })
 }
 
 const COMPACT_PROMPT: &str = "You summarize a conversation between a user and a coding agent \
@@ -734,25 +963,41 @@ fn cap_output(mut s: String) -> String {
     s
 }
 
+const SUBAGENT_NOTE: &str = "You are a subagent: the task comes from another agent, not from the \
+user, and you cannot ask it anything. Work on your own, then end with a final message reporting the \
+result. It is passed to that agent verbatim and is all it sees of your work, so make it complete \
+and concise.";
+
+const SUBAGENT_PLAN_NOTE: &str = "The caller is in PLAN mode, so tools that change files or run \
+commands are unavailable. If the task needs such changes, do the read-only part and report exactly \
+what would have to be changed or run.";
+
 fn system_prompt(
     mode: Mode,
     tools: &ToolRegistry,
     instructions: Option<&str>,
     skills: Option<&str>,
     repo_map: Option<&str>,
+    sub: Option<&Subagent>,
 ) -> String {
     let cwd = tools.root().display();
-    let task = match mode {
-        Mode::Plan => {
+    let task = match (sub, mode) {
+        (Some(s), Mode::Build) => format!("{}\n\n{SUBAGENT_NOTE}", s.prompt).trim().to_string(),
+        (Some(s), Mode::Plan) => format!("{}\n\n{SUBAGENT_NOTE}\n{SUBAGENT_PLAN_NOTE}", s.prompt)
+            .trim()
+            .to_string(),
+        (None, Mode::Plan) => {
             "You are in PLAN mode. Explore the code with the read-only tools and produce a concise, \
              concrete implementation plan. Do not attempt to modify files."
+                .into()
         }
-        Mode::Build => {
+        (None, Mode::Build) => {
             "You are in BUILD mode. Implement the requested changes using the tools. \
              Read files before editing them; prefer edit_file for targeted changes. \
              Change only what the task requires: no unrelated refactoring, renaming, reformatting, \
              extra features, comments, tests or new files unless asked. If the request is ambiguous \
              or a broader change seems necessary, stop and ask instead of guessing."
+                .into()
         }
     };
     let mut prompt = format!(
@@ -897,6 +1142,27 @@ mod tests {
         history.push(Message::User("next".into()));
         let elided = elide_old_outputs(&history);
         assert_eq!(reasoning(&elided[3]), "");
+    }
+
+    #[test]
+    fn consecutive_agent_calls_are_grouped() {
+        let calls: Vec<ToolCall> = [
+            "agent",
+            "agent",
+            "read_file",
+            "agent",
+            "edit_file",
+            "edit_file",
+        ]
+        .iter()
+        .map(|n| ToolCall {
+            id: String::new(),
+            name: n.to_string(),
+            arguments: "{}".into(),
+        })
+        .collect();
+        assert_eq!(call_groups(&calls, true), [0..2, 2..3, 3..4, 4..5, 5..6]);
+        assert_eq!(call_groups(&calls, false).len(), calls.len());
     }
 
     #[test]

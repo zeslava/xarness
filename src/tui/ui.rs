@@ -229,7 +229,10 @@ fn panel_lines(app: &App, width: usize, cap: usize, accent: Color) -> (Vec<Line<
 /// The preview is cut to fit `cap` so the options always stay visible.
 fn approval_lines(a: &Approval, width: usize, cap: usize, accent: Color) -> Vec<Line<'static>> {
     let mut title = vec![Span::styled(
-        format!("Allow {}?", display_name(&a.name)),
+        match &a.agent {
+            Some(agent) => format!("Allow {agent}: {}?", display_name(&a.name)),
+            None => format!("Allow {}?", display_name(&a.name)),
+        },
         Style::new().fg(Color::Magenta).bold(),
     )];
     // For `run` the summary is the command itself, already shown in full below.
@@ -439,17 +442,32 @@ fn log_text(app: &App) -> Text<'static> {
                 }
             }
             Entry::Assistant(t) => lines.extend(markdown::render(t).lines),
-            Entry::Tool { name, arguments } => lines.push(Line::from(vec![
-                Span::styled(
-                    format!("⚙ {} ", display_name(name)),
-                    Style::new().fg(Color::Magenta).bold(),
-                ),
+            Entry::Tool {
+                name,
+                arguments,
+                agent,
+            } => lines.push(Line::from(vec![
+                match agent {
+                    Some(a) => Span::styled(
+                        format!("  ↳ {a} {} ", display_name(name)),
+                        Style::new().fg(Color::Magenta),
+                    ),
+                    None => Span::styled(
+                        format!("⚙ {} ", display_name(name)),
+                        Style::new().fg(Color::Magenta).bold(),
+                    ),
+                },
                 Span::styled(
                     truncate(&tool_summary(name, arguments), 200),
                     Style::new().dim(),
                 ),
             ])),
-            Entry::ToolOutput { text, is_error } => {
+            Entry::ToolOutput {
+                text,
+                is_error,
+                agent,
+            } => {
+                let indent = if agent.is_some() { "    " } else { "  " };
                 let style = if *is_error {
                     Style::new().fg(Color::Red)
                 } else {
@@ -457,11 +475,11 @@ fn log_text(app: &App) -> Text<'static> {
                 };
                 let total = text.lines().count();
                 for l in text.lines().take(TOOL_OUTPUT_PREVIEW) {
-                    lines.push(Line::styled(format!("  │ {l}"), style));
+                    lines.push(Line::styled(format!("{indent}│ {l}"), style));
                 }
                 if total > TOOL_OUTPUT_PREVIEW {
                     lines.push(Line::styled(
-                        format!("  │ … {} more lines", total - TOOL_OUTPUT_PREVIEW),
+                        format!("{indent}│ … {} more lines", total - TOOL_OUTPUT_PREVIEW),
                         style,
                     ));
                 }
@@ -531,6 +549,10 @@ fn tool_summary(name: &str, arguments: &str) -> String {
             }
             Some(c) => c.trim().replace('\n', " ↵ "),
             None => arguments.to_string(),
+        },
+        ("agent", _) => match (str_arg("agent"), str_arg("task")) {
+            (Some(a), Some(t)) => format!("{a}: {}", t.trim().replace('\n', " ↵ ")),
+            _ => arguments.to_string(),
         },
         (n, _) if n.contains("__") => mcp_summary(&v).unwrap_or_else(|| arguments.to_string()),
         _ => arguments.to_string(),

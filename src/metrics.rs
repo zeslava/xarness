@@ -3,8 +3,10 @@ use std::collections::BTreeMap;
 /// One model request of the current session, for `/stats`.
 #[derive(Debug, Default)]
 pub struct Request {
-    /// `provider/model`, filled in by the TUI.
+    /// `provider/model`, filled in by the TUI when empty.
     pub model: String,
+    /// Subagent that made the request.
+    pub agent: Option<String>,
     pub compact: bool,
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,

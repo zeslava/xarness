@@ -6,6 +6,7 @@ mod metrics;
 mod repomap;
 mod session;
 mod skills;
+mod subagents;
 mod tools;
 mod tui;
 

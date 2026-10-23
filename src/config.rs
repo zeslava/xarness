@@ -15,6 +15,13 @@ pub struct Config {
     pub mcp: BTreeMap<String, McpServerConfig>,
     #[serde(default)]
     pub skills: SkillsConfig,
+    /// Runtime settings of subagents by name; their definitions are `agents/<name>.md` files.
+    #[serde(default)]
+    pub agents: BTreeMap<String, AgentConfig>,
+    /// Whether consecutive `agent` calls run in parallel. A server with one slot (llama.cpp
+    /// `-np 1`) serializes them anyway, and each one evicts the others' KV cache.
+    #[serde(default = "enabled")]
+    pub agents_parallel: bool,
     /// Fraction of the context window (e.g. `0.8`) at which history is compacted after a turn;
     /// absent = off.
     pub auto_compact: Option<f32>,
@@ -174,6 +181,18 @@ pub struct McpServerConfig {
     pub tools: Option<Vec<String>>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentConfig {
+    #[serde(default = "enabled")]
+    pub enabled: bool,
+    /// `provider/model`; absent = the calling agent's model.
+    pub model: Option<String>,
+    /// Key of the model's `think.levels`.
+    pub think: Option<String>,
+    /// Merged into the request body after the `think` level.
+    pub extra: Option<Value>,
+}
+
 fn enabled() -> bool {
     true
 }
@@ -298,7 +317,7 @@ fn read_layer(path: &Path) -> Result<Value> {
     parsed.with_context(|| format!("parsing {}", path.display()))
 }
 
-fn merge(base: &mut Value, over: Value) {
+pub(crate) fn merge(base: &mut Value, over: Value) {
     match (base, over) {
         (Value::Object(b), Value::Object(o)) => {
             for (k, v) in o {

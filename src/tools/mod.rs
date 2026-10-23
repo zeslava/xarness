@@ -77,30 +77,35 @@ impl ToolRegistry {
             .extend(tools);
     }
 
-    fn available(&self, mode: Mode) -> Vec<Arc<dyn Tool>> {
+    /// `allow` restricts the tools by name, for subagents.
+    fn available(&self, mode: Mode, allow: Option<&[String]>) -> Vec<Arc<dyn Tool>> {
         let mcp = self.mcp.read().unwrap_or_else(PoisonError::into_inner);
         self.tools
             .iter()
             .chain(mcp.iter())
             .filter(|t| mode == Mode::Build || !t.mutating())
+            .filter(|t| allow.is_none_or(|a| a.contains(&t.spec().name)))
             .cloned()
             .collect()
     }
 
-    fn find(&self, mode: Mode, name: &str) -> Option<Arc<dyn Tool>> {
-        self.available(mode)
+    fn find(&self, mode: Mode, allow: Option<&[String]>, name: &str) -> Option<Arc<dyn Tool>> {
+        self.available(mode, allow)
             .into_iter()
             .find(|t| t.spec().name == name)
     }
 
-    pub fn specs(&self, mode: Mode) -> Vec<ToolSpec> {
-        self.available(mode).iter().map(|t| t.spec()).collect()
+    pub fn specs(&self, mode: Mode, allow: Option<&[String]>) -> Vec<ToolSpec> {
+        self.available(mode, allow)
+            .iter()
+            .map(|t| t.spec())
+            .collect()
     }
 
     /// Besides tools that always ask, a read-only tool asks when its `path` leaves the working
     /// directory (`resolve_read` lets it into the home directory).
     pub fn needs_approval(&self, name: &str, arguments: &str) -> bool {
-        let Some(tool) = self.find(Mode::Build, name) else {
+        let Some(tool) = self.find(Mode::Build, None, name) else {
             return false;
         };
         tool.needs_approval()
@@ -112,10 +117,19 @@ impl ToolRegistry {
                     .is_some_and(|p| !lexical(&self.root, p).starts_with(&self.root)))
     }
 
-    pub async fn run(&self, mode: Mode, name: &str, arguments: &str) -> Result<String> {
-        let tool = self
-            .find(mode, name)
-            .ok_or_else(|| anyhow!("tool `{name}` is not available in {} mode", mode.label()))?;
+    pub async fn run(
+        &self,
+        mode: Mode,
+        allow: Option<&[String]>,
+        name: &str,
+        arguments: &str,
+    ) -> Result<String> {
+        let tool = self.find(mode, allow, name).ok_or_else(|| match allow {
+            Some(_) if self.find(mode, None, name).is_some() => {
+                anyhow!("tool `{name}` is not available to this agent")
+            }
+            _ => anyhow!("tool `{name}` is not available in {} mode", mode.label()),
+        })?;
         let args: Value = if arguments.trim().is_empty() {
             Value::Object(Default::default())
         } else {

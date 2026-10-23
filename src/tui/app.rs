@@ -24,7 +24,8 @@ use crate::metrics;
 use crate::repomap;
 use crate::session::{self, Session, Shown};
 use crate::skills::{Skill, Skills};
-use crate::tools::ToolRegistry;
+use crate::subagents::{Subagents, Target};
+use crate::tools::{ToolRegistry, clip};
 
 const WHEEL_LINES: u16 = 3;
 const FLASH_TTL: Duration = Duration::from_millis(1500);
@@ -68,10 +69,29 @@ impl Selection {
 pub enum Entry {
     User(String),
     Assistant(String),
-    Tool { name: String, arguments: String },
-    ToolOutput { text: String, is_error: bool },
+    /// `agent` is the label of the subagent making the call.
+    Tool {
+        name: String,
+        arguments: String,
+        agent: Option<String>,
+    },
+    ToolOutput {
+        text: String,
+        is_error: bool,
+        agent: Option<String>,
+    },
     Info(String),
     Error(String),
+}
+
+impl Entry {
+    /// Label of the subagent the entry comes from.
+    fn agent(&self) -> Option<&String> {
+        match self {
+            Entry::Tool { agent, .. } | Entry::ToolOutput { agent, .. } => agent.as_ref(),
+            _ => None,
+        }
+    }
 }
 
 /// What an active run is doing, for the live indicator at the bottom of the log.
@@ -116,6 +136,7 @@ fn history_log(history: &[Message], shown: &Shown) -> Vec<Entry> {
                 log.extend(tool_calls.iter().map(|c| Entry::Tool {
                     name: c.name.clone(),
                     arguments: c.arguments.clone(),
+                    agent: None,
                 }));
             }
             Message::System(_) | Message::Tool { .. } => {}
@@ -147,6 +168,8 @@ pub struct Approval {
     reply: oneshot::Sender<Answer>,
     pub name: String,
     pub arguments: String,
+    /// Label of the subagent asking.
+    pub agent: Option<String>,
     /// Highlighted index into `APPROVAL_OPTIONS`.
     pub choice: usize,
 }
@@ -164,6 +187,7 @@ pub struct App {
     /// Contents of AGENTS.md in the working directory, read once at startup.
     instructions: Option<Arc<str>>,
     skills: Arc<Skills>,
+    agents: Arc<Subagents>,
     /// Built at startup only, so the system prompt prefix stays cacheable.
     skill_catalog: Option<Arc<str>>,
     /// Per server: tool count or connection error; `None` while connecting.
@@ -222,7 +246,8 @@ pub struct App {
     /// Reports of exited background jobs not yet sent to the model. They start a turn of their
     /// own when idle, otherwise they ride along with the next message.
     notices: Vec<String>,
-    approval: Option<Approval>,
+    /// Calls waiting for approval; the front one is shown. Parallel subagents can ask at once.
+    approval: VecDeque<Approval>,
     /// Tools answered with "always": approved without asking until the app exits.
     pub always: BTreeSet<String>,
     run_id: u64,
@@ -252,6 +277,15 @@ impl App {
             .ok()
             .map(Arc::from);
         let session = Session::new(tools.root());
+        let mut agents = Subagents::discover(tools.root(), &config.agents, |spec| {
+            let (provider, model) = config.resolve_model(spec)?;
+            Ok(Target {
+                label: spec.to_string(),
+                provider: build_provider(&config.providers[&provider]),
+                model,
+            })
+        });
+        agents.parallel = config.agents_parallel;
         let mut app = Self {
             think: active.as_ref().and_then(|a| default_think(&a.model)),
             active,
@@ -261,6 +295,7 @@ impl App {
             instructions,
             skill_catalog: skills.catalog().map(Arc::from),
             skills,
+            agents: Arc::new(agents),
             repo_map: None,
             map_tx,
             flashes: VecDeque::new(),
@@ -292,7 +327,7 @@ impl App {
             queued: VecDeque::new(),
             pastes: Vec::new(),
             notices: Vec::new(),
-            approval: None,
+            approval: VecDeque::new(),
             always: BTreeSet::new(),
             run_id: 0,
             tx,
@@ -345,7 +380,7 @@ impl App {
     }
 
     pub fn approval(&self) -> Option<&Approval> {
-        self.approval.as_ref()
+        self.approval.front()
     }
 
     pub fn is_running(&self) -> bool {
@@ -437,7 +472,11 @@ impl App {
     }
 
     fn paste_label(&self, n: usize) -> String {
-        format!("[Pasted #{} +{} lines]", n + 1, self.pastes[n].lines().count())
+        format!(
+            "[Pasted #{} +{} lines]",
+            n + 1,
+            self.pastes[n].lines().count()
+        )
     }
 
     /// Replaces paste placeholders with their text; a placeholder edited by hand stays as typed.
@@ -526,7 +565,7 @@ impl App {
         if newline {
             return self.insert("\n");
         }
-        if let Some(mut a) = self.approval.take() {
+        if let Some(mut a) = self.approval.pop_front() {
             let n = APPROVAL_OPTIONS.len();
             // No letter hotkeys: any letter could start a decline reason.
             match key.code {
@@ -546,7 +585,7 @@ impl App {
             if let Some(step) = step {
                 a.choice = (a.choice + step) % n;
             }
-            self.approval = Some(a);
+            self.approval.push_front(a);
             if step.is_some() {
                 return;
             }
@@ -563,7 +602,7 @@ impl App {
             self.completion = 0;
         }
         let completions = self.completions();
-        if !completions.is_empty() && self.approval.is_none() {
+        if !completions.is_empty() && self.approval.is_empty() {
             let n = completions.len();
             let selected = &completions[self.completion.min(n - 1)].insert;
             // A recalled slash command shows completions too; Up/Down keep browsing history.
@@ -859,6 +898,8 @@ impl App {
             skills: self.skill_catalog.clone(),
             repo_map: self.repo_map.clone(),
             extra: self.think_patch(),
+            agents: Arc::clone(&self.agents),
+            sub: None,
         };
         self.run_id += 1;
         Some(run)
@@ -883,7 +924,8 @@ impl App {
     }
 
     fn interrupt(&mut self) {
-        self.approval = None;
+        self.approval.clear();
+        self.log.retain(|e| e.agent().is_none());
         if let Some(h) = self.running.take() {
             h.abort();
             // Invalidate events already queued by the aborted run.
@@ -906,6 +948,14 @@ impl App {
         let answer = match a.choice {
             0 => Answer::Yes,
             1 => {
+                // Parallel subagents may be waiting on the same tool.
+                let (same, rest) = std::mem::take(&mut self.approval)
+                    .into_iter()
+                    .partition(|q| q.name == a.name);
+                self.approval = rest;
+                for q in same {
+                    let _ = q.reply.send(Answer::Yes);
+                }
                 self.always.insert(a.name);
                 Answer::Yes
             }
@@ -1004,6 +1054,10 @@ impl App {
                 let msg = self.skills_status();
                 self.log.push(Entry::Info(msg));
             }
+            Command::Agents => {
+                let msg = self.agents_status();
+                self.log.push(Entry::Info(msg));
+            }
             Command::Clear => {
                 self.interrupt();
                 self.history.clear();
@@ -1093,17 +1147,44 @@ impl App {
                 }
             }
             AgentEvent::Thinking => self.set_phase(Phase::Thinking),
-            AgentEvent::ToolStart { name, arguments } => {
-                self.set_phase(Phase::Running(name.clone()));
-                self.push_log(Entry::Tool { name, arguments })
+            AgentEvent::ToolStart {
+                name,
+                arguments,
+                agent,
+            } => {
+                self.set_phase(Phase::Running(match &agent {
+                    Some(a) => format!("{a}: {name}"),
+                    None => name.clone(),
+                }));
+                // Only a subagent's latest call is shown, with its error if it fails.
+                if let Some(a) = &agent {
+                    self.log.retain(|e| e.agent() != Some(a));
+                }
+                self.push_log(Entry::Tool {
+                    name,
+                    arguments,
+                    agent,
+                })
             }
             // Successful tool output is noise in the log; only errors are shown.
-            AgentEvent::ToolResult { output, is_error } => {
-                self.set_phase(Phase::Waiting);
+            AgentEvent::ToolResult {
+                output,
+                is_error,
+                agent,
+            } => {
+                self.set_phase(match &agent {
+                    Some(a) => Phase::Running(a.clone()),
+                    None => Phase::Waiting,
+                });
+                // A result of the main agent's call: any subagents it ran are done.
+                if agent.is_none() {
+                    self.log.retain(|e| e.agent().is_none());
+                }
                 if is_error {
                     self.push_log(Entry::ToolOutput {
                         text: output,
                         is_error,
+                        agent,
                     })
                 }
             }
@@ -1132,7 +1213,12 @@ impl App {
                 })
             }
             AgentEvent::Metrics(mut stats) => {
-                stats.model = self.model_label();
+                if stats.model.is_empty() {
+                    stats.model = self.model_label();
+                }
+                if let Some(a) = &stats.agent {
+                    stats.model = format!("{} (agent {a})", stats.model);
+                }
                 self.metrics.push(stats);
             }
             AgentEvent::Approve { name, reply, .. } if self.always.contains(&name) => {
@@ -1141,13 +1227,15 @@ impl App {
             AgentEvent::Approve {
                 name,
                 arguments,
+                agent,
                 reply,
             } => {
                 self.scroll = 0;
-                self.approval = Some(Approval {
+                self.approval.push_back(Approval {
                     reply,
                     name,
                     arguments,
+                    agent,
                     choice: 0,
                 });
             }
@@ -1300,6 +1388,52 @@ impl App {
         }
         lines.extend(self.skills.warnings.iter().map(|w| format!("! {w}")));
         lines.join("\n")
+    }
+
+    fn agents_status(&self) -> String {
+        let root = self.tools.root();
+        let home = dirs::home_dir();
+        let mut blocks: Vec<String> = self
+            .agents
+            .list
+            .iter()
+            .map(|a| {
+                let place = match &a.path {
+                    None => "built-in".into(),
+                    Some(p) => match (
+                        p.strip_prefix(root),
+                        home.as_ref().map(|h| p.strip_prefix(h)),
+                    ) {
+                        (Ok(rel), _) => rel.display().to_string(),
+                        (_, Some(Ok(rel))) => format!("~/{}", rel.display()),
+                        _ => p.display().to_string(),
+                    },
+                };
+                let model = a.target.as_ref().map_or("caller's model", |t| &t.label);
+                let mut settings = vec![format!("model: {model}")];
+                if let Some(t) = &a.think {
+                    settings.push(format!("think: {t}"));
+                }
+                settings.push(match &a.tools {
+                    Some(t) => format!("tools: {}", t.join(", ")),
+                    None => "tools: all".into(),
+                });
+                format!(
+                    "{} · {place}\n  {}\n  {}",
+                    a.name,
+                    clip(&a.short_description(), 100),
+                    settings.join(" · ")
+                )
+            })
+            .collect();
+        if blocks.is_empty() {
+            blocks.push("agents: none".into());
+        }
+        let mut out = blocks.join("\n\n");
+        for w in &self.agents.warnings {
+            out.push_str(&format!("\n! {w}"));
+        }
+        out
     }
 
     fn mcp_status(&self) -> String {
