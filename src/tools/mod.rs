@@ -102,6 +102,12 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// Unknown tools count as mutating.
+    pub fn is_mutating(&self, name: &str) -> bool {
+        self.find(Mode::Build, None, name)
+            .is_none_or(|t| t.mutating())
+    }
+
     /// Besides tools that always ask, a read-only tool asks when its `path` leaves the working
     /// directory (`resolve_read` lets it into the home directory).
     pub fn needs_approval(&self, name: &str, arguments: &str) -> bool {

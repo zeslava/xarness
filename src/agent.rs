@@ -84,8 +84,11 @@ pub struct Run {
 
 type Sink = Arc<dyn Fn(AgentEvent) + Send + Sync>;
 
-/// Requests with tool calls a subagent may make before it is stopped.
+/// Requests with tool calls a subagent may make; the next one gets no tools and must report.
 const MAX_SUBAGENT_STEPS: usize = 40;
+
+const WRAP_UP: &str = "You have used up your tool calls. Do not call any more tools: report now \
+                       what you have found so far, and say what is still unverified.";
 
 struct Outcome {
     /// Text of the final response.
@@ -126,9 +129,14 @@ async fn drive(r: &mut Run, sink: &Sink) -> anyhow::Result<Outcome> {
             r.repo_map.as_deref(),
             r.sub.as_deref(),
         );
-        let mut tools = r
-            .tools
-            .specs(r.mode, r.sub.as_ref().and_then(|s| s.tools.as_deref()));
+        // Rather than lose all a subagent found, its last request asks for a report.
+        let wrap_up = r.sub.is_some() && steps >= MAX_SUBAGENT_STEPS;
+        let mut tools = if wrap_up {
+            Vec::new()
+        } else {
+            r.tools
+                .specs(r.mode, r.sub.as_ref().and_then(|s| s.tools.as_deref()))
+        };
         if r.sub.is_none() {
             tools.extend(r.agents.spec());
         }
@@ -178,6 +186,9 @@ async fn drive(r: &mut Run, sink: &Sink) -> anyhow::Result<Outcome> {
         };
         let mut messages = vec![Message::System(system)];
         messages.extend(history);
+        if wrap_up {
+            messages.push(Message::User(WRAP_UP.into()));
+        }
         let req = ChatRequest {
             model: r.model.id.clone(),
             max_tokens: r.model.max_tokens,
@@ -216,7 +227,7 @@ async fn drive(r: &mut Run, sink: &Sink) -> anyhow::Result<Outcome> {
                     truncated: t,
                 }) => {
                     // A cut-off tool call likely has incomplete arguments; don't run it.
-                    calls = if t { Vec::new() } else { tool_calls };
+                    calls = if t || wrap_up { Vec::new() } else { tool_calls };
                     truncated = t;
                     stats.prompt_tokens = prompt_tokens;
                     stats.completion_tokens = completion_tokens;
@@ -279,9 +290,6 @@ async fn drive(r: &mut Run, sink: &Sink) -> anyhow::Result<Outcome> {
             return Ok(Outcome { text, truncated });
         }
         steps += 1;
-        if r.sub.is_some() && steps >= MAX_SUBAGENT_STEPS {
-            bail!("stopped after {MAX_SUBAGENT_STEPS} steps without a final report");
-        }
     }
 }
 
@@ -313,9 +321,12 @@ async fn run_calls(r: &Run, calls: &[ToolCall], sink: &Sink) -> Vec<(String, boo
             agent: None,
         })
     };
+    let repeats: Vec<bool> = (0..calls.len())
+        .map(|i| repeated(r, &calls[..i], &calls[i]))
+        .collect();
     let mut out = Vec::with_capacity(calls.len());
-    for group in call_groups(calls, r.agents.parallel) {
-        let group = &calls[group];
+    for range in call_groups(calls, r.agents.parallel) {
+        let group = &calls[range.clone()];
         if group[0].name == subagents::TOOL && r.sub.is_none() {
             group.iter().for_each(start);
             let runs = group.iter().enumerate().map(|(k, c)| {
@@ -326,14 +337,57 @@ async fn run_calls(r: &Run, calls: &[ToolCall], sink: &Sink) -> Vec<(String, boo
                 out.push(finish(result, sink));
             }
         } else {
-            for c in group {
+            for (c, &repeat) in group.iter().zip(&repeats[range]) {
                 start(c);
-                let result = call_tool(r, c, sink).await;
+                let result = if repeat {
+                    Err(anyhow!(
+                        "this exact call was already made in this turn and nothing has changed \
+                         since; use its result above instead of repeating it"
+                    ))
+                } else {
+                    call_tool(r, c, sink).await
+                };
                 out.push(finish(result, sink));
             }
         }
     }
     out
+}
+
+/// Whether `c` repeats a read-only call made earlier in this turn, with no mutating call since.
+/// Small models loop on such calls although the earlier result is still in context.
+fn repeated(r: &Run, earlier: &[ToolCall], c: &ToolCall) -> bool {
+    let changes = |p: &ToolCall| p.name == subagents::TOOL || r.tools.is_mutating(&p.name);
+    if changes(c) {
+        return false;
+    }
+    let turn = r
+        .history
+        .iter()
+        .rev()
+        .take_while(|m| !matches!(m, Message::User(_)))
+        .filter_map(|m| match m {
+            Message::Assistant { tool_calls, .. } => Some(tool_calls.iter().rev()),
+            _ => None,
+        })
+        .flatten();
+    for p in earlier.iter().rev().chain(turn) {
+        if p.name == c.name && same_args(&p.arguments, &c.arguments) {
+            return true;
+        }
+        if changes(p) {
+            return false;
+        }
+    }
+    false
+}
+
+fn same_args(a: &str, b: &str) -> bool {
+    a == b
+        || matches!(
+            (serde_json::from_str::<Value>(a), serde_json::from_str::<Value>(b)),
+            (Ok(x), Ok(y)) if x == y
+        )
 }
 
 fn finish(result: anyhow::Result<String>, sink: &Sink) -> (String, bool) {
