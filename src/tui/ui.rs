@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -181,7 +183,7 @@ fn selected_text(log: &Paragraph, width: u16, sel: Selection) -> String {
 }
 
 /// The panel between the log and the input shows one thing at a time, by priority:
-/// a pending approval, slash-command completions, queued messages. Returns its lines,
+/// a pending approval, slash-command completions, background subagents and queued messages. Returns its lines,
 /// sized to the content, and the row to keep visible if they exceed `cap`.
 fn panel_lines(app: &App, width: usize, cap: usize, accent: Color) -> (Vec<Line<'static>>, usize) {
     if let Some(a) = app.approval() {
@@ -207,10 +209,22 @@ fn panel_lines(app: &App, width: usize, cap: usize, accent: Color) -> (Vec<Line<
         return (lines, selected);
     }
     // Newest last, nearest the input; overflow hides the oldest.
-    let lines: Vec<Line> = app
-        .queued
-        .iter()
-        .map(|m| {
+    let background = app.background_runs.iter().map(|b| {
+        let tool = b
+            .tool
+            .as_deref()
+            .map(|t| format!(" · {}", display_name(t)))
+            .unwrap_or_default();
+        Line::from(vec![
+            Span::styled(
+                format!("◇ {}{tool} ", b.label),
+                Style::new().fg(Color::Magenta),
+            ),
+            Span::styled(elapsed(b.started), Style::new().dim()),
+        ])
+    });
+    let lines: Vec<Line> = background
+        .chain(app.queued.iter().map(|m| {
             let first = m.lines().next().unwrap_or_default();
             let shown = truncate(first, width.saturating_sub(4));
             let shown = if m.contains('\n') && !shown.ends_with('…') {
@@ -219,7 +233,7 @@ fn panel_lines(app: &App, width: usize, cap: usize, accent: Color) -> (Vec<Line<
                 shown
             };
             Line::styled(format!("⏳ {shown}"), Style::new().dim())
-        })
+        }))
         .collect();
     let last = lines.len().saturating_sub(1);
     (lines, last)
@@ -407,20 +421,23 @@ fn live_line(app: &App) -> Line<'static> {
         Phase::Writing => "writing".to_string(),
         Phase::Running(name) => format!("running {name}"),
     };
-    let secs = started.elapsed().as_secs();
-    let elapsed = if secs < 60 {
-        format!("{secs}s")
-    } else {
-        format!("{}m{:02}s", secs / 60, secs % 60)
-    };
     let icon = SPINNER[app.tick % SPINNER.len()];
     Line::from(vec![
         Span::styled(
             format!("{icon} {label} "),
             Style::new().fg(Color::Magenta).bold(),
         ),
-        Span::styled(elapsed, Style::new().dim()),
+        Span::styled(elapsed(*started), Style::new().dim()),
     ])
+}
+
+fn elapsed(since: Instant) -> String {
+    let secs = since.elapsed().as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    }
 }
 
 fn kilo(n: u32) -> String {

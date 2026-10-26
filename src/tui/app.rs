@@ -16,7 +16,7 @@ use super::clipboard::Clipboard;
 use super::commands::{self, Command, Completion};
 use crate::adapters::build_provider;
 use crate::adapters::mcp;
-use crate::agent::{self, AgentEvent, Answer, ContextCut, Run};
+use crate::agent::{self, AgentEvent, Answer, Background, BackgroundEvent, ContextCut, Run};
 use crate::config::{Config, ModelConfig};
 use crate::domain::message::{Message, Mode};
 use crate::domain::ports::LlmProvider;
@@ -164,12 +164,21 @@ impl Active {
 /// Answers to a tool call approval, in menu order.
 pub const APPROVAL_OPTIONS: [&str; 3] = ["yes", "allow for session", "no"];
 
+pub struct BackgroundRun {
+    pub label: String,
+    /// Its latest tool call.
+    pub tool: Option<String>,
+    pub started: Instant,
+}
+
 pub struct Approval {
     reply: oneshot::Sender<Answer>,
     pub name: String,
     pub arguments: String,
     /// Label of the subagent asking.
     pub agent: Option<String>,
+    /// From a background subagent, which an interrupt does not stop.
+    background: bool,
     /// Highlighted index into `APPROVAL_OPTIONS`.
     pub choice: usize,
 }
@@ -240,6 +249,8 @@ pub struct App {
     pub phase: (Phase, Instant),
     /// Messages submitted while a run was active, sent together as one turn when it finishes.
     pub queued: VecDeque<String>,
+    /// Background subagents still running, in start order; shown in the panel.
+    pub background_runs: Vec<BackgroundRun>,
     /// Large pastes, the nth shown as `paste_label(n)` and expanded when sent. Kept for the whole
     /// session so recalled and queued inputs still expand.
     pastes: Vec<String>,
@@ -252,6 +263,7 @@ pub struct App {
     pub always: BTreeSet<String>,
     run_id: u64,
     tx: UnboundedSender<(u64, AgentEvent)>,
+    background: Arc<Background>,
     /// Set by the first Ctrl+C; the next key either quits (Ctrl+C) or disarms it.
     pub quit_armed: bool,
     pub quit: bool,
@@ -263,6 +275,7 @@ impl App {
         tools: ToolRegistry,
         skills: Arc<Skills>,
         tx: UnboundedSender<(u64, AgentEvent)>,
+        background_tx: UnboundedSender<BackgroundEvent>,
         map_tx: UnboundedSender<Option<repomap::RepoMap>>,
         resume: bool,
     ) -> anyhow::Result<Self> {
@@ -325,12 +338,14 @@ impl App {
             compacting: false,
             phase: (Phase::Waiting, Instant::now()),
             queued: VecDeque::new(),
+            background_runs: Vec::new(),
             pastes: Vec::new(),
             notices: Vec::new(),
             approval: VecDeque::new(),
             always: BTreeSet::new(),
             run_id: 0,
             tx,
+            background: Arc::new(Background::new(background_tx)),
             quit_armed: false,
             quit: false,
         };
@@ -347,6 +362,7 @@ impl App {
     fn resume(&mut self, path: PathBuf) {
         match Session::open(path) {
             Ok((session, history, shown)) => {
+                self.stop_background();
                 self.log = history_log(&history, &shown);
                 self.log.push(Entry::Info("session resumed".into()));
                 self.history = history;
@@ -826,11 +842,7 @@ impl App {
         Some(
             self.notices
                 .drain(..)
-                .map(|r| {
-                    format!(
-                        "[automatic notice, not written by the user] Background job exited:\n{r}"
-                    )
-                })
+                .map(|n| format!("[automatic notice, not written by the user] {n}"))
                 .collect::<Vec<_>>()
                 .join("\n\n"),
         )
@@ -839,10 +851,95 @@ impl App {
     pub fn on_job(&mut self, report: String) {
         let summary = report.lines().next().unwrap_or_default();
         self.push_log(Entry::Info(format!("job {summary}")));
-        self.notices.push(report);
+        self.notices
+            .push(format!("Background job exited:\n{report}"));
         if !self.is_running() && self.active.is_some() {
             self.send_notices();
         }
+    }
+
+    pub fn has_background(&self) -> bool {
+        !self.background_runs.is_empty()
+    }
+
+    pub fn on_background(&mut self, ev: BackgroundEvent) {
+        // Events queued by subagents stopped with `/clear` or `/resume` have no run left.
+        let known = |label: &str| self.background_runs.iter().any(|b| b.label == label);
+        match ev {
+            BackgroundEvent::Started { label } => self.background_runs.push(BackgroundRun {
+                label,
+                tool: None,
+                started: Instant::now(),
+            }),
+            BackgroundEvent::Event(AgentEvent::ToolStart {
+                name,
+                agent: Some(label),
+                ..
+            }) => {
+                if let Some(b) = self.background_runs.iter_mut().find(|b| b.label == label) {
+                    b.tool = Some(name);
+                }
+            }
+            BackgroundEvent::Event(AgentEvent::Approve {
+                name,
+                arguments,
+                agent: Some(label),
+                reply,
+            }) if known(&label) => self.ask(name, arguments, Some(label), reply, true),
+            BackgroundEvent::Event(AgentEvent::Metrics(stats)) => self.push_metrics(stats),
+            BackgroundEvent::Event(_) => {}
+            BackgroundEvent::Finished { label, .. } if !known(&label) => {}
+            BackgroundEvent::Finished { label, report } => {
+                self.background_runs.retain(|b| b.label != label);
+                self.push_log(Entry::Info(format!("agent {label} finished")));
+                self.notices
+                    .push(format!("Background agent `{label}` finished:\n{report}"));
+                if !self.is_running() && self.active.is_some() {
+                    self.send_notices();
+                }
+            }
+        }
+    }
+
+    fn push_metrics(&mut self, mut stats: metrics::Request) {
+        if stats.model.is_empty() {
+            stats.model = self.model_label();
+        }
+        if let Some(a) = &stats.agent {
+            stats.model = format!("{} (agent {a})", stats.model);
+        }
+        self.metrics.push(stats);
+    }
+
+    /// Queues an approval, unless the tool was answered with "always".
+    fn ask(
+        &mut self,
+        name: String,
+        arguments: String,
+        agent: Option<String>,
+        reply: oneshot::Sender<Answer>,
+        background: bool,
+    ) {
+        if self.always.contains(&name) {
+            let _ = reply.send(Answer::Yes);
+            return;
+        }
+        self.scroll = 0;
+        self.approval.push_back(Approval {
+            reply,
+            name,
+            arguments,
+            agent,
+            background,
+            choice: 0,
+        });
+    }
+
+    /// Their reports and pending approvals belong to the history being left.
+    fn stop_background(&mut self) {
+        self.background.cancel();
+        self.background_runs.clear();
+        self.approval.retain(|a| !a.background);
     }
 
     fn start_run(&mut self) {
@@ -900,6 +997,7 @@ impl App {
             extra: self.think_patch(),
             agents: Arc::clone(&self.agents),
             sub: None,
+            background: Some(Arc::clone(&self.background)),
         };
         self.run_id += 1;
         Some(run)
@@ -924,7 +1022,7 @@ impl App {
     }
 
     fn interrupt(&mut self) {
-        self.approval.clear();
+        self.approval.retain(|a| a.background);
         self.log.retain(|e| e.agent().is_none());
         if let Some(h) = self.running.take() {
             h.abort();
@@ -1060,6 +1158,7 @@ impl App {
             }
             Command::Clear => {
                 self.interrupt();
+                self.stop_background();
                 self.history.clear();
                 self.shown.clear();
                 self.session = Some(Session::new(self.tools.root()));
@@ -1212,33 +1311,13 @@ impl App {
                     cached,
                 })
             }
-            AgentEvent::Metrics(mut stats) => {
-                if stats.model.is_empty() {
-                    stats.model = self.model_label();
-                }
-                if let Some(a) = &stats.agent {
-                    stats.model = format!("{} (agent {a})", stats.model);
-                }
-                self.metrics.push(stats);
-            }
-            AgentEvent::Approve { name, reply, .. } if self.always.contains(&name) => {
-                let _ = reply.send(Answer::Yes);
-            }
+            AgentEvent::Metrics(stats) => self.push_metrics(stats),
             AgentEvent::Approve {
                 name,
                 arguments,
                 agent,
                 reply,
-            } => {
-                self.scroll = 0;
-                self.approval.push_back(Approval {
-                    reply,
-                    name,
-                    arguments,
-                    agent,
-                    choice: 0,
-                });
-            }
+            } => self.ask(name, arguments, agent, reply, false),
             AgentEvent::Error(e) => self.push_log(Entry::Error(e)),
             AgentEvent::Finished => {
                 self.running = None;

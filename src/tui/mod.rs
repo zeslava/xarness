@@ -33,6 +33,7 @@ pub async fn run(
     let (mcp_tx, mcp_rx) = mpsc::unbounded_channel();
     let (job_tx, job_rx) = mpsc::unbounded_channel();
     let (map_tx, map_rx) = mpsc::unbounded_channel();
+    let (background_tx, background_rx) = mpsc::unbounded_channel();
     tools.watch_jobs(job_tx);
     if !config.mcp.is_empty() {
         let servers = config.mcp.clone();
@@ -42,7 +43,7 @@ pub async fn run(
             let _ = mcp_tx.send(mcp::connect_all(servers, root).await);
         });
     }
-    let app = App::new(config, tools, skills, tx, map_tx, resume)?;
+    let app = App::new(config, tools, skills, tx, background_tx, map_tx, resume)?;
     let mut terminal = ratatui::init();
     // Wheel and drag arrive as mouse events, apart from the arrow keys; selection is ours
     // to draw and copy (native one needs Shift).
@@ -57,7 +58,16 @@ pub async fn run(
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         )?;
     }
-    let res = event_loop(&mut terminal, app, rx, mcp_rx, job_rx, map_rx).await;
+    let res = event_loop(
+        &mut terminal,
+        app,
+        rx,
+        background_rx,
+        mcp_rx,
+        job_rx,
+        map_rx,
+    )
+    .await;
     if enhanced {
         let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     }
@@ -71,6 +81,7 @@ async fn event_loop(
     terminal: &mut DefaultTerminal,
     mut app: App,
     mut rx: mpsc::UnboundedReceiver<(u64, crate::agent::AgentEvent)>,
+    mut background_rx: mpsc::UnboundedReceiver<crate::agent::BackgroundEvent>,
     mut mcp_rx: mpsc::UnboundedReceiver<mcp::Connected>,
     mut job_rx: mpsc::UnboundedReceiver<String>,
     mut map_rx: mpsc::UnboundedReceiver<Option<crate::repomap::RepoMap>>,
@@ -82,11 +93,13 @@ async fn event_loop(
         tokio::select! {
             Some(ev) = events.next() => app.on_term_event(ev?),
             Some((id, ev)) = rx.recv() => app.on_agent_event(id, ev),
+            Some(ev) = background_rx.recv() => app.on_background(ev),
             Some(servers) = mcp_rx.recv() => app.on_mcp(servers),
             Some(report) = job_rx.recv() => app.on_job(report),
             Some(map) = map_rx.recv() => app.on_repo_map(map),
-            // Animates the spinner and expires the flash, so no redraws while idle.
-            _ = ticker.tick(), if app.is_running() || app.flash().is_some() => app.on_tick(),
+            // Animates the spinner, counts background agents' time and expires the flash, so no
+            // redraws while idle.
+            _ = ticker.tick(), if app.is_running() || app.has_background() || app.flash().is_some() => app.on_tick(),
         }
     }
     Ok(())

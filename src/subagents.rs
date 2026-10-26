@@ -210,6 +210,34 @@ impl Subagents {
         } else {
             ""
         };
+        let mut parameters = json!({
+            "type": "object",
+            "properties": {
+                "agent": {
+                    "type": "string",
+                    "enum": self.list.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+                },
+                "task": { "type": "string", "description": "Complete instructions for the subagent" },
+                "dir": {
+                    "type": "string",
+                    "description": "Directory to work in, for a task about one project: the \
+                        subagent's paths are relative to it and it gets that project's \
+                        AGENTS.md and repo map. Outside your working directory it is \
+                        read-only and the call needs the user's approval. Omit to work in \
+                        your directory."
+                }
+            },
+            "required": ["agent", "task"]
+        });
+        // Running beside the caller needs a server that takes parallel requests too.
+        if self.parallel {
+            parameters["properties"]["background"] = json!({
+                "type": "boolean",
+                "description": "Return at once and keep working while the subagent runs; its \
+                    report arrives later as a new message. Use it when you do not need the \
+                    result to continue."
+            });
+        }
         Some(ToolSpec {
             name: TOOL.into(),
             description: format!(
@@ -219,25 +247,7 @@ impl Subagents {
                  the goal, relevant paths and names, and what to report back.{parallel}\
                  \n\nAgents:\n{list}"
             ),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "agent": {
-                        "type": "string",
-                        "enum": self.list.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
-                    },
-                    "task": { "type": "string", "description": "Complete instructions for the subagent" },
-                    "dir": {
-                        "type": "string",
-                        "description": "Directory to work in, for a task about one project: the \
-                            subagent's paths are relative to it and it gets that project's \
-                            AGENTS.md and repo map. Outside your working directory it is \
-                            read-only and the call needs the user's approval. Omit to work in \
-                            your directory."
-                    }
-                },
-                "required": ["agent", "task"]
-            }),
+            parameters,
         })
     }
 }

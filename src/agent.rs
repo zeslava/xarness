@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use anyhow::{anyhow, bail};
@@ -10,6 +11,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
+use tokio::task::AbortHandle;
 
 use crate::config::{ModelConfig, merge};
 use crate::domain::message::{Message, Mode, ToolCall};
@@ -80,6 +82,83 @@ pub struct Run {
     pub agents: Arc<Subagents>,
     /// Set when this run is a subagent's.
     pub sub: Option<Arc<Subagent>>,
+    /// `None` for subagents.
+    pub background: Option<Arc<Background>>,
+}
+
+pub enum BackgroundEvent {
+    /// Sent before any of its events; labels are unique per session.
+    Started {
+        label: String,
+    },
+    /// Tool starts, approvals and metrics of a running subagent, tagged with its label.
+    Event(AgentEvent),
+    Finished {
+        label: String,
+        report: String,
+    },
+}
+
+/// Subagents started with `background`. They outlive the turn that started them, so their events
+/// bypass the `run_id` check, and report to the TUI when done.
+pub struct Background {
+    tx: UnboundedSender<BackgroundEvent>,
+    tasks: Mutex<Vec<AbortHandle>>,
+    started: AtomicUsize,
+}
+
+impl Background {
+    pub fn new(tx: UnboundedSender<BackgroundEvent>) -> Self {
+        Self {
+            tx,
+            tasks: Mutex::default(),
+            started: AtomicUsize::new(0),
+        }
+    }
+
+    /// Stops all of them, for `/clear` and `/resume`: their reports belong to another history.
+    pub fn cancel(&self) {
+        for t in self
+            .tasks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain(..)
+        {
+            t.abort();
+        }
+    }
+
+    /// `prefix` goes before the report, as it does before a foreground one.
+    fn spawn(&self, mut sub: Run, def: &Subagent, prefix: String) -> String {
+        let n = self.started.fetch_add(1, Ordering::Relaxed) + 1;
+        let label = format!("{}#bg{n}", def.name);
+        let _ = self.tx.send(BackgroundEvent::Started {
+            label: label.clone(),
+        });
+        let tx = self.tx.clone();
+        let sink: Sink = Arc::new(move |ev| {
+            let _ = tx.send(BackgroundEvent::Event(ev));
+        });
+        let sink = sub_sink(&sink, def, label.clone());
+        let tx = self.tx.clone();
+        let task_label = label.clone();
+        let task = tokio::spawn(async move {
+            let report = match drive(&mut sub, &sink).await {
+                Ok(o) if o.text.trim().is_empty() => "It ended without a report.".into(),
+                Ok(o) if o.truncated => format!("{prefix}{}\n[cut off at max_tokens]", o.text),
+                Ok(o) => prefix + &o.text,
+                Err(e) => format!("It failed: {e:#}"),
+            };
+            let _ = tx.send(BackgroundEvent::Finished {
+                label: task_label,
+                report,
+            });
+        });
+        let mut tasks = self.tasks.lock().unwrap_or_else(PoisonError::into_inner);
+        tasks.retain(|t| !t.is_finished());
+        tasks.push(task.abort_handle());
+        label
+    }
 }
 
 type Sink = Arc<dyn Fn(AgentEvent) + Send + Sync>;
@@ -455,6 +534,8 @@ struct DelegateArgs {
     agent: String,
     task: String,
     dir: Option<String>,
+    #[serde(default)]
+    background: bool,
 }
 
 /// Where a subagent works when the call sets `dir`.
@@ -576,7 +657,25 @@ fn delegate<'a>(
             extra,
             agents: Arc::clone(&r.agents),
             sub: Some(Arc::clone(def)),
+            background: None,
         };
+        let prefix = if moved {
+            format!("(paths relative to {})\n", sub.tools.root().display())
+        } else {
+            String::new()
+        };
+        if a.background {
+            let bg = r
+                .background
+                .as_ref()
+                .filter(|_| r.agents.parallel)
+                .ok_or_else(|| anyhow!("background agents are unavailable"))?;
+            let label = bg.spawn(sub, def, prefix);
+            return Ok(format!(
+                "Started in the background as `{label}`. Its report arrives as a new message when \
+                 it finishes: do not wait or poll for it, continue with other work or end your turn."
+            ));
+        }
         let label = format!("{}{}", def.name, suffix.unwrap_or_default());
         let out = drive(&mut sub, &sub_sink(sink, def, label)).await?;
         if out.truncated {
@@ -585,15 +684,7 @@ fn delegate<'a>(
         if out.text.trim().is_empty() {
             bail!("the subagent ended without a report");
         }
-        Ok(if moved {
-            format!(
-                "(paths relative to {})\n{}",
-                sub.tools.root().display(),
-                out.text
-            )
-        } else {
-            out.text
-        })
+        Ok(prefix + &out.text)
     }
     .boxed()
 }
