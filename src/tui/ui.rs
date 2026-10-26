@@ -22,7 +22,7 @@ const SIDE_PANE_MIN_WIDTH: u16 = 100;
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 // Markers must be single-width and without an emoji variant, or terminals disagree on their size.
 const PROMPT: &str = "❯ ";
-const TOOL_MARK: &str = "*";
+const TOOL_MARK: &str = "●";
 const SUBAGENT_MARK: &str = "↳";
 const AGENT_MARK: &str = "◇";
 const WAIT_MARK: &str = "⏳";
