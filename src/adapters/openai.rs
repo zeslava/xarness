@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
@@ -71,10 +72,24 @@ async fn pump(
     let mut bytes = resp.bytes_stream();
     let mut buf = String::new();
     let mut acc = DeltaAccumulator::default();
+    // Debugging aid: raw stream lines are appended to this file, one block per response.
+    let mut dump = std::env::var_os("XARNESS_STREAM_LOG").and_then(|p| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+            .ok()
+    });
+    if let Some(f) = &mut dump {
+        let _ = writeln!(f, "=== response");
+    }
     while let Some(chunk) = bytes.next().await {
         buf.push_str(&String::from_utf8_lossy(&chunk?));
         while let Some(nl) = buf.find('\n') {
             let line: String = buf.drain(..=nl).collect();
+            if let Some(f) = &mut dump {
+                let _ = f.write_all(line.as_bytes());
+            }
             let Some(data) = line.trim().strip_prefix("data:") else {
                 continue;
             };
