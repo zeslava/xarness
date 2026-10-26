@@ -169,6 +169,13 @@ const MAX_SUBAGENT_STEPS: usize = 40;
 const WRAP_UP: &str = "You have used up your tool calls. Do not call any more tools: report now \
                        what you have found so far, and say what is still unverified.";
 
+/// Times in a row a subagent's cut-off response is discarded and requested again.
+const MAX_CUT_OFFS: usize = 2;
+
+const CUT_OFF: &str = "Your previous response was cut off at the output token limit and has \
+                       been discarded. Respond again: keep your reasoning short, be concise, \
+                       and split long writes into several smaller tool calls.";
+
 struct Outcome {
     /// Text of the final response.
     text: String,
@@ -199,6 +206,7 @@ async fn drive(r: &mut Run, sink: &Sink) -> anyhow::Result<Outcome> {
     let mut scale = 1.0_f64;
     let mut retried = false;
     let mut steps = 0;
+    let mut cut_offs = 0;
     'turn: loop {
         let system = system_prompt(
             r.mode,
@@ -265,8 +273,13 @@ async fn drive(r: &mut Run, sink: &Sink) -> anyhow::Result<Outcome> {
         };
         let mut messages = vec![Message::System(system)];
         messages.extend(history);
-        if wrap_up {
-            messages.push(Message::User(WRAP_UP.into()));
+        // One message: some chat templates reject two user messages in a row.
+        let notes: Vec<&str> = [(cut_offs > 0, CUT_OFF), (wrap_up, WRAP_UP)]
+            .into_iter()
+            .filter_map(|(on, s)| on.then_some(s))
+            .collect();
+        if !notes.is_empty() {
+            messages.push(Message::User(notes.join("\n\n")));
         }
         let req = ChatRequest {
             model: r.model.id.clone(),
@@ -338,8 +351,16 @@ async fn drive(r: &mut Run, sink: &Sink) -> anyhow::Result<Outcome> {
         }
 
         stats.duration_ms = started.elapsed().as_millis() as u64;
-        let tools_started = Instant::now();
         retried = false;
+        // A subagent's report is all its caller gets, so a cut-off one is worth another try.
+        // The partial response stays out of history: the retry reuses the same prefix.
+        if truncated && r.sub.is_some() && cut_offs < MAX_CUT_OFFS {
+            cut_offs += 1;
+            sink(AgentEvent::Metrics(stats));
+            continue;
+        }
+        cut_offs = 0;
+        let tools_started = Instant::now();
         let final_text = calls.is_empty().then(|| text.clone());
         let mut batch = vec![Message::Assistant {
             content: text,
@@ -678,11 +699,15 @@ fn delegate<'a>(
         }
         let label = format!("{}{}", def.name, suffix.unwrap_or_default());
         let out = drive(&mut sub, &sub_sink(sink, def, label)).await?;
-        if out.truncated {
-            bail!("the subagent's response was cut off at max_tokens");
-        }
         if out.text.trim().is_empty() {
-            bail!("the subagent ended without a report");
+            bail!(if out.truncated {
+                "the subagent's response was cut off at max_tokens"
+            } else {
+                "the subagent ended without a report"
+            });
+        }
+        if out.truncated {
+            return Ok(format!("{prefix}{}\n[cut off at max_tokens]", out.text));
         }
         Ok(prefix + &out.text)
     }
