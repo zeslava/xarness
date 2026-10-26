@@ -1,13 +1,14 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
 use crate::config::{AgentConfig, ModelConfig};
 use crate::domain::ports::{LlmProvider, ToolSpec};
+use crate::repomap;
 use crate::skills::{parse_frontmatter, split_frontmatter};
 use crate::tools::clip;
 
@@ -44,6 +45,15 @@ pub struct Subagents {
     pub warnings: Vec<String>,
     /// Consecutive calls run in parallel rather than one by one.
     pub parallel: bool,
+    /// Context of the directories subagents were sent to, built once per session so repeated
+    /// calls send a byte-identical prompt.
+    dirs: Mutex<HashMap<PathBuf, Arc<DirContext>>>,
+}
+
+/// What a subagent sent to `dir` sees instead of the caller's AGENTS.md and repo map.
+pub struct DirContext {
+    pub instructions: Option<Arc<str>>,
+    pub repo_map: Option<Arc<str>>,
 }
 
 const DESCRIPTION_MAX: usize = 300;
@@ -157,6 +167,33 @@ impl Subagents {
         self.list.iter().find(|a| a.name == name)
     }
 
+    pub async fn dir_context(&self, dir: &Path) -> Arc<DirContext> {
+        let cached = self
+            .dirs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(dir)
+            .cloned();
+        if let Some(c) = cached {
+            return c;
+        }
+        let root = dir.to_path_buf();
+        let built = tokio::task::spawn_blocking(move || DirContext {
+            instructions: fs::read_to_string(root.join("AGENTS.md"))
+                .ok()
+                .map(Arc::from),
+            repo_map: repomap::build(&root).map(|m| Arc::from(m.text)),
+        })
+        .await
+        .unwrap_or(DirContext {
+            instructions: None,
+            repo_map: None,
+        });
+        // A parallel call may have built it meanwhile; keep the first so prompts stay identical.
+        let mut dirs = self.dirs.lock().unwrap_or_else(PoisonError::into_inner);
+        Arc::clone(dirs.entry(dir.to_path_buf()).or_insert(Arc::new(built)))
+    }
+
     /// The `agent` tool, with the agents listed in its description. Built once per session like
     /// the other specs, so the request prefix stays cacheable.
     pub fn spec(&self) -> Option<ToolSpec> {
@@ -189,7 +226,15 @@ impl Subagents {
                         "type": "string",
                         "enum": self.list.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
                     },
-                    "task": { "type": "string", "description": "Complete instructions for the subagent" }
+                    "task": { "type": "string", "description": "Complete instructions for the subagent" },
+                    "dir": {
+                        "type": "string",
+                        "description": "Directory to work in, for a task about one project: the \
+                            subagent's paths are relative to it and it gets that project's \
+                            AGENTS.md and repo map. Outside your working directory it is \
+                            read-only and the call needs the user's approval. Omit to work in \
+                            your directory."
+                    }
                 },
                 "required": ["agent", "task"]
             }),

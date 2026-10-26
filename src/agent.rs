@@ -16,7 +16,7 @@ use crate::domain::message::{Message, Mode, ToolCall};
 use crate::domain::ports::{ChatRequest, ContextOverflow, LlmEvent, LlmProvider};
 use crate::metrics;
 use crate::subagents::{self, Subagent, Subagents};
-use crate::tools::{SKILL_TOOL, ToolRegistry};
+use crate::tools::{self, SKILL_TOOL, ToolRegistry};
 
 pub enum AgentEvent {
     TextDelta(String),
@@ -454,6 +454,49 @@ async fn call_tool(r: &Run, c: &ToolCall, sink: &Sink) -> anyhow::Result<String>
 struct DelegateArgs {
     agent: String,
     task: String,
+    dir: Option<String>,
+}
+
+/// Where a subagent works when the call sets `dir`.
+struct Workdir {
+    tools: Arc<ToolRegistry>,
+    instructions: Option<Arc<str>>,
+    repo_map: Option<Arc<str>>,
+    /// Outside the caller's root: read-only, so one approval does not widen the write sandbox.
+    read_only: bool,
+}
+
+async fn workdir(r: &Run, c: &ToolCall, dir: &str, sink: &Sink) -> anyhow::Result<Option<Workdir>> {
+    let root = r.tools.root();
+    let path = tools::resolve_read(root, dir)?;
+    if path == root {
+        return Ok(None);
+    }
+    if !path.is_dir() {
+        bail!("`{dir}` is not a directory");
+    }
+    let read_only = !path.starts_with(root);
+    if read_only {
+        let (reply, answer) = oneshot::channel();
+        sink(AgentEvent::Approve {
+            name: c.name.clone(),
+            arguments: c.arguments.clone(),
+            agent: None,
+            reply,
+        });
+        match answer.await.unwrap_or(Answer::No(None)) {
+            Answer::Yes => {}
+            Answer::No(None) => bail!("the user declined this call"),
+            Answer::No(Some(reason)) => bail!("the user declined this call and said: {reason}"),
+        }
+    }
+    let ctx = r.agents.dir_context(&path).await;
+    Ok(Some(Workdir {
+        tools: Arc::new(r.tools.rooted(path)),
+        instructions: ctx.instructions.clone(),
+        repo_map: ctx.repo_map.clone(),
+        read_only,
+    }))
 }
 
 /// Runs an `agent` call: a subagent with a history of its own, starting from the task alone.
@@ -501,16 +544,35 @@ fn delegate<'a>(
                 None => extra = Some(e.clone()),
             }
         }
+        let wd = match &a.dir {
+            Some(d) => workdir(r, c, d, sink).await?,
+            None => None,
+        };
+        let moved = wd.is_some();
+        let (mode, tools, instructions, repo_map) = match wd {
+            Some(w) => (
+                if w.read_only { Mode::Plan } else { r.mode },
+                w.tools,
+                w.instructions,
+                w.repo_map,
+            ),
+            None => (
+                r.mode,
+                Arc::clone(&r.tools),
+                r.instructions.clone(),
+                r.repo_map.clone(),
+            ),
+        };
         let mut sub = Run {
             provider,
             model,
-            mode: r.mode,
+            mode,
             history: vec![Message::User(a.task)],
             cut: ContextCut::default(),
-            tools: Arc::clone(&r.tools),
-            instructions: r.instructions.clone(),
+            tools,
+            instructions,
             skills: r.skills.clone().filter(|_| def.allows(SKILL_TOOL)),
-            repo_map: r.repo_map.clone(),
+            repo_map,
             extra,
             agents: Arc::clone(&r.agents),
             sub: Some(Arc::clone(def)),
@@ -523,7 +585,15 @@ fn delegate<'a>(
         if out.text.trim().is_empty() {
             bail!("the subagent ended without a report");
         }
-        Ok(out.text)
+        Ok(if moved {
+            format!(
+                "(paths relative to {})\n{}",
+                sub.tools.root().display(),
+                out.text
+            )
+        } else {
+            out.text
+        })
     }
     .boxed()
 }
@@ -1022,8 +1092,7 @@ user, and you cannot ask it anything. Work on your own, then end with a final me
 result. It is passed to that agent verbatim and is all it sees of your work, so make it complete \
 and concise.";
 
-const SUBAGENT_PLAN_NOTE: &str = "The caller is in PLAN mode, so tools that change files or run \
-commands are unavailable. If the task needs such changes, do the read-only part and report exactly \
+const SUBAGENT_PLAN_NOTE: &str = "Tools that change files or run commands are unavailable to you. If the task needs such changes, do the read-only part and report exactly \
 what would have to be changed or run.";
 
 fn system_prompt(

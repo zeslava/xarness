@@ -65,6 +65,22 @@ impl ToolRegistry {
         &self.root
     }
 
+    /// The same tools working in `root`, for a subagent sent to another directory. MCP tools
+    /// connected later are not added to it, which is fine for a registry that lives one call.
+    pub fn rooted(&self, root: PathBuf) -> Self {
+        Self {
+            root,
+            tools: self.tools.clone(),
+            jobs: Arc::clone(&self.jobs),
+            mcp: RwLock::new(
+                self.mcp
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone(),
+            ),
+        }
+    }
+
     /// `tx` receives a report for each background job that exits.
     pub fn watch_jobs(&self, tx: UnboundedSender<String>) {
         self.jobs.notify(tx);
