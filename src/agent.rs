@@ -57,6 +57,15 @@ pub enum AgentEvent {
         agent: Option<String>,
         reply: oneshot::Sender<Answer>,
     },
+    /// A subagent began `task`; its text follows as `SubagentText`, for the TUI's live view.
+    SubagentStarted {
+        agent: String,
+        task: String,
+    },
+    SubagentText {
+        agent: String,
+        text: String,
+    },
     Error(String),
     Finished,
 }
@@ -139,7 +148,7 @@ impl Background {
         let sink: Sink = Arc::new(move |ev| {
             let _ = tx.send(BackgroundEvent::Event(ev));
         });
-        let sink = sub_sink(&sink, def, label.clone());
+        let sink = sub_sink(&sink, def, label.clone(), task(&sub));
         let tx = self.tx.clone();
         let task_label = label.clone();
         let task = tokio::spawn(async move {
@@ -698,7 +707,8 @@ fn delegate<'a>(
             ));
         }
         let label = format!("{}{}", def.name, suffix.unwrap_or_default());
-        let out = drive(&mut sub, &sub_sink(sink, def, label)).await?;
+        let sub_sink = sub_sink(sink, def, label, task(&sub));
+        let out = drive(&mut sub, &sub_sink).await?;
         if out.text.trim().is_empty() {
             bail!(if out.truncated {
                 "the subagent's response was cut off at max_tokens"
@@ -714,13 +724,28 @@ fn delegate<'a>(
     .boxed()
 }
 
-/// Passes on what the TUI shows of a subagent's work, tagged with `label`. Its text, history
-/// and context usage stay with it: only the final response reaches the caller.
-fn sub_sink(parent: &Sink, def: &Subagent, label: String) -> Sink {
+fn task(sub: &Run) -> String {
+    match sub.history.first() {
+        Some(Message::User(t)) => t.clone(),
+        _ => String::new(),
+    }
+}
+
+/// Passes on what the TUI shows of a subagent's work, tagged with `label`. Its history and
+/// context usage stay with it: only the final response reaches the caller.
+fn sub_sink(parent: &Sink, def: &Subagent, label: String, task: String) -> Sink {
     let parent = Arc::clone(parent);
+    parent(AgentEvent::SubagentStarted {
+        agent: label.clone(),
+        task,
+    });
     let name = def.name.clone();
     let model = def.target.as_ref().map(|t| t.label.clone());
     Arc::new(move |ev| match ev {
+        AgentEvent::TextDelta(text) => parent(AgentEvent::SubagentText {
+            agent: label.clone(),
+            text,
+        }),
         AgentEvent::ToolStart {
             name, arguments, ..
         } => parent(AgentEvent::ToolStart {

@@ -16,7 +16,20 @@ const TOOL_OUTPUT_PREVIEW: usize = 8;
 const MAX_INPUT_ROWS: usize = 6;
 /// Upper bound of the panel above the input, as a share of the screen height.
 const PANEL_SHARE_PCT: usize = 40;
+/// Share of the log area taken by the subagent pane; below the minimum width it goes underneath.
+const PANE_SHARE_PCT: u16 = 45;
+const SIDE_PANE_MIN_WIDTH: u16 = 100;
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+// Markers must be single-width and without an emoji variant, or terminals disagree on their size.
+const PROMPT: &str = "❯ ";
+const TOOL_MARK: &str = "*";
+const SUBAGENT_MARK: &str = "↳";
+const AGENT_MARK: &str = "◇";
+const WAIT_MARK: &str = "⏳";
+const OUTPUT_BAR: &str = "│";
+const NEWLINE_MARK: &str = " ↵ ";
+const UNSEEN_MARK: &str = "↓";
+const OK_MARK: &str = "✓";
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let width = f.area().width.saturating_sub(2).max(1) as usize;
@@ -35,10 +48,30 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Constraint::Length(1),
     ])
     .areas(f.area());
+    let log_area = match app.viewed() {
+        Some((pos, t)) => {
+            let side = log_area.width >= SIDE_PANE_MIN_WIDTH;
+            let [main, pane] = if side {
+                Layout::horizontal([Constraint::Min(1), Constraint::Percentage(PANE_SHARE_PCT)])
+                    .areas(log_area)
+            } else {
+                Layout::vertical([Constraint::Min(1), Constraint::Percentage(PANE_SHARE_PCT)])
+                    .areas(log_area)
+            };
+            let title = format!(
+                " {AGENT_MARK} {} ({pos}/{}) · /agents next · Esc close ",
+                t.label,
+                app.transcripts.len()
+            );
+            transcript_pane(f, pane, &t.log, side, title);
+            main
+        }
+        None => log_area,
+    };
 
     // A pending approval has the panel as its indicator.
     let live = app.is_running() && app.approval().is_none();
-    let mut text = log_text(app);
+    let mut text = log_text(&app.log);
     if live {
         // Room for the indicator, so at the bottom it doesn't cover the last line.
         text.lines.push(Line::default());
@@ -66,7 +99,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         let text = selected_text(&log, log_area.width, sel);
         if !text.is_empty() {
             app.clipboard.copy(&text);
-            app.notify(FlashKind::Ok, "✓ copied");
+            app.notify(FlashKind::Ok, format!("{OK_MARK} copied"));
         }
     }
     f.render_widget(log.scroll((offset, 0)), log_area);
@@ -95,7 +128,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .map(|(i, r)| {
             if i == 0 && first == 0 {
                 Line::from(vec![
-                    Span::styled("> ", Style::new().fg(accent).bold()),
+                    Span::styled(PROMPT, Style::new().fg(accent).bold()),
                     Span::raw(r),
                 ])
             } else {
@@ -133,6 +166,19 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         ));
         f.render_widget(line.right_aligned(), status_area);
     }
+}
+
+/// A subagent's live conversation, always following its end.
+fn transcript_pane(f: &mut Frame, area: Rect, log: &[Entry], side: bool, title: String) {
+    let block = Block::default()
+        .borders(if side { Borders::LEFT } else { Borders::TOP })
+        .border_style(Style::new().fg(Color::Gray))
+        .title(Span::styled(title, Style::new().fg(Color::Magenta).bold()));
+    let inner = block.inner(area);
+    let text = Paragraph::new(log_text(log)).wrap(Wrap { trim: false });
+    let offset = (text.line_count(inner.width) as u16).saturating_sub(inner.height);
+    f.render_widget(block, area);
+    f.render_widget(text.scroll((offset, 0)), inner);
 }
 
 fn highlight(buf: &mut Buffer, area: Rect, offset: u16, sel: Selection) {
@@ -217,7 +263,7 @@ fn panel_lines(app: &App, width: usize, cap: usize, accent: Color) -> (Vec<Line<
             .unwrap_or_default();
         Line::from(vec![
             Span::styled(
-                format!("◇ {}{tool} ", b.label),
+                format!("{AGENT_MARK} {}{tool} ", b.label),
                 Style::new().fg(Color::Magenta),
             ),
             Span::styled(elapsed(b.started), Style::new().dim()),
@@ -232,7 +278,7 @@ fn panel_lines(app: &App, width: usize, cap: usize, accent: Color) -> (Vec<Line<
             } else {
                 shown
             };
-            Line::styled(format!("⏳ {shown}"), Style::new().dim())
+            Line::styled(format!("{WAIT_MARK} {shown}"), Style::new().dim())
         }))
         .collect();
     let last = lines.len().saturating_sub(1);
@@ -283,11 +329,11 @@ fn approval_lines(a: &Approval, width: usize, cap: usize, accent: Color) -> Vec<
     lines.extend(
         preview[..shown]
             .iter()
-            .map(|l| Line::styled(format!("  │ {l}"), style)),
+            .map(|l| Line::styled(format!("  {OUTPUT_BAR} {l}"), style)),
     );
     if shown < preview.len() && room > 0 {
         lines.push(Line::styled(
-            format!("  │ … {} more lines", preview.len() - shown),
+            format!("  {OUTPUT_BAR} … {} more lines", preview.len() - shown),
             style,
         ));
     }
@@ -400,7 +446,7 @@ fn status_line(app: &App) -> Line<'static> {
     }
     if app.unseen > 0 {
         spans.push(Span::styled(
-            format!(" · ↓ {} new lines", app.unseen),
+            format!(" · {UNSEEN_MARK} {} new lines", app.unseen),
             Style::new().fg(Color::Yellow),
         ));
     }
@@ -448,13 +494,13 @@ fn kilo(n: u32) -> String {
     }
 }
 
-fn log_text(app: &App) -> Text<'static> {
+fn log_text(log: &[Entry]) -> Text<'static> {
     let mut lines: Vec<Line> = Vec::new();
-    for entry in app.log.iter() {
+    for entry in log.iter() {
         match entry {
             Entry::User(t) => {
                 for (i, l) in t.lines().enumerate() {
-                    let prefix = if i == 0 { "> " } else { "  " };
+                    let prefix = if i == 0 { PROMPT } else { "  " };
                     lines.push(Line::from(format!("{prefix}{l}")).bold().fg(Color::Blue));
                 }
             }
@@ -466,11 +512,11 @@ fn log_text(app: &App) -> Text<'static> {
             } => lines.push(Line::from(vec![
                 match agent {
                     Some(a) => Span::styled(
-                        format!("  ↳ {a} {} ", display_name(name)),
+                        format!("  {SUBAGENT_MARK} {a} {} ", display_name(name)),
                         Style::new().fg(Color::Magenta),
                     ),
                     None => Span::styled(
-                        format!("⚙ {} ", display_name(name)),
+                        format!("{TOOL_MARK} {} ", display_name(name)),
                         Style::new().fg(Color::Magenta).bold(),
                     ),
                 },
@@ -492,11 +538,11 @@ fn log_text(app: &App) -> Text<'static> {
                 };
                 let total = text.lines().count();
                 for l in text.lines().take(TOOL_OUTPUT_PREVIEW) {
-                    lines.push(Line::styled(format!("{indent}│ {l}"), style));
+                    lines.push(Line::styled(format!("{indent}{OUTPUT_BAR} {l}"), style));
                 }
                 if total > TOOL_OUTPUT_PREVIEW {
                     lines.push(Line::styled(
-                        format!("{indent}│ … {} more lines", total - TOOL_OUTPUT_PREVIEW),
+                        format!("{indent}{OUTPUT_BAR} … {} more lines", total - TOOL_OUTPUT_PREVIEW),
                         style,
                     ));
                 }
@@ -562,13 +608,13 @@ fn tool_summary(name: &str, arguments: &str) -> String {
         // A span can't hold line breaks, so multi-line scripts are flattened.
         ("run", _) => match str_arg("command") {
             Some(c) if v.get("background").and_then(|x| x.as_bool()) == Some(true) => {
-                format!("{} &", c.trim().replace('\n', " ↵ "))
+                format!("{} &", c.trim().replace('\n', NEWLINE_MARK))
             }
-            Some(c) => c.trim().replace('\n', " ↵ "),
+            Some(c) => c.trim().replace('\n', NEWLINE_MARK),
             None => arguments.to_string(),
         },
         ("agent", _) => match (str_arg("agent"), str_arg("task")) {
-            (Some(a), Some(t)) => format!("{a}: {}", t.trim().replace('\n', " ↵ ")),
+            (Some(a), Some(t)) => format!("{a}: {}", t.trim().replace('\n', NEWLINE_MARK)),
             _ => arguments.to_string(),
         },
         (n, _) if n.contains("__") => mcp_summary(&v).unwrap_or_else(|| arguments.to_string()),
@@ -581,7 +627,7 @@ fn tool_summary(name: &str, arguments: &str) -> String {
 fn mcp_summary(v: &serde_json::Value) -> Option<String> {
     let obj = v.as_object()?;
     let flat = |x: &serde_json::Value| match x {
-        serde_json::Value::String(s) => s.trim().replace('\n', " ↵ "),
+        serde_json::Value::String(s) => s.trim().replace('\n', NEWLINE_MARK),
         other => other.to_string(),
     };
     Some(match obj.len() {

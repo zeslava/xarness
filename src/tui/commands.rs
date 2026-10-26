@@ -7,7 +7,9 @@ pub enum Command {
     MapShow,
     Mcp,
     Skills,
+    /// Opens the pane of the newest running subagent, then steps to older ones.
     Agents,
+    AgentsList,
     Compact(Option<String>),
     Clear,
     Resume(Option<String>),
@@ -21,8 +23,8 @@ pub enum Command {
     },
 }
 
-pub const HELP: &str = "/clear  /compact [focus]  /resume [n]  /plan  /build  /model [provider/model]  /think [level]  /map [show]  /mcp  /skills  /agents  /stats  /<skill> [args]  /help  /quit\n\
-Tab — complete command or cycle its arguments, Shift+Tab — toggle mode, Esc — interrupt, PgUp/PgDn/wheel — scroll, Up/Down/Ctrl+P/Ctrl+N — input history, drag — select and copy (Shift+drag — native selection), Ctrl+C — interrupt or clear input, twice to quit\n\
+pub const HELP: &str = "/clear  /compact [focus]  /resume [n]  /plan  /build  /model [provider/model]  /think [level]  /map [show]  /mcp  /skills  /agents [list]  /stats  /<skill> [args]  /help  /quit\n\
+Tab — complete command or cycle its arguments, Shift+Tab — toggle mode, Esc — interrupt or close the subagent pane, PgUp/PgDn/wheel — scroll, Up/Down/Ctrl+P/Ctrl+N — input history, drag — select and copy (Shift+drag — native selection), Ctrl+C — interrupt or clear input, twice to quit\n\
 Shift+Enter/Alt+Enter/Ctrl+J — new line, Ctrl+W/Alt+Backspace — delete word, Ctrl+U/Ctrl+K — delete to line start/end, \
 Ctrl+A/Ctrl+E — line start/end, Ctrl+←→/Alt+B/Alt+F — move by word\n\
 Approval: ←→/Tab + Enter; type a reason, pick no and Enter to decline with it; Esc interrupts";
@@ -38,7 +40,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("map", "rebuild repo map"),
     ("mcp", "MCP server status"),
     ("skills", "list skills"),
-    ("agents", "list subagents"),
+    ("agents", "watch running subagents; list: show all"),
     ("stats", "request and context metrics"),
     ("help", "show help"),
     ("quit", "exit"),
@@ -141,7 +143,14 @@ pub fn parse(input: &str) -> Command {
         },
         "mcp" => Command::Mcp,
         "skills" => Command::Skills,
-        "agents" => Command::Agents,
+        "agents" => match arg {
+            None => Command::Agents,
+            Some("list") => Command::AgentsList,
+            Some(other) => Command::Other {
+                name: "agents".into(),
+                arg: Some(other.into()),
+            },
+        },
         "compact" => Command::Compact(arg.map(str::to_string)),
         "clear" => Command::Clear,
         "resume" => Command::Resume(arg.map(str::to_string)),

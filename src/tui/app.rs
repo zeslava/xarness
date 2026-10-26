@@ -171,6 +171,13 @@ pub struct BackgroundRun {
     pub started: Instant,
 }
 
+/// A running subagent's conversation, for the live view; dropped when it ends.
+pub struct Transcript {
+    pub label: String,
+    pub log: Vec<Entry>,
+    background: bool,
+}
+
 pub struct Approval {
     reply: oneshot::Sender<Answer>,
     pub name: String,
@@ -251,6 +258,10 @@ pub struct App {
     pub queued: VecDeque<String>,
     /// Background subagents still running, in start order; shown in the panel.
     pub background_runs: Vec<BackgroundRun>,
+    /// Running subagents, in start order.
+    pub transcripts: Vec<Transcript>,
+    /// Label of the transcript shown in the side pane (Ctrl+O), read-only.
+    view: Option<String>,
     /// Large pastes, the nth shown as `paste_label(n)` and expanded when sent. Kept for the whole
     /// session so recalled and queued inputs still expand.
     pastes: Vec<String>,
@@ -339,6 +350,8 @@ impl App {
             phase: (Phase::Waiting, Instant::now()),
             queued: VecDeque::new(),
             background_runs: Vec::new(),
+            transcripts: Vec::new(),
+            view: None,
             pastes: Vec::new(),
             notices: Vec::new(),
             approval: VecDeque::new(),
@@ -664,6 +677,7 @@ impl App {
             KeyCode::Char('n') if ctrl => self.recall_newer(),
             KeyCode::Up => self.recall_older(),
             KeyCode::Down => self.recall_newer(),
+            KeyCode::Esc if self.view.is_some() => self.set_view(None),
             KeyCode::Esc => self.interrupt(),
             KeyCode::Enter => self.submit(),
             KeyCode::BackTab => self.set_mode(self.mode.toggle()),
@@ -730,6 +744,7 @@ impl App {
                     .collect()
             }
             "map" => vec![("show".into(), "print the current map".into())],
+            "agents" => vec![("list".into(), "defined and running subagents".into())],
             "resume" => session::list(self.tools.root())
                 .into_iter()
                 .enumerate()
@@ -871,15 +886,47 @@ impl App {
                 tool: None,
                 started: Instant::now(),
             }),
+            BackgroundEvent::Event(AgentEvent::SubagentStarted { agent, task })
+                if known(&agent) =>
+            {
+                self.transcripts.push(Transcript {
+                    label: agent,
+                    log: vec![Entry::User(task)],
+                    background: true,
+                })
+            }
+            BackgroundEvent::Event(AgentEvent::SubagentText { agent, text }) => {
+                self.record(&agent, Entry::Assistant(text))
+            }
             BackgroundEvent::Event(AgentEvent::ToolStart {
                 name,
+                arguments,
                 agent: Some(label),
-                ..
             }) => {
                 if let Some(b) = self.background_runs.iter_mut().find(|b| b.label == label) {
-                    b.tool = Some(name);
+                    b.tool = Some(name.clone());
                 }
+                self.record(
+                    &label,
+                    Entry::Tool {
+                        name,
+                        arguments,
+                        agent: None,
+                    },
+                );
             }
+            BackgroundEvent::Event(AgentEvent::ToolResult {
+                output,
+                is_error,
+                agent: Some(label),
+            }) => self.record(
+                &label,
+                Entry::ToolOutput {
+                    text: output,
+                    is_error,
+                    agent: None,
+                },
+            ),
             BackgroundEvent::Event(AgentEvent::Approve {
                 name,
                 arguments,
@@ -891,6 +938,7 @@ impl App {
             BackgroundEvent::Finished { label, .. } if !known(&label) => {}
             BackgroundEvent::Finished { label, report } => {
                 self.background_runs.retain(|b| b.label != label);
+                self.drop_transcripts(|t| t.label == label);
                 self.push_log(Entry::Info(format!("agent {label} finished")));
                 self.notices
                     .push(format!("Background agent `{label}` finished:\n{report}"));
@@ -899,6 +947,52 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Adds to the transcript of subagent `label`; streamed text extends its last response.
+    fn record(&mut self, label: &str, entry: Entry) {
+        let Some(t) = self.transcripts.iter_mut().find(|t| t.label == label) else {
+            return;
+        };
+        match (t.log.last_mut(), entry) {
+            (Some(Entry::Assistant(s)), Entry::Assistant(delta)) => s.push_str(&delta),
+            (_, e) => t.log.push(e),
+        }
+    }
+
+    fn drop_transcripts(&mut self, ended: impl Fn(&Transcript) -> bool) {
+        self.transcripts.retain(|t| !ended(t));
+        if let Some(v) = &self.view
+            && !self.transcripts.iter().any(|t| &t.label == v)
+        {
+            let msg = format!("agent {v} ended");
+            self.set_view(None);
+            self.notify(FlashKind::Info, msg);
+        }
+    }
+
+    /// The viewed transcript and its position among them, newest first.
+    pub fn viewed(&self) -> Option<(usize, &Transcript)> {
+        let v = self.view.as_ref()?;
+        let i = self.transcripts.iter().position(|t| &t.label == v)?;
+        Some((self.transcripts.len() - i, &self.transcripts[i]))
+    }
+
+    /// Steps through closed → newest subagent → … → oldest → closed.
+    fn cycle_view(&mut self) {
+        let n = self.transcripts.len();
+        let pos = self.viewed().map_or(0, |(pos, _)| pos);
+        let next = (pos + 1) % (n + 1);
+        let view = (next > 0).then(|| self.transcripts[n - next].label.clone());
+        self.set_view(view);
+    }
+
+    fn set_view(&mut self, view: Option<String>) {
+        // Opening or closing the pane rewraps the log, so a selection would point elsewhere.
+        if view.is_some() != self.view.is_some() {
+            self.selection = None;
+        }
+        self.view = view;
     }
 
     fn push_metrics(&mut self, mut stats: metrics::Request) {
@@ -939,6 +1033,7 @@ impl App {
     fn stop_background(&mut self) {
         self.background.cancel();
         self.background_runs.clear();
+        self.drop_transcripts(|t| t.background);
         self.approval.retain(|a| !a.background);
     }
 
@@ -1024,6 +1119,7 @@ impl App {
     fn interrupt(&mut self) {
         self.approval.retain(|a| a.background);
         self.log.retain(|e| e.agent().is_none());
+        self.drop_transcripts(|t| !t.background);
         if let Some(h) = self.running.take() {
             h.abort();
             // Invalidate events already queued by the aborted run.
@@ -1152,7 +1248,11 @@ impl App {
                 let msg = self.skills_status();
                 self.log.push(Entry::Info(msg));
             }
-            Command::Agents => {
+            Command::Agents if self.transcripts.is_empty() => self.log.push(Entry::Info(
+                "no running subagents; /agents list shows the defined ones".into(),
+            )),
+            Command::Agents => self.cycle_view(),
+            Command::AgentsList => {
                 let msg = self.agents_status();
                 self.log.push(Entry::Info(msg));
             }
@@ -1258,6 +1358,14 @@ impl App {
                 // Only a subagent's latest call is shown, with its error if it fails.
                 if let Some(a) = &agent {
                     self.log.retain(|e| e.agent() != Some(a));
+                    self.record(
+                        a,
+                        Entry::Tool {
+                            name: name.clone(),
+                            arguments: arguments.clone(),
+                            agent: None,
+                        },
+                    );
                 }
                 self.push_log(Entry::Tool {
                     name,
@@ -1276,8 +1384,19 @@ impl App {
                     None => Phase::Waiting,
                 });
                 // A result of the main agent's call: any subagents it ran are done.
-                if agent.is_none() {
-                    self.log.retain(|e| e.agent().is_none());
+                match &agent {
+                    None => {
+                        self.log.retain(|e| e.agent().is_none());
+                        self.drop_transcripts(|t| !t.background);
+                    }
+                    Some(a) => self.record(
+                        a,
+                        Entry::ToolOutput {
+                            text: output.clone(),
+                            is_error,
+                            agent: None,
+                        },
+                    ),
                 }
                 if is_error {
                     self.push_log(Entry::ToolOutput {
@@ -1318,9 +1437,16 @@ impl App {
                 agent,
                 reply,
             } => self.ask(name, arguments, agent, reply, false),
+            AgentEvent::SubagentStarted { agent, task } => self.transcripts.push(Transcript {
+                label: agent,
+                log: vec![Entry::User(task)],
+                background: false,
+            }),
+            AgentEvent::SubagentText { agent, text } => self.record(&agent, Entry::Assistant(text)),
             AgentEvent::Error(e) => self.push_log(Entry::Error(e)),
             AgentEvent::Finished => {
                 self.running = None;
+                self.drop_transcripts(|t| !t.background);
                 // Queued messages and notices wait for the compaction's own `Finished`.
                 if !std::mem::take(&mut self.compacting)
                     && let Some(fill) = self.auto_compact_due()
@@ -1505,6 +1631,10 @@ impl App {
             .collect();
         if blocks.is_empty() {
             blocks.push("agents: none".into());
+        }
+        if !self.transcripts.is_empty() {
+            let running: Vec<&str> = self.transcripts.iter().map(|t| t.label.as_str()).collect();
+            blocks.insert(0, format!("running: {}", running.join(", ")));
         }
         let mut out = blocks.join("\n\n");
         for w in &self.agents.warnings {
