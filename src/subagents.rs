@@ -27,8 +27,7 @@ pub struct Subagent {
     pub target: Option<Target>,
     pub think: Option<String>,
     pub extra: Option<Value>,
-    /// `None` for built-ins.
-    pub path: Option<PathBuf>,
+    pub path: PathBuf,
 }
 
 pub struct Target {
@@ -58,32 +57,6 @@ pub struct DirContext {
 
 const DESCRIPTION_MAX: usize = 300;
 
-const EXPLORE_DESCRIPTION: &str = "Read-only codebase search: finds where something is defined, \
-     used or handled and explains how the pieces fit together. Give it a specific question; it \
-     returns paths, symbols and a short summary instead of whole files.";
-const EXPLORE_PROMPT: &str = "You explore a codebase to answer the question in the task. Search \
-     and read with the tools, then reply with what you found: the relevant paths and symbols and a \
-     short explanation of how they fit together, quoting code verbatim only where it matters. Do \
-     not paste whole files. If you could not find something, say so and list where you looked.";
-
-fn explore() -> Subagent {
-    Subagent {
-        name: "explore".into(),
-        description: EXPLORE_DESCRIPTION.into(),
-        prompt: EXPLORE_PROMPT.into(),
-        tools: Some(
-            ["read_file", "read_symbol", "list_dir", "grep"]
-                .map(String::from)
-                .to_vec(),
-        ),
-        model: None,
-        target: None,
-        think: None,
-        extra: None,
-        path: None,
-    }
-}
-
 impl Subagents {
     /// `resolve` turns a configured `provider/model` into a target.
     pub fn discover(
@@ -102,7 +75,7 @@ impl Subagents {
         Self::discover_in(&dirs, cfg, resolve)
     }
 
-    /// Earlier dirs win on a name clash; built-ins come last.
+    /// Earlier dirs win on a name clash.
     fn discover_in(
         dirs: &[PathBuf],
         cfg: &BTreeMap<String, AgentConfig>,
@@ -126,18 +99,13 @@ impl Subagents {
                 }
             }
         }
-        found.push(explore());
         for mut a in found {
             if let Some(first) = agents.get(&a.name) {
-                let place = |p: &Option<PathBuf>| match p {
-                    Some(p) => p.display().to_string(),
-                    None => "built-in".into(),
-                };
                 agents.warnings.push(format!(
                     "agent `{}` in {} is shadowed by {}",
                     a.name,
-                    place(&a.path),
-                    place(&first.path)
+                    a.path.display(),
+                    first.path.display()
                 ));
                 continue;
             }
@@ -310,7 +278,7 @@ fn load(path: &Path) -> Result<Subagent> {
         target: None,
         think: None,
         extra: None,
-        path: Some(path.to_path_buf()),
+        path: path.to_path_buf(),
     })
 }
 
@@ -319,7 +287,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn files_shadow_builtins_and_config_applies() {
+    fn earlier_dirs_shadow_later_and_config_applies() {
         let dir = std::env::temp_dir().join(format!("xarness-agents-{}", std::process::id()));
         let (a, b) = (dir.join("a"), dir.join("b"));
         fs::create_dir_all(&a).unwrap();
@@ -350,7 +318,7 @@ mod tests {
         assert_eq!(review.model.as_deref(), Some("p/m"));
         assert!(review.allows("grep") && !review.allows("run"));
         assert!(review.target.is_none());
-        // The second `review` is shadowed and `p/m` is unknown; disabled `explore`s are skipped.
+        // The second `review` is shadowed and `p/m` is unknown; disabled `explore` is skipped.
         assert_eq!(agents.warnings.len(), 2);
     }
 }

@@ -1477,16 +1477,14 @@ impl App {
             .list
             .iter()
             .map(|a| {
-                let place = match &a.path {
-                    None => "built-in".into(),
-                    Some(p) => match (
-                        p.strip_prefix(root),
-                        home.as_ref().map(|h| p.strip_prefix(h)),
-                    ) {
-                        (Ok(rel), _) => rel.display().to_string(),
-                        (_, Some(Ok(rel))) => format!("~/{}", rel.display()),
-                        _ => p.display().to_string(),
-                    },
+                let p = &a.path;
+                let place = match (
+                    p.strip_prefix(root),
+                    home.as_ref().map(|h| p.strip_prefix(h)),
+                ) {
+                    (Ok(rel), _) => rel.display().to_string(),
+                    (_, Some(Ok(rel))) => format!("~/{}", rel.display()),
+                    _ => p.display().to_string(),
                 };
                 let model = a.target.as_ref().map_or("caller's model", |t| &t.label);
                 let mut settings = vec![format!("model: {model}")];
