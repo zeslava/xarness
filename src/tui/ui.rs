@@ -542,7 +542,10 @@ fn log_text(log: &[Entry]) -> Text<'static> {
                 }
                 if total > TOOL_OUTPUT_PREVIEW {
                     lines.push(Line::styled(
-                        format!("{indent}{OUTPUT_BAR} … {} more lines", total - TOOL_OUTPUT_PREVIEW),
+                        format!(
+                            "{indent}{OUTPUT_BAR} … {} more lines",
+                            total - TOOL_OUTPUT_PREVIEW
+                        ),
                         style,
                     ));
                 }
