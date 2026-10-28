@@ -382,7 +382,8 @@ async fn drive(r: &mut Run, sink: &Sink) -> anyhow::Result<Outcome> {
             reasoning,
             tool_calls: calls.clone(),
         }];
-        for (c, (output, is_error)) in calls.iter().zip(run_calls(r, &calls, sink).await) {
+        let cap = output_cap(context_window);
+        for (c, (output, is_error)) in calls.iter().zip(run_calls(r, &calls, cap, sink).await) {
             stats.tools.push(metrics::ToolRun {
                 name: c.name.clone(),
                 error: is_error,
@@ -428,7 +429,7 @@ fn call_groups(calls: &[ToolCall], parallel: bool) -> Vec<Range<usize>> {
 }
 
 /// Outputs of `calls`, in order.
-async fn run_calls(r: &Run, calls: &[ToolCall], sink: &Sink) -> Vec<(String, bool)> {
+async fn run_calls(r: &Run, calls: &[ToolCall], cap: usize, sink: &Sink) -> Vec<(String, bool)> {
     let start = |c: &ToolCall| {
         sink(AgentEvent::ToolStart {
             name: c.name.clone(),
@@ -449,7 +450,7 @@ async fn run_calls(r: &Run, calls: &[ToolCall], sink: &Sink) -> Vec<(String, boo
                 delegate(r, c, label, sink)
             });
             for result in join_all(runs).await {
-                out.push(finish(result, sink));
+                out.push(finish(result, cap, sink));
             }
         } else {
             for (c, &repeat) in group.iter().zip(&repeats[range]) {
@@ -462,7 +463,7 @@ async fn run_calls(r: &Run, calls: &[ToolCall], sink: &Sink) -> Vec<(String, boo
                 } else {
                     call_tool(r, c, sink).await
                 };
-                out.push(finish(result, sink));
+                out.push(finish(result, cap, sink));
             }
         }
     }
@@ -505,12 +506,12 @@ fn same_args(a: &str, b: &str) -> bool {
         )
 }
 
-fn finish(result: anyhow::Result<String>, sink: &Sink) -> (String, bool) {
+fn finish(result: anyhow::Result<String>, cap: usize, sink: &Sink) -> (String, bool) {
     let (output, is_error) = match result {
         Ok(out) => (out, false),
         Err(e) => (format!("error: {e:#}"), true),
     };
-    let output = cap_output(output);
+    let output = cap_output(output, cap);
     sink(AgentEvent::ToolResult {
         output: output.clone(),
         is_error,
@@ -1228,13 +1229,24 @@ fn skill_calls(history: &[Message]) -> HashSet<&str> {
 
 /// Backstop for tools that return more than their own limits should allow.
 const MAX_TOOL_OUTPUT: usize = 16_000;
+/// With a small context window one output may take at most this fraction of it, so a single
+/// read does not crowd out the rest of the turn.
+const OUTPUT_WINDOW_SHARE: f64 = 0.15;
+const MIN_TOOL_OUTPUT: usize = 4_000;
 
-fn cap_output(mut s: String) -> String {
-    if s.len() <= MAX_TOOL_OUTPUT {
+fn output_cap(context_window: Option<u32>) -> usize {
+    context_window.map_or(MAX_TOOL_OUTPUT, |w| {
+        ((w as f64 * OUTPUT_WINDOW_SHARE) as usize * CHARS_PER_TOKEN)
+            .clamp(MIN_TOOL_OUTPUT, MAX_TOOL_OUTPUT)
+    })
+}
+
+fn cap_output(mut s: String, cap: usize) -> String {
+    if s.len() <= cap {
         return s;
     }
     let total = s.len();
-    let mut keep = MAX_TOOL_OUTPUT;
+    let mut keep = cap;
     while !s.is_char_boundary(keep) {
         keep -= 1;
     }
@@ -1474,5 +1486,13 @@ mod tests {
         let elided = arguments(&history);
         assert_eq!(elided["path"], "src/a.rs");
         assert_eq!(elided["old_string"], ELIDED_ARG);
+    }
+
+    #[test]
+    fn output_cap_scales_with_window() {
+        assert_eq!(output_cap(None), MAX_TOOL_OUTPUT);
+        assert_eq!(output_cap(Some(8192)), MIN_TOOL_OUTPUT);
+        assert_eq!(output_cap(Some(32768)), 14_745);
+        assert_eq!(output_cap(Some(131072)), MAX_TOOL_OUTPUT);
     }
 }
