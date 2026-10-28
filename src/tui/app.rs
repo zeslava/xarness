@@ -278,6 +278,8 @@ pub struct App {
     /// Set by the first Ctrl+C; the next key either quits (Ctrl+C) or disarms it.
     pub quit_armed: bool,
     pub quit: bool,
+    /// Working directory and git branch; refreshed after each run, which may switch branches.
+    pub location: String,
 }
 
 impl App {
@@ -311,6 +313,7 @@ impl App {
         });
         agents.parallel = config.agents_parallel;
         let mut app = Self {
+            location: super::location::location(tools.root()),
             think: active.as_ref().and_then(|a| default_think(&a.model)),
             active,
             config,
@@ -1281,7 +1284,18 @@ impl App {
                 self.log.push(Entry::Info(msg));
             }
             Command::Stats => {
-                let msg = metrics::summary(&self.metrics);
+                let mut msg = metrics::summary(&self.metrics);
+                if let Some(u) = &self.usage {
+                    let mut ctx = format!("context: {}", metrics::k(u.used as usize));
+                    if let Some(w) = u.window.filter(|&w| w > 0) {
+                        let pct = u.used as u64 * 100 / w as u64;
+                        ctx += &format!(" / {} ({pct}%)", metrics::k(w as usize));
+                    }
+                    if let Some(c) = u.cached {
+                        ctx += &format!(", cached {}", metrics::k(c as usize));
+                    }
+                    msg = format!("{ctx}\n{msg}");
+                }
                 self.log.push(Entry::Info(msg));
             }
             Command::Resume(Some(arg)) => {
@@ -1446,6 +1460,7 @@ impl App {
             AgentEvent::Error(e) => self.push_log(Entry::Error(e)),
             AgentEvent::Finished => {
                 self.running = None;
+                self.location = super::location::location(self.tools.root());
                 self.drop_transcripts(|t| !t.background);
                 // Queued messages and notices wait for the compaction's own `Finished`.
                 if !std::mem::take(&mut self.compacting)

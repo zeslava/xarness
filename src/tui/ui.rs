@@ -71,8 +71,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     // A pending approval has the panel as its indicator.
     let live = app.is_running() && app.approval().is_none();
+    // Flashes share the indicator row; `copy` is about to add one.
+    let indicator = live || app.flash().is_some() || app.copy;
     let mut text = log_text(&app.log);
-    if live {
+    if indicator {
         // Room for the indicator, so at the bottom it doesn't cover the last line.
         text.lines.push(Line::default());
     }
@@ -106,15 +108,39 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if let Some(sel) = app.selection {
         highlight(f.buffer_mut(), log_area, offset, sel);
     }
-    if live {
+    if indicator {
         // Follows the text while it fits, then stays pinned to the bottom, scrolled or not.
         let row = Rect {
             y: log_area.y + total.min(log_area.height).saturating_sub(1),
             height: 1,
             ..log_area
         };
-        f.render_widget(Clear, row);
-        f.render_widget(live_line(app), row);
+        if live {
+            f.render_widget(Clear, row);
+            f.render_widget(live_line(app), row);
+        }
+        if let Some(flash) = app.flash() {
+            let color = match flash.kind {
+                FlashKind::Info => Color::DarkGray,
+                FlashKind::Ok => Color::Green,
+                FlashKind::Error => Color::LightRed,
+            };
+            let line = Line::from(Span::styled(
+                format!("{} ", flash.text),
+                Style::new().fg(color),
+            ));
+            // Right above the input even while the log is short; cleared under the text only,
+            // as a scrolled log fills that row.
+            let w = (line.width() as u16).min(log_area.width);
+            let row = Rect {
+                x: log_area.right() - w,
+                y: log_area.bottom().saturating_sub(1),
+                width: w,
+                height: 1,
+            };
+            f.render_widget(Clear, row);
+            f.render_widget(line, row);
+        }
     }
     let skip = (keep as u16 + 1).saturating_sub(panel_area.height);
     f.render_widget(Paragraph::new(panel).scroll((skip, 0)), panel_area);
@@ -153,18 +179,16 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         input_area.x + cursor_col as u16,
         input_area.y + 1 + (cur_row - first) as u16,
     ));
-    f.render_widget(status_line(app), status_area);
-    if let Some(flash) = app.flash() {
-        let color = match flash.kind {
-            FlashKind::Info => Color::DarkGray,
-            FlashKind::Ok => Color::Green,
-            FlashKind::Error => Color::LightRed,
-        };
-        let line = Line::from(Span::styled(
-            format!("{} ", flash.text),
-            Style::new().fg(color),
-        ));
-        f.render_widget(line.right_aligned(), status_area);
+    let status = status_line(app);
+    let used = status.width();
+    f.render_widget(status, status_area);
+    let location = Line::styled(
+        format!("{} ", app.location),
+        Style::new().fg(Color::DarkGray),
+    );
+    // Hidden when it would overlap the status.
+    if used + location.width() < status_area.width as usize {
+        f.render_widget(location.right_aligned(), status_area);
     }
 }
 
@@ -421,20 +445,19 @@ fn status_line(app: &App) -> Line<'static> {
         ));
     }
     if let Some(u) = &app.usage {
-        let mut s = format!("· ctx {}", kilo(u.used));
-        let mut fg = Color::DarkGray;
-        if let Some(w) = u.window.filter(|&w| w > 0) {
-            let pct = u.used as u64 * 100 / w as u64;
-            s += &format!("/{} {pct}%", kilo(w));
-            fg = match pct {
-                0..50 => Color::DarkGray,
-                50..75 => Color::Gray,
-                _ => Color::LightRed,
-            };
-        }
-        if let Some(c) = u.cached {
-            s += &format!(" · cache {}", kilo(c));
-        }
+        // Details are in `/stats`.
+        let (s, fg) = match u.window.filter(|&w| w > 0) {
+            Some(w) => {
+                let pct = u.used as u64 * 100 / w as u64;
+                let fg = match pct {
+                    0..50 => Color::DarkGray,
+                    50..75 => Color::Gray,
+                    _ => Color::LightRed,
+                };
+                (format!("· ctx {pct}%"), fg)
+            }
+            None => (format!("· ctx {}", kilo(u.used)), Color::DarkGray),
+        };
         spans.push(Span::styled(s, Style::new().fg(fg)));
     }
     if !app.always.is_empty() {

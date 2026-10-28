@@ -175,7 +175,7 @@ fn percent(part: u64, total: u64) -> u64 {
     (part * 100).checked_div(total).unwrap_or(0)
 }
 
-fn k(n: usize) -> String {
+pub fn k(n: usize) -> String {
     if n < 1000 {
         n.to_string()
     } else {

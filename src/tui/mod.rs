@@ -1,6 +1,7 @@
 mod app;
 mod clipboard;
 mod commands;
+mod location;
 mod markdown;
 mod ui;
 
