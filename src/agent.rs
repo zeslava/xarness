@@ -539,7 +539,7 @@ async fn call_tool(r: &Run, c: &ToolCall, sink: &Sink) -> anyhow::Result<String>
     {
         bail!("subagents cannot start background jobs; run the command without `background`");
     }
-    let answer = if r.tools.needs_approval(&c.name, &c.arguments) {
+    let answer = if r.tools.needs_approval(r.mode, &c.name, &c.arguments) {
         let (reply, answer) = oneshot::channel();
         sink(AgentEvent::Approve {
             name: c.name.clone(),
@@ -1266,7 +1266,8 @@ fn system_prompt(
     };
     let mut prompt = format!(
         "You are a coding agent working in `{cwd}`. All paths are relative to it; read-only tools \
-         also accept paths under the home directory (`~/…`), e.g. dependency sources.\n{task}\n\
+         also accept paths outside it (`~/…` or absolute), e.g. dependency sources, after the \
+         user approves.\n{task}\n\
          Do exactly what the user asked — nothing more. If you have ideas, improvements or noticed \
          other problems, mention them briefly at the end and ask whether to act on them; do not act \
          on them yourself. If the user asks a question, answer it without changing anything.\n\

@@ -98,8 +98,8 @@ impl ToolRegistry {
         let mcp = self.mcp.read().unwrap_or_else(PoisonError::into_inner);
         self.tools
             .iter()
-            .chain(mcp.iter())
             .filter(|t| mode == Mode::Build || !t.mutating())
+            .chain(mcp.iter())
             .filter(|t| allow.is_none_or(|a| a.contains(&t.spec().name)))
             .cloned()
             .collect()
@@ -125,12 +125,13 @@ impl ToolRegistry {
     }
 
     /// Besides tools that always ask, a read-only tool asks when its `path` leaves the working
-    /// directory (`resolve_read` lets it into the home directory).
-    pub fn needs_approval(&self, name: &str, arguments: &str) -> bool {
+    /// directory, and a mutating tool asks in Plan mode (only MCP tools are offered there).
+    pub fn needs_approval(&self, mode: Mode, name: &str, arguments: &str) -> bool {
         let Some(tool) = self.find(Mode::Build, None, name) else {
             return false;
         };
         tool.needs_approval()
+            || (mode == Mode::Plan && tool.mutating())
             || (PATH_READERS.contains(&name)
                 && serde_json::from_str::<Value>(arguments)
                     .ok()
@@ -176,15 +177,11 @@ pub(crate) fn resolve(root: &Path, path: &str) -> Result<PathBuf> {
     Ok(out)
 }
 
-/// For read-only tools: the home directory is readable too, e.g. dependency sources in
-/// `~/.cargo/registry` or `~/go/pkg/mod`. Writes stay inside the working directory.
+/// For read-only tools: any path is readable, e.g. dependency sources in `~/.cargo/registry` or
+/// `~/go/pkg/mod`; outside the working directory the call waits for approval
+/// (`ToolRegistry::needs_approval`). Writes stay inside the working directory.
 pub(crate) fn resolve_read(root: &Path, path: &str) -> Result<PathBuf> {
-    let out = lexical(root, path);
-    let home = dirs::home_dir();
-    if !out.starts_with(root) && !home.is_some_and(|h| out.starts_with(h)) {
-        bail!("path `{path}` is outside the working directory and the home directory");
-    }
-    Ok(out)
+    Ok(lexical(root, path))
 }
 
 /// Relative paths start at `root`; a leading `~` is the home directory.
