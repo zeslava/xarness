@@ -342,6 +342,12 @@ async fn drive(r: &mut Run, sink: &Sink) -> anyhow::Result<Outcome> {
                         });
                     }
                 }
+                Ok(LlmEvent::Retry { reason, delay }) => {
+                    text.clear();
+                    reasoning.clear();
+                    stats.first_token_ms = None;
+                    sink(AgentEvent::Error(retry_notice(&reason, delay)));
+                }
                 Err(e) => {
                     if let Some(o) = e.downcast_ref::<ContextOverflow>()
                         && !retried
@@ -864,6 +870,11 @@ pub async fn compact(
                 stats.completion_tokens = completion_tokens;
                 stats.cached_tokens = cached_tokens;
             }
+            Ok(LlmEvent::Retry { reason, delay }) => {
+                summary.clear();
+                stats.first_token_ms = None;
+                send(AgentEvent::Error(retry_notice(&reason, delay)));
+            }
             Err(e) => {
                 send(AgentEvent::Error(format!("compaction failed: {e:#}")));
                 send(AgentEvent::Finished);
@@ -888,6 +899,10 @@ pub async fn compact(
         ]));
     }
     send(AgentEvent::Finished);
+}
+
+fn retry_notice(reason: &str, delay: std::time::Duration) -> String {
+    format!("{reason}; retrying in {}s", delay.as_secs())
 }
 
 const DEFAULT_OUTPUT_RESERVE: u32 = 2048;

@@ -64,11 +64,58 @@ impl LlmProvider for OpenAiProvider {
     }
 }
 
+/// Delays in seconds before each retry of a transient failure.
+const RETRY_DELAYS: [u64; 5] = [5, 10, 20, 30, 50];
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// A failure worth another try: rate limits, 5xx, network errors, a connection lost mid-stream.
+#[derive(Debug)]
+struct Transient {
+    reason: String,
+    retry_after: Option<Duration>,
+}
+
+impl std::fmt::Display for Transient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for Transient {}
+
 async fn pump(
     http: reqwest::RequestBuilder,
     tx: &mut mpsc::Sender<Result<LlmEvent>>,
 ) -> Result<()> {
-    let resp = send_with_retry(http, tx).await?;
+    let mut delays = RETRY_DELAYS.iter();
+    loop {
+        let Err(e) = stream_once(&http, tx).await else {
+            return Ok(());
+        };
+        let (Some(t), Some(&secs)) = (e.downcast_ref::<Transient>(), delays.next()) else {
+            return Err(e);
+        };
+        let delay = t
+            .retry_after
+            .map_or(Duration::from_secs(secs), |d| d.min(MAX_RETRY_AFTER));
+        tx.send(Ok(LlmEvent::Retry {
+            reason: t.reason.clone(),
+            delay,
+        }))
+        .await?;
+        tokio::time::sleep(delay).await;
+        // The run was aborted while we waited.
+        if tx.is_closed() {
+            bail!("aborted");
+        }
+    }
+}
+
+async fn stream_once(
+    http: &reqwest::RequestBuilder,
+    tx: &mut mpsc::Sender<Result<LlmEvent>>,
+) -> Result<()> {
+    let resp = send(http).await?;
     let mut bytes = resp.bytes_stream();
     let mut buf = String::new();
     let mut acc = DeltaAccumulator::default();
@@ -84,7 +131,11 @@ async fn pump(
         let _ = writeln!(f, "=== response");
     }
     while let Some(chunk) = bytes.next().await {
-        buf.push_str(&String::from_utf8_lossy(&chunk?));
+        let chunk = chunk.map_err(|e| Transient {
+            reason: format!("connection lost: {:#}", anyhow!(e)),
+            retry_after: None,
+        })?;
+        buf.push_str(&String::from_utf8_lossy(&chunk));
         while let Some(nl) = buf.find('\n') {
             let line: String = buf.drain(..=nl).collect();
             if let Some(f) = &mut dump {
@@ -132,57 +183,49 @@ async fn pump(
     finish(acc, tx).await
 }
 
-const MAX_RETRIES: u32 = 5;
-const MAX_BACKOFF: Duration = Duration::from_secs(60);
-
-/// Retries rate-limit errors (429 or a "too many tokens" body) and connect errors,
-/// honoring `Retry-After` (seconds) or falling back to exponential backoff.
-async fn send_with_retry(
-    http: reqwest::RequestBuilder,
-    tx: &mpsc::Sender<Result<LlmEvent>>,
-) -> Result<reqwest::Response> {
-    let mut attempt = 0;
-    loop {
-        let req = http
-            .try_clone()
-            .ok_or_else(|| anyhow!("request body is not cloneable"))?;
-        let retry_after = match req.send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                if status.is_success() {
-                    return Ok(resp);
-                }
-                let retry_after = resp
-                    .headers()
-                    .get(RETRY_AFTER)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.trim().parse::<u64>().ok())
-                    .map(Duration::from_secs);
-                let body = resp.text().await.unwrap_or_default();
-                if let Some(e) = context_overflow(&body) {
-                    return Err(e.into());
-                }
-                let rate_limited = status == StatusCode::TOO_MANY_REQUESTS
-                    || body.to_lowercase().contains("too many tokens");
-                if !rate_limited || attempt >= MAX_RETRIES {
-                    bail!("HTTP {status}: {body}");
-                }
-                retry_after
+/// Fails with `Transient` on rate limits (429 or a "too many tokens" body), 5xx and network
+/// errors, carrying `Retry-After` (seconds) if the server sent it.
+async fn send(http: &reqwest::RequestBuilder) -> Result<reqwest::Response> {
+    let req = http
+        .try_clone()
+        .ok_or_else(|| anyhow!("request body is not cloneable"))?;
+    let resp = match req.send().await {
+        Ok(resp) => resp,
+        Err(e) if !e.is_builder() => {
+            return Err(Transient {
+                reason: format!("{:#}", anyhow!(e)),
+                retry_after: None,
             }
-            // Transient socket failures, e.g. EADDRNOTAVAIL when ephemeral ports run out.
-            Err(e) if e.is_connect() && attempt < MAX_RETRIES => None,
-            Err(e) => return Err(e.into()),
-        };
-        let delay = retry_after
-            .unwrap_or(Duration::from_secs(1 << attempt))
-            .min(MAX_BACKOFF);
-        tokio::time::sleep(delay).await;
-        // The run was aborted while we waited.
-        if tx.is_closed() {
-            bail!("aborted");
+            .into());
         }
-        attempt += 1;
+        Err(e) => return Err(e.into()),
+    };
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp);
     }
+    let retry_after = resp
+        .headers()
+        .get(RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_secs);
+    let body = resp.text().await.unwrap_or_default();
+    if let Some(e) = context_overflow(&body) {
+        return Err(e.into());
+    }
+    let reason = format!("HTTP {status}: {body}");
+    if status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+        || body.to_lowercase().contains("too many tokens")
+    {
+        return Err(Transient {
+            reason,
+            retry_after,
+        }
+        .into());
+    }
+    bail!(reason)
 }
 
 async fn finish(mut acc: DeltaAccumulator, tx: &mut mpsc::Sender<Result<LlmEvent>>) -> Result<()> {

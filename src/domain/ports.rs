@@ -37,6 +37,12 @@ pub enum LlmEvent {
         /// Output stopped at the max_tokens limit rather than naturally.
         truncated: bool,
     },
+    /// The request failed transiently and is sent again after `delay`; anything streamed so far
+    /// is void, a fresh response follows.
+    Retry {
+        reason: String,
+        delay: std::time::Duration,
+    },
 }
 
 /// Returned (via `anyhow`) when the server rejects a prompt as too large.
