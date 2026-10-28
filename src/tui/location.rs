@@ -1,6 +1,7 @@
 use std::path::Path;
 
-/// `root` shortened to `~/…` under home, plus the git branch if it is inside a repository.
+/// `root` shortened to `~/…` under home, plus the git branch if it is inside a repository,
+/// marked `*` with uncommitted changes (untracked files included) and `✓` without.
 pub fn location(root: &Path) -> String {
     let home = dirs::home_dir();
     let path = match home.as_deref().and_then(|h| root.strip_prefix(h).ok()) {
@@ -9,7 +10,11 @@ pub fn location(root: &Path) -> String {
         None => root.display().to_string(),
     };
     match branch(root) {
-        Some(b) => format!("{path} · {b}"),
+        Some(b) => match dirty(root) {
+            Some(true) => format!("{path} · {b} *"),
+            Some(false) => format!("{path} · {b} ✓"),
+            None => format!("{path} · {b}"),
+        },
         None => path,
     }
 }
@@ -33,4 +38,16 @@ fn branch(root: &Path) -> Option<String> {
         Some(r) => r.strip_prefix("refs/heads/").unwrap_or(r).to_string(),
         None => head.get(..7)?.to_string(),
     })
+}
+
+/// `None` if git is not installed or fails.
+fn dirty(root: &Path) -> Option<bool> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    out.status.success().then(|| !out.stdout.is_empty())
 }
