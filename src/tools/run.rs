@@ -30,13 +30,16 @@ struct Args {
 const TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_LINES: usize = 60;
 const OK_TAIL_LINES: usize = 10;
+/// Successful output up to this size is kept whole whatever its line count: a diff or a log is
+/// read for its content, while build noise worth cutting is usually longer.
+const OK_WHOLE_BYTES: usize = 16_000;
 const MAX_LINE_CHARS: usize = 300;
 
 impl Tool for RunCommand {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "run".into(),
-            description: "Run a shell command in the working directory, e.g. the build, test or lint commands from the project instructions. Run it after editing code to check your changes. Output is condensed: on failure the error lines (at most 60), on success the last lines. Times out after 120s. Set `background` for dev servers, watchers, or long builds and tests: it returns at once, and the result arrives as a message when the command exits.".into(),
+            description: "Run a shell command in the working directory, e.g. the build, test or lint commands from the project instructions. Run it after editing code to check your changes. Output is condensed: on failure the error lines (at most 60), on success output up to 16 KB whole and the last lines of longer output. Times out after 120s. Set `background` for dev servers, watchers, or long builds and tests: it returns at once, and the result arrives as a message when the command exits.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -94,7 +97,7 @@ impl RunCommand {
         let bytes = output.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let text = String::from_utf8_lossy(&bytes);
         match status {
-            Some(s) if s.success() => Ok(format!("ok\n{}", tail(&text, OK_TAIL_LINES))),
+            Some(s) if s.success() => Ok(format!("ok\n{}", success_output(&text))),
             Some(s) => bail!(
                 "exit {}\n{}",
                 s.code().map_or("signal".into(), |c| c.to_string()),
@@ -147,6 +150,21 @@ pub(super) fn collect(
         })
     };
     (output, reader)
+}
+
+/// Short output is kept whole, blank lines included (a diff or file listing needs them); long
+/// output, usually build noise, is cut to its tail with a marker so the model knows to narrow it.
+fn success_output(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= MAX_LINES || text.len() <= OK_WHOLE_BYTES {
+        return clipped(&lines);
+    }
+    format!(
+        "{}[showing last {OK_TAIL_LINES} of {} lines; to read it all, redirect the command to a \
+         file and read that with read_file in parts]",
+        tail(text, OK_TAIL_LINES),
+        lines.len()
+    )
 }
 
 pub(super) fn tail(text: &str, n: usize) -> String {

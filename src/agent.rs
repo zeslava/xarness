@@ -66,6 +66,11 @@ pub enum AgentEvent {
         agent: String,
         text: String,
     },
+    /// A failed request is sent again after `delay`; shown while it waits, not logged.
+    Retrying {
+        reason: String,
+        delay: std::time::Duration,
+    },
     Error(String),
     Finished,
 }
@@ -178,6 +183,21 @@ const MAX_SUBAGENT_STEPS: usize = 40;
 const WRAP_UP: &str = "You have used up your tool calls. Do not call any more tools: report now \
                        what you have found so far, and say what is still unverified.";
 
+const CONTEXT_FULL: &str = "The context window is full: most of what you read in this turn has \
+                            been cut, and re-reading it would only cut more. Do not call any more \
+                            tools: answer now with what you have found so far, and say what is \
+                            still unverified.";
+
+/// Result of a call made after the wrap-up note. Weak models ignore the note, and with the tools
+/// left out of the request they write the call as plain text instead, which ends the turn with it.
+const REFUSED: &str = "Not run: no more tool calls are allowed. Answer now with what you have \
+                       found so far.";
+
+/// Start of the answer put in the model's mouth when it calls tools again after the refusal.
+/// `tool_choice: "none"` alone only makes it write the call as text; continuing this, it answers.
+/// llama.cpp echoes it in the response.
+const PREFILL: &str = "No more tool calls; here is what I found so far.\n\n";
+
 /// Times in a row a subagent's cut-off response is discarded and requested again.
 const MAX_CUT_OFFS: usize = 2;
 
@@ -216,6 +236,8 @@ async fn drive(r: &mut Run, sink: &Sink) -> anyhow::Result<Outcome> {
     let mut retried = false;
     let mut steps = 0;
     let mut cut_offs = 0;
+    let mut refused = false;
+    let mut forced = false;
     'turn: loop {
         let system = system_prompt(
             r.mode,
@@ -225,14 +247,15 @@ async fn drive(r: &mut Run, sink: &Sink) -> anyhow::Result<Outcome> {
             r.repo_map.as_deref(),
             r.sub.as_deref(),
         );
-        // Rather than lose all a subagent found, its last request asks for a report.
-        let wrap_up = r.sub.is_some() && steps >= MAX_SUBAGENT_STEPS;
-        let mut tools = if wrap_up {
-            Vec::new()
-        } else {
-            r.tools
-                .specs(r.mode, r.sub.as_ref().and_then(|s| s.tools.as_deref()))
-        };
+        // Rather than lose all a subagent found, its last request asks for a report. The same
+        // goes for a turn that no longer fits: its outputs get cut, the model re-reads them,
+        // which cuts more, until the window is exhausted with nothing to show. The tools stay in
+        // the request, so its prefix (and the server's KV cache) is unchanged; calls are refused.
+        let starved = context_window.and_then(|_| starved(&r.history, &r.cut));
+        let wrap_up = starved.is_some() || r.sub.is_some() && steps >= MAX_SUBAGENT_STEPS;
+        let mut tools = r
+            .tools
+            .specs(r.mode, r.sub.as_ref().and_then(|s| s.tools.as_deref()));
         if r.sub.is_none() {
             tools.extend(r.agents.spec());
         }
@@ -283,12 +306,32 @@ async fn drive(r: &mut Run, sink: &Sink) -> anyhow::Result<Outcome> {
         let mut messages = vec![Message::System(system)];
         messages.extend(history);
         // One message: some chat templates reject two user messages in a row.
-        let notes: Vec<&str> = [(cut_offs > 0, CUT_OFF), (wrap_up, WRAP_UP)]
+        let wrap_up_note = match &starved {
+            Some(cuts) => format!(
+                "{CONTEXT_FULL}\n\nThese outputs were cut, so what they held is unverified \
+                 unless another output showed it:\n{cuts}"
+            ),
+            None => WRAP_UP.to_string(),
+        };
+        let notes: Vec<&str> = [(cut_offs > 0, CUT_OFF), (wrap_up, wrap_up_note.as_str())]
             .into_iter()
             .filter_map(|(on, s)| on.then_some(s))
             .collect();
         if !notes.is_empty() {
             messages.push(Message::User(notes.join("\n\n")));
+        }
+        let mut extra = r.extra.clone();
+        if forced {
+            messages.push(Message::Assistant {
+                content: PREFILL.to_string(),
+                reasoning: String::new(),
+                tool_calls: Vec::new(),
+            });
+            let none = serde_json::json!({ "tool_choice": "none" });
+            match &mut extra {
+                Some(x) => merge(x, none),
+                None => extra = Some(none),
+            }
         }
         let req = ChatRequest {
             model: r.model.id.clone(),
@@ -296,7 +339,7 @@ async fn drive(r: &mut Run, sink: &Sink) -> anyhow::Result<Outcome> {
             temperature: r.model.temperature,
             messages,
             tools,
-            extra: r.extra.clone(),
+            extra,
         };
 
         let started = Instant::now();
@@ -328,7 +371,7 @@ async fn drive(r: &mut Run, sink: &Sink) -> anyhow::Result<Outcome> {
                     truncated: t,
                 }) => {
                     // A cut-off tool call likely has incomplete arguments; don't run it.
-                    calls = if t || wrap_up { Vec::new() } else { tool_calls };
+                    calls = if t { Vec::new() } else { tool_calls };
                     truncated = t;
                     stats.prompt_tokens = prompt_tokens;
                     stats.completion_tokens = completion_tokens;
@@ -346,7 +389,7 @@ async fn drive(r: &mut Run, sink: &Sink) -> anyhow::Result<Outcome> {
                     text.clear();
                     reasoning.clear();
                     stats.first_token_ms = None;
-                    sink(AgentEvent::Error(retry_notice(&reason, delay)));
+                    sink(AgentEvent::Retrying { reason, delay });
                 }
                 Err(e) => {
                     if let Some(o) = e.downcast_ref::<ContextOverflow>()
@@ -375,6 +418,20 @@ async fn drive(r: &mut Run, sink: &Sink) -> anyhow::Result<Outcome> {
             continue;
         }
         cut_offs = 0;
+        // Calls are refused once; made again, the response is dropped (the request is repeated on
+        // the same prefix) and the answer is begun for the model. If it still calls tools, they
+        // are dropped and the turn ends with the text.
+        if wrap_up && refused && !calls.is_empty() {
+            if !forced {
+                forced = true;
+                sink(AgentEvent::Metrics(stats));
+                continue;
+            }
+            calls.clear();
+            sink(AgentEvent::Error(
+                "kept calling tools after being told to answer; turn ended".into(),
+            ));
+        }
         let tools_started = Instant::now();
         let final_text = calls.is_empty().then(|| text.clone());
         let mut batch = vec![Message::Assistant {
@@ -383,7 +440,13 @@ async fn drive(r: &mut Run, sink: &Sink) -> anyhow::Result<Outcome> {
             tool_calls: calls.clone(),
         }];
         let cap = output_cap(context_window);
-        for (c, (output, is_error)) in calls.iter().zip(run_calls(r, &calls, cap, sink).await) {
+        let outputs = if wrap_up {
+            refused = !calls.is_empty();
+            calls.iter().map(|_| (REFUSED.to_string(), true)).collect()
+        } else {
+            run_calls(r, &calls, cap, sink).await
+        };
+        for (c, (output, is_error)) in calls.iter().zip(outputs) {
             stats.tools.push(metrics::ToolRun {
                 name: c.name.clone(),
                 error: is_error,
@@ -455,15 +518,21 @@ async fn run_calls(r: &Run, calls: &[ToolCall], cap: usize, sink: &Sink) -> Vec<
         } else {
             for (c, &repeat) in group.iter().zip(&repeats[range]) {
                 start(c);
-                let result = if repeat {
-                    Err(anyhow!(
-                        "this exact call was already made in this turn and nothing has changed \
-                         since; use its result above instead of repeating it"
-                    ))
-                } else {
-                    call_tool(r, c, sink).await
-                };
-                out.push(finish(result, cap, sink));
+                // The refusal of a repeat is only for the model: the user gets an empty,
+                // non-error result, which ends the call without logging anything.
+                if repeat {
+                    sink(AgentEvent::ToolResult {
+                        output: String::new(),
+                        is_error: false,
+                        agent: None,
+                    });
+                    let output = "error: this exact call was already made in this turn and \
+                                  nothing has changed since; use its result above instead of \
+                                  repeating it";
+                    out.push((output.to_string(), true));
+                    continue;
+                }
+                out.push(finish(call_tool(r, c, sink).await, cap, sink));
             }
         }
     }
@@ -783,6 +852,10 @@ fn sub_sink(parent: &Sink, def: &Subagent, label: String, task: String) -> Sink 
             m.agent = Some(name.clone());
             parent(AgentEvent::Metrics(m))
         }
+        AgentEvent::Retrying { reason, delay } => parent(AgentEvent::Retrying {
+            reason: format!("{label}: {reason}"),
+            delay,
+        }),
         _ => {}
     })
 }
@@ -874,7 +947,7 @@ pub async fn compact(
             Ok(LlmEvent::Retry { reason, delay }) => {
                 summary.clear();
                 stats.first_token_ms = None;
-                send(AgentEvent::Error(retry_notice(&reason, delay)));
+                send(AgentEvent::Retrying { reason, delay });
             }
             Err(e) => {
                 send(AgentEvent::Error(format!("compaction failed: {e:#}")));
@@ -900,10 +973,6 @@ pub async fn compact(
         ]));
     }
     send(AgentEvent::Finished);
-}
-
-fn retry_notice(reason: &str, delay: std::time::Duration) -> String {
-    format!("{reason}; retrying in {}s", delay.as_secs())
 }
 
 const DEFAULT_OUTPUT_RESERVE: u32 = 2048;
@@ -997,7 +1066,55 @@ fn call_label(messages: &[Message], i: usize) -> String {
 }
 
 fn cut_marker(label: &str, shown: usize, total: usize) -> String {
-    format!("\n…[{label}: output cut to fit context, {shown} of {total} bytes shown]\n")
+    format!(
+        "\n…[{label}: output cut to fit context, {shown} of {total} bytes shown; \
+         re-reading it cuts other outputs, so do it only if essential]\n"
+    )
+}
+
+/// If `cut` took more than half the bytes of the current turn's tool outputs, the list of the
+/// turn's cut calls: a weak model told to say what is unverified does not recall them by itself.
+fn starved(history: &[Message], cut: &ContextCut) -> Option<String> {
+    let turn = history
+        .iter()
+        .rposition(|m| matches!(m, Message::User(_)))?;
+    let view = &history[cut.start.min(history.len())..];
+    let in_turn = |i: usize| cut.start + i > turn;
+    let total: usize = view
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| in_turn(i))
+        .map(|(_, m)| match m {
+            Message::Tool { content, .. } => content.len(),
+            _ => 0,
+        })
+        .sum();
+    let lost: usize = cut
+        .truncated
+        .iter()
+        .filter(|&&(i, _)| in_turn(i))
+        .map(|&(i, keep)| match view.get(i) {
+            Some(Message::Tool { content, .. }) => content.len().saturating_sub(keep),
+            _ => 0,
+        })
+        .sum();
+    if lost * 2 <= total {
+        return None;
+    }
+    let list = cut
+        .truncated
+        .iter()
+        .filter(|&&(i, _)| in_turn(i))
+        .filter_map(|&(i, keep)| match view.get(i) {
+            Some(Message::Tool { content, .. }) if keep < content.len() => Some(format!(
+                "- {} ({keep} of {} bytes shown)\n",
+                call_label(view, i),
+                content.len()
+            )),
+            _ => None,
+        })
+        .collect();
+    Some(list)
 }
 
 /// Keeps about `keep` bytes split between the head and the tail of `content`.
@@ -1306,6 +1423,9 @@ fn system_prompt(
          When the user says you are wrong, do not apologize or agree yet: re-check with tools, then \
          state what the code shows. If you were wrong, say so in one line and fix it; if you were \
          right, say so and cite the evidence.\n\
+         Once the build or tests pass after your change, do not re-check what they already \
+         confirmed: end the turn with a short report.\n\
+         Reply in the language the user writes in.\n\
          Be concise. When showing code from files, quote it verbatim; put explanations \
          outside the code block."
     );

@@ -94,7 +94,7 @@ impl Entry {
     }
 }
 
-/// What an active run is doing, for the live indicator at the bottom of the log.
+/// What an active run is doing, for the live row above the input.
 #[derive(PartialEq)]
 pub enum Phase {
     /// Request sent, nothing streamed yet (prompt processing).
@@ -102,6 +102,11 @@ pub enum Phase {
     Thinking,
     Writing,
     Running(String),
+    /// A failed request waits for its retry at `until`.
+    Retrying {
+        reason: String,
+        until: Instant,
+    },
 }
 
 pub struct ContextUsage {
@@ -937,6 +942,10 @@ impl App {
                 reply,
             }) if known(&label) => self.ask(name, arguments, Some(label), reply, true),
             BackgroundEvent::Event(AgentEvent::Metrics(stats)) => self.push_metrics(stats),
+            BackgroundEvent::Event(AgentEvent::Retrying { reason, delay }) => self.notify(
+                FlashKind::Error,
+                format!("{reason} · retry in {}s", delay.as_secs()),
+            ),
             BackgroundEvent::Event(_) => {}
             BackgroundEvent::Finished { label, .. } if !known(&label) => {}
             BackgroundEvent::Finished { label, report } => {
@@ -1457,6 +1466,10 @@ impl App {
                 background: false,
             }),
             AgentEvent::SubagentText { agent, text } => self.record(&agent, Entry::Assistant(text)),
+            AgentEvent::Retrying { reason, delay } => self.set_phase(Phase::Retrying {
+                reason,
+                until: Instant::now() + delay,
+            }),
             AgentEvent::Error(e) => self.push_log(Entry::Error(e)),
             AgentEvent::Finished => {
                 self.running = None;
@@ -1474,7 +1487,9 @@ impl App {
                 } else if !self.queued.is_empty() {
                     let next = self.queued.drain(..).collect::<Vec<_>>().join("\n\n");
                     self.send(next);
-                } else {
+                } else if !self.notices.is_empty() {
+                    // Without an entry of its own the new turn's text would extend the last answer.
+                    self.push_log(Entry::Info("sending background reports".into()));
                     self.send_notices();
                 }
             }

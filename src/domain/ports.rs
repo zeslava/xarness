@@ -40,6 +40,7 @@ pub enum LlmEvent {
     /// The request failed transiently and is sent again after `delay`; anything streamed so far
     /// is void, a fresh response follows.
     Retry {
+        /// Short, for a one-line notice: a status code or `network error`.
         reason: String,
         delay: std::time::Duration,
     },

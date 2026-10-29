@@ -41,8 +41,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     };
     let panel_cap = (f.area().height as usize * PANEL_SHARE_PCT / 100).max(1);
     let (panel, keep) = panel_lines(app, f.area().width as usize, panel_cap, accent);
-    let [log_area, panel_area, input_area, status_area] = Layout::vertical([
+    // The live row is always there, so the log doesn't jump when a turn starts or ends.
+    let [log_area, live_area, panel_area, input_area, status_area] = Layout::vertical([
         Constraint::Min(1),
+        Constraint::Length(1),
         Constraint::Length(panel.len().min(panel_cap) as u16),
         Constraint::Length(input_rows as u16 + 2),
         Constraint::Length(1),
@@ -69,16 +71,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         None => log_area,
     };
 
-    // A pending approval has the panel as its indicator.
-    let live = app.is_running() && app.approval().is_none();
-    // Flashes share the indicator row; `copy` is about to add one.
-    let indicator = live || app.flash().is_some() || app.copy;
-    let mut text = log_text(&app.log);
-    if indicator {
-        // Room for the indicator, so at the bottom it doesn't cover the last line.
-        text.lines.push(Line::default());
-    }
-    let log = Paragraph::new(text).wrap(Wrap { trim: false });
+    let log = Paragraph::new(log_text(&app.log)).wrap(Wrap { trim: false });
     let total = log.line_count(log_area.width);
     if app.scroll > 0 {
         // `scroll` counts from the bottom, so growth would push the viewed lines up.
@@ -108,39 +101,29 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if let Some(sel) = app.selection {
         highlight(f.buffer_mut(), log_area, offset, sel);
     }
-    if indicator {
-        // Follows the text while it fits, then stays pinned to the bottom, scrolled or not.
-        let row = Rect {
-            y: log_area.y + total.min(log_area.height).saturating_sub(1),
-            height: 1,
-            ..log_area
+    // A pending approval has the panel as its indicator.
+    if app.is_running() && app.approval().is_none() {
+        f.render_widget(live_line(app), live_area);
+    }
+    if let Some(flash) = app.flash() {
+        let color = match flash.kind {
+            FlashKind::Info => Color::DarkGray,
+            FlashKind::Ok => Color::Green,
+            FlashKind::Error => Color::LightRed,
         };
-        if live {
-            f.render_widget(Clear, row);
-            f.render_widget(live_line(app), row);
-        }
-        if let Some(flash) = app.flash() {
-            let color = match flash.kind {
-                FlashKind::Info => Color::DarkGray,
-                FlashKind::Ok => Color::Green,
-                FlashKind::Error => Color::LightRed,
-            };
-            let line = Line::from(Span::styled(
-                format!("{} ", flash.text),
-                Style::new().fg(color),
-            ));
-            // Right above the input even while the log is short; cleared under the text only,
-            // as a scrolled log fills that row.
-            let w = (line.width() as u16).min(log_area.width);
-            let row = Rect {
-                x: log_area.right() - w,
-                y: log_area.bottom().saturating_sub(1),
-                width: w,
-                height: 1,
-            };
-            f.render_widget(Clear, row);
-            f.render_widget(line, row);
-        }
+        let line = Line::from(Span::styled(
+            format!("{} ", flash.text),
+            Style::new().fg(color),
+        ));
+        // Right-aligned over the live line, which it may cover when long.
+        let w = (line.width() as u16).min(live_area.width);
+        let row = Rect {
+            x: live_area.right() - w,
+            width: w,
+            ..live_area
+        };
+        f.render_widget(Clear, row);
+        f.render_widget(line, row);
     }
     let skip = (keep as u16 + 1).saturating_sub(panel_area.height);
     f.render_widget(Paragraph::new(panel).scroll((skip, 0)), panel_area);
@@ -484,11 +467,16 @@ fn status_line(app: &App) -> Line<'static> {
 
 fn live_line(app: &App) -> Line<'static> {
     let (phase, started) = &app.phase;
-    let label = match phase {
-        Phase::Waiting => "waiting".to_string(),
-        Phase::Thinking => "thinking".to_string(),
-        Phase::Writing => "writing".to_string(),
-        Phase::Running(name) => format!("running {name}"),
+    let (label, time) = match phase {
+        Phase::Waiting => ("waiting".to_string(), elapsed(*started)),
+        Phase::Thinking => ("thinking".to_string(), elapsed(*started)),
+        Phase::Writing => ("writing".to_string(), elapsed(*started)),
+        Phase::Running(name) => (format!("running {name}"), elapsed(*started)),
+        // Counts down to the retry, then times the retried request like `Waiting`.
+        Phase::Retrying { reason, until } => match until.checked_duration_since(Instant::now()) {
+            Some(left) => (reason.clone(), format!("retry in {}s", left.as_secs() + 1)),
+            None => ("waiting".to_string(), elapsed(*until)),
+        },
     };
     let icon = SPINNER[app.tick % SPINNER.len()];
     Line::from(vec![
@@ -496,7 +484,7 @@ fn live_line(app: &App) -> Line<'static> {
             format!("{icon} {label} "),
             Style::new().fg(Color::Magenta).bold(),
         ),
-        Span::styled(elapsed(*started), Style::new().dim()),
+        Span::styled(time, Style::new().dim()),
     ])
 }
 

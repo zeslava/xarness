@@ -72,6 +72,8 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 #[derive(Debug)]
 struct Transient {
     reason: String,
+    /// Status code or error kind, for the retry notice; `reason` is kept for the final error.
+    short: String,
     retry_after: Option<Duration>,
 }
 
@@ -99,7 +101,7 @@ async fn pump(
             .retry_after
             .map_or(Duration::from_secs(secs), |d| d.min(MAX_RETRY_AFTER));
         tx.send(Ok(LlmEvent::Retry {
-            reason: t.reason.clone(),
+            reason: t.short.clone(),
             delay,
         }))
         .await?;
@@ -133,6 +135,7 @@ async fn stream_once(
     while let Some(chunk) = bytes.next().await {
         let chunk = chunk.map_err(|e| Transient {
             reason: format!("connection lost: {:#}", anyhow!(e)),
+            short: "connection lost".into(),
             retry_after: None,
         })?;
         buf.push_str(&String::from_utf8_lossy(&chunk));
@@ -194,6 +197,7 @@ async fn send(http: &reqwest::RequestBuilder) -> Result<reqwest::Response> {
         Err(e) if !e.is_builder() => {
             return Err(Transient {
                 reason: format!("{:#}", anyhow!(e)),
+                short: "network error".into(),
                 retry_after: None,
             }
             .into());
@@ -221,6 +225,7 @@ async fn send(http: &reqwest::RequestBuilder) -> Result<reqwest::Response> {
     {
         return Err(Transient {
             reason,
+            short: status.as_u16().to_string(),
             retry_after,
         }
         .into());
