@@ -75,7 +75,7 @@ pub trait LlmProvider: Send + Sync {
 
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
-    /// Tools that change the filesystem are only available in build mode.
+    /// Tools that change the filesystem: hidden from read-only runs, asked about in `/plan` turns.
     fn mutating(&self) -> bool;
     /// Each call waits for the user's approval in the TUI.
     fn needs_approval(&self) -> bool {

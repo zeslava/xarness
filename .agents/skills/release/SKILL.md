@@ -7,7 +7,7 @@ description: Cut a new xarness release — bump the version, tag vX.Y.Z and push
 
 Argument (optional): `patch`, `minor`, `major` or an explicit `X.Y.Z`.
 
-Everything goes through the `run` tool. If it isn't available (Plan mode), stop right away and ask to switch to Build — don't read `.git` or other files instead.
+Everything goes through the `run` tool. If it isn't available (a read-only run), stop right away and say so — don't read `.git` or other files instead.
 
 1. Gather the state in one call:
    ```sh

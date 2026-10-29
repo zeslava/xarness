@@ -15,6 +15,30 @@ pub struct Skill {
     pub model_invocable: bool,
     /// Available as a `/name` command.
     pub user_invocable: bool,
+    /// Invoked by the user, its turn runs with `Access::Plan`. Frontmatter `read-only: true`, an
+    /// xarness extension: the spec's `allowed-tools` lists tools approved in advance, not a limit.
+    pub read_only: bool,
+    /// The body of a skill compiled in; it has no directory.
+    pub builtin: Option<&'static str>,
+}
+
+const PLAN: &str = "Plan the task below; do not implement it. Explore the code with the read-only \
+tools, then reply with a concise, concrete plan: what to change, where and why, in what order, \
+and the risks. In this turn calls that change files or run commands wait for the user's approval; \
+make one only when the plan depends on its output, e.g. a build or a test run.";
+
+/// After all skill dirs, so a `plan` skill of one's own replaces it.
+fn builtins() -> Vec<Skill> {
+    vec![Skill {
+        name: "plan".into(),
+        description: "Explore with read-only tools and propose a plan; changes need approval"
+            .into(),
+        dir: PathBuf::new(),
+        model_invocable: false,
+        user_invocable: true,
+        read_only: true,
+        builtin: Some(PLAN),
+    }]
 }
 
 #[derive(Default)]
@@ -33,7 +57,13 @@ const MAX_DEPTH: usize = 3;
 impl Skills {
     pub fn discover(root: &Path, cfg: &SkillsConfig) -> Self {
         let dirs = search_dirs(root, dirs::home_dir().as_deref(), cfg);
-        Self::discover_in(&dirs, cfg)
+        let mut skills = Self::discover_in(&dirs, cfg);
+        for b in builtins() {
+            if !cfg.disabled.contains(&b.name) && skills.get(&b.name).is_none() {
+                skills.list.push(b);
+            }
+        }
+        skills
     }
 
     /// Earlier dirs win on a name clash.
@@ -147,6 +177,8 @@ fn load(dir: &Path) -> Result<Skill> {
         dir: dir.to_path_buf(),
         model_invocable: get("disable-model-invocation") != Some("true"),
         user_invocable: get("user-invocable") != Some("false"),
+        read_only: get("read-only") == Some("true"),
+        builtin: None,
     })
 }
 
@@ -162,6 +194,9 @@ impl Skill {
 
     /// The instructions with `{skill_dir}` filled in, headed by the skill's directory and files.
     pub fn body(&self) -> Result<String> {
+        if let Some(body) = self.builtin {
+            return Ok(body.to_string());
+        }
         let text = fs::read_to_string(self.dir.join("SKILL.md"))
             .with_context(|| format!("reading {}", self.dir.join("SKILL.md").display()))?;
         let dir = self.dir.display().to_string();

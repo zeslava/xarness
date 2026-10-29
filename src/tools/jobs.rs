@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
@@ -30,6 +30,8 @@ pub struct Jobs {
 
 struct Job {
     command: String,
+    /// Where a cut report saves the full output.
+    root: PathBuf,
     child: Child,
     output: Arc<Mutex<Vec<u8>>>,
     started: Instant,
@@ -69,8 +71,8 @@ impl Job {
             .clone();
         let text = String::from_utf8_lossy(&bytes);
         let output = match self.poll() {
-            Some(s) if !s.success() && !killed => run::condense(&text),
-            _ => run::tail(&text, TAIL_LINES),
+            Some(s) if !s.success() && !killed => run::condense(&text, &self.root),
+            _ => run::tail(&text, TAIL_LINES, &self.root),
         };
         if self.status.is_some() {
             self.reported = true;
@@ -97,6 +99,7 @@ impl Jobs {
             let mut list = self.lock();
             list.push(Job {
                 command: command.to_string(),
+                root: root.to_path_buf(),
                 child,
                 output,
                 started: Instant::now(),
@@ -199,7 +202,7 @@ impl Tool for JobTool {
         }
     }
 
-    // Jobs are only started in build mode, so they are only managed there too.
+    // Read-only runs cannot start jobs, so they do not manage them either.
     fn mutating(&self) -> bool {
         true
     }

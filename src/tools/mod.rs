@@ -9,14 +9,16 @@ mod symbol;
 mod write;
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, bail};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::domain::message::Mode;
+use crate::domain::message::Access;
 use crate::domain::ports::{Tool, ToolSpec};
 use crate::skills::Skills;
 
@@ -50,7 +52,8 @@ impl ToolRegistry {
                 jobs: Arc::clone(&jobs),
             }),
         ];
-        if !skills.list.is_empty() {
+        // Built-in skills are for the user and have no files to read.
+        if skills.list.iter().any(|s| s.builtin.is_none()) {
             tools.push(Arc::new(skill::SkillTool { skills }));
         }
         Self {
@@ -94,25 +97,25 @@ impl ToolRegistry {
     }
 
     /// `allow` restricts the tools by name, for subagents.
-    fn available(&self, mode: Mode, allow: Option<&[String]>) -> Vec<Arc<dyn Tool>> {
+    fn available(&self, access: Access, allow: Option<&[String]>) -> Vec<Arc<dyn Tool>> {
         let mcp = self.mcp.read().unwrap_or_else(PoisonError::into_inner);
         self.tools
             .iter()
-            .filter(|t| mode == Mode::Build || !t.mutating())
+            .filter(|t| access != Access::ReadOnly || !t.mutating())
             .chain(mcp.iter())
             .filter(|t| allow.is_none_or(|a| a.contains(&t.spec().name)))
             .cloned()
             .collect()
     }
 
-    fn find(&self, mode: Mode, allow: Option<&[String]>, name: &str) -> Option<Arc<dyn Tool>> {
-        self.available(mode, allow)
+    fn find(&self, access: Access, allow: Option<&[String]>, name: &str) -> Option<Arc<dyn Tool>> {
+        self.available(access, allow)
             .into_iter()
             .find(|t| t.spec().name == name)
     }
 
-    pub fn specs(&self, mode: Mode, allow: Option<&[String]>) -> Vec<ToolSpec> {
-        self.available(mode, allow)
+    pub fn specs(&self, access: Access, allow: Option<&[String]>) -> Vec<ToolSpec> {
+        self.available(access, allow)
             .iter()
             .map(|t| t.spec())
             .collect()
@@ -120,18 +123,19 @@ impl ToolRegistry {
 
     /// Unknown tools count as mutating.
     pub fn is_mutating(&self, name: &str) -> bool {
-        self.find(Mode::Build, None, name)
+        self.find(Access::Full, None, name)
             .is_none_or(|t| t.mutating())
     }
 
     /// Besides tools that always ask, a read-only tool asks when its `path` leaves the working
-    /// directory, and a mutating tool asks in Plan mode (only MCP tools are offered there).
-    pub fn needs_approval(&self, mode: Mode, name: &str, arguments: &str) -> bool {
-        let Some(tool) = self.find(Mode::Build, None, name) else {
+    /// directory, and a mutating tool asks unless access is full (only MCP tools are offered
+    /// to a read-only run).
+    pub fn needs_approval(&self, access: Access, name: &str, arguments: &str) -> bool {
+        let Some(tool) = self.find(Access::Full, None, name) else {
             return false;
         };
         tool.needs_approval()
-            || (mode == Mode::Plan && tool.mutating())
+            || (access != Access::Full && tool.mutating())
             || (PATH_READERS.contains(&name)
                 && serde_json::from_str::<Value>(arguments)
                     .ok()
@@ -142,16 +146,19 @@ impl ToolRegistry {
 
     pub async fn run(
         &self,
-        mode: Mode,
+        access: Access,
         allow: Option<&[String]>,
         name: &str,
         arguments: &str,
     ) -> Result<String> {
-        let tool = self.find(mode, allow, name).ok_or_else(|| match allow {
-            Some(_) if self.find(mode, None, name).is_some() => {
+        let tool = self.find(access, allow, name).ok_or_else(|| match allow {
+            Some(_) if self.find(access, None, name).is_some() => {
                 anyhow!("tool `{name}` is not available to this agent")
             }
-            _ => anyhow!("tool `{name}` is not available in {} mode", mode.label()),
+            _ if self.find(Access::Full, None, name).is_some() => {
+                anyhow!("tool `{name}` is not available to a read-only agent")
+            }
+            _ => anyhow!("unknown tool `{name}`"),
         })?;
         let args: Value = if arguments.trim().is_empty() {
             Value::Object(Default::default())
@@ -203,6 +210,55 @@ fn lexical(root: &Path, path: &str) -> PathBuf {
         }
     }
     out
+}
+
+fn spill_dir(root: &Path) -> PathBuf {
+    root.join(".xarness").join("tmp")
+}
+
+/// Saves the full text of an output that is shown cut, so the model can read the rest in parts
+/// instead of running the command again. Returns the path relative to `root`; `None` if the
+/// write fails.
+pub(crate) fn spill(root: &Path, text: &str) -> Option<String> {
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    let dir = spill_dir(root);
+    std::fs::create_dir_all(&dir).ok()?;
+    let ignore = dir.join(".gitignore");
+    if !ignore.exists() {
+        std::fs::write(ignore, "*\n").ok()?;
+    }
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let path = dir.join(format!(
+        "{millis}-{}.txt",
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&path, text).ok()?;
+    Some(display(root, &path))
+}
+
+/// Spilled outputs only matter to the conversation that produced them.
+pub(crate) fn clear_spills(root: &Path) {
+    let _ = std::fs::remove_dir_all(spill_dir(root));
+}
+
+pub(crate) fn spilled_note(path: &str) -> String {
+    format!(
+        "full output saved to {path}: read it in parts with read_file or search it with grep \
+         instead of repeating the call"
+    )
+}
+
+/// Where a command's output that was shown cut can be read whole.
+fn command_note(root: &Path, text: &str) -> String {
+    match spill(root, text) {
+        Some(p) => spilled_note(&p),
+        None => "to read it all, redirect the command to a file and read that with read_file \
+                 in parts"
+            .into(),
+    }
 }
 
 pub(crate) fn clip(line: &str, max_chars: usize) -> std::borrow::Cow<'_, str> {

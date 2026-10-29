@@ -1,25 +1,14 @@
 use serde::{Deserialize, Serialize};
 
+/// What a run may change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mode {
+pub enum Access {
+    Full,
+    /// A turn started by a read-only skill (`/plan`). Every tool stays in the request, so the
+    /// prompt prefix (and the server's KV cache) is unchanged, but mutating calls wait for approval.
     Plan,
-    Build,
-}
-
-impl Mode {
-    pub fn label(self) -> &'static str {
-        match self {
-            Mode::Plan => "PLAN",
-            Mode::Build => "BUILD",
-        }
-    }
-
-    pub fn toggle(self) -> Self {
-        match self {
-            Mode::Plan => Mode::Build,
-            Mode::Build => Mode::Plan,
-        }
-    }
+    /// Mutating built-in tools are hidden; mutating MCP tools ask. For subagents.
+    ReadOnly,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -39,7 +39,7 @@ impl Tool for RunCommand {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "run".into(),
-            description: "Run a shell command in the working directory, e.g. the build, test or lint commands from the project instructions. Run it after editing code to check your changes. Output is condensed: on failure the error lines (at most 60), on success output up to 16 KB whole and the last lines of longer output. Times out after 120s. Set `background` for dev servers, watchers, or long builds and tests: it returns at once, and the result arrives as a message when the command exits.".into(),
+            description: "Run a shell command in the working directory, e.g. the build, test or lint commands from the project instructions. Run it after editing code to check your changes. Output is condensed: on failure the error lines (at most 60), on success output up to 16 KB whole and the last lines of longer output; cut output is saved whole to a file named in the result. Times out after 120s. Set `background` for dev servers, watchers, or long builds and tests: it returns at once, and the result arrives as a message when the command exits.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -97,16 +97,16 @@ impl RunCommand {
         let bytes = output.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let text = String::from_utf8_lossy(&bytes);
         match status {
-            Some(s) if s.success() => Ok(format!("ok\n{}", success_output(&text))),
+            Some(s) if s.success() => Ok(format!("ok\n{}", success_output(&text, root))),
             Some(s) => bail!(
                 "exit {}\n{}",
                 s.code().map_or("signal".into(), |c| c.to_string()),
-                condense(&text)
+                condense(&text, root)
             ),
             None => bail!(
                 "timed out after {}s\n{}",
                 TIMEOUT.as_secs(),
-                condense(&text)
+                condense(&text, root)
             ),
         }
     }
@@ -153,28 +153,42 @@ pub(super) fn collect(
 }
 
 /// Short output is kept whole, blank lines included (a diff or file listing needs them); long
-/// output, usually build noise, is cut to its tail with a marker so the model knows to narrow it.
-fn success_output(text: &str) -> String {
+/// output, usually build noise, is cut to its tail and saved whole for reading in parts.
+fn success_output(text: &str, root: &Path) -> String {
     let lines: Vec<&str> = text.lines().collect();
     if lines.len() <= MAX_LINES || text.len() <= OK_WHOLE_BYTES {
         return clipped(&lines);
     }
     format!(
-        "{}[showing last {OK_TAIL_LINES} of {} lines; to read it all, redirect the command to a \
-         file and read that with read_file in parts]",
-        tail(text, OK_TAIL_LINES),
-        lines.len()
+        "{}[showing last {OK_TAIL_LINES} of {} lines; {}]",
+        clipped(&non_blank_tail(text, OK_TAIL_LINES)),
+        lines.len(),
+        super::command_note(root, text)
     )
 }
 
-pub(super) fn tail(text: &str, n: usize) -> String {
+fn non_blank_tail(text: &str, n: usize) -> Vec<&str> {
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-    clipped(&lines[lines.len().saturating_sub(n)..])
+    lines[lines.len().saturating_sub(n)..].to_vec()
+}
+
+/// The last `n` non-blank lines; when that cuts anything, the whole text is saved and the
+/// marker says where.
+pub(super) fn tail(text: &str, n: usize, root: &Path) -> String {
+    let total = text.lines().filter(|l| !l.trim().is_empty()).count();
+    let shown = clipped(&non_blank_tail(text, n));
+    if total <= n {
+        return shown;
+    }
+    format!(
+        "{shown}[showing last {n} of {total} lines; {}]",
+        super::command_note(root, text)
+    )
 }
 
 /// Short output is kept whole; long output is cut to the lines that point at a problem, falling
-/// back to the tail when none do.
-pub(super) fn condense(text: &str) -> String {
+/// back to the tail when none do, and saved whole.
+pub(super) fn condense(text: &str, root: &Path) -> String {
     let mut lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     lines.dedup();
     if lines.len() <= MAX_LINES {
@@ -188,9 +202,10 @@ pub(super) fn condense(text: &str) -> String {
         (&relevant[..relevant.len().min(MAX_LINES)], lines.len())
     };
     format!(
-        "{}[showing {} of {total} lines]",
+        "{}[showing {} of {total} lines; {}]",
         clipped(shown),
-        shown.len()
+        shown.len(),
+        super::command_note(root, text)
     )
 }
 

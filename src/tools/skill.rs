@@ -61,6 +61,9 @@ impl SkillTool {
             }
             return skill.body();
         };
+        if skill.builtin.is_some() {
+            bail!("skill `{}` is built in and has no files", a.name);
+        }
         // The skill's directory is the root here, so global skills stay readable without
         // widening the working-directory sandbox.
         let path = super::resolve(&skill.dir, &file)
@@ -84,6 +87,8 @@ mod tests {
                     dir: "/tmp/skills/a".into(),
                     model_invocable: true,
                     user_invocable: true,
+                    read_only: false,
+                    builtin: None,
                 }],
                 warnings: Vec::new(),
             }),

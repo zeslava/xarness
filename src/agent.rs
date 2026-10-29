@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
@@ -14,7 +15,7 @@ use tokio::sync::oneshot;
 use tokio::task::AbortHandle;
 
 use crate::config::{ModelConfig, merge};
-use crate::domain::message::{Message, Mode, ToolCall};
+use crate::domain::message::{Access, Message, ToolCall};
 use crate::domain::ports::{ChatRequest, ContextOverflow, LlmEvent, LlmProvider};
 use crate::metrics;
 use crate::subagents::{self, Subagent, Subagents};
@@ -84,7 +85,7 @@ pub enum Answer {
 pub struct Run {
     pub provider: Arc<dyn LlmProvider>,
     pub model: ModelConfig,
-    pub mode: Mode,
+    pub access: Access,
     pub history: Vec<Message>,
     pub cut: ContextCut,
     pub tools: Arc<ToolRegistry>,
@@ -195,8 +196,22 @@ const REFUSED: &str = "Not run: no more tool calls are allowed. Answer now with 
 
 /// Start of the answer put in the model's mouth when it calls tools again after the refusal.
 /// `tool_choice: "none"` alone only makes it write the call as text; continuing this, it answers.
+/// It begins a list: after a bare sentence weak models still go on with a call as text.
 /// llama.cpp echoes it in the response.
-const PREFILL: &str = "No more tool calls; here is what I found so far.\n\n";
+const PREFILL: &str = "No more tool calls; here is what I found so far:\n\n1. ";
+
+/// Tool-call markup models write as text when calls are off. Sent as stop sequences with the
+/// prefill, and cut from the answer for servers that ignore them.
+const CALL_MARKUP: [&str; 2] = ["<tool_call>", "<function="];
+
+/// Mutating calls the user may decline in a `/plan` turn before it is wrapped up.
+const MAX_PLAN_DECLINES: usize = 2;
+
+const PLAN_WRAP_UP: &str = "The user keeps declining changes in this planning turn. Do not call \
+                            any more tools: write the plan now from what you have found, and say \
+                            what is still unverified.";
+
+const PLAN_PREFILL: &str = "No more tool calls; here is the plan:\n\n1. ";
 
 /// Times in a row a subagent's cut-off response is discarded and requested again.
 const MAX_CUT_OFFS: usize = 2;
@@ -238,9 +253,10 @@ async fn drive(r: &mut Run, sink: &Sink) -> anyhow::Result<Outcome> {
     let mut cut_offs = 0;
     let mut refused = false;
     let mut forced = false;
+    let mut declined = 0;
     'turn: loop {
         let system = system_prompt(
-            r.mode,
+            r.access,
             &r.tools,
             r.instructions.as_deref(),
             r.skills.as_deref(),
@@ -251,11 +267,14 @@ async fn drive(r: &mut Run, sink: &Sink) -> anyhow::Result<Outcome> {
         // goes for a turn that no longer fits: its outputs get cut, the model re-reads them,
         // which cuts more, until the window is exhausted with nothing to show. The tools stay in
         // the request, so its prefix (and the server's KV cache) is unchanged; calls are refused.
+        // A `/plan` turn whose model keeps trying to change things is wrapped up the same way.
         let starved = context_window.and_then(|_| starved(&r.history, &r.cut));
-        let wrap_up = starved.is_some() || r.sub.is_some() && steps >= MAX_SUBAGENT_STEPS;
+        let planned = declined >= MAX_PLAN_DECLINES;
+        let wrap_up =
+            starved.is_some() || planned || r.sub.is_some() && steps >= MAX_SUBAGENT_STEPS;
         let mut tools = r
             .tools
-            .specs(r.mode, r.sub.as_ref().and_then(|s| s.tools.as_deref()));
+            .specs(r.access, r.sub.as_ref().and_then(|s| s.tools.as_deref()));
         if r.sub.is_none() {
             tools.extend(r.agents.spec());
         }
@@ -311,6 +330,7 @@ async fn drive(r: &mut Run, sink: &Sink) -> anyhow::Result<Outcome> {
                 "{CONTEXT_FULL}\n\nThese outputs were cut, so what they held is unverified \
                  unless another output showed it:\n{cuts}"
             ),
+            None if planned => PLAN_WRAP_UP.to_string(),
             None => WRAP_UP.to_string(),
         };
         let notes: Vec<&str> = [(cut_offs > 0, CUT_OFF), (wrap_up, wrap_up_note.as_str())]
@@ -323,11 +343,11 @@ async fn drive(r: &mut Run, sink: &Sink) -> anyhow::Result<Outcome> {
         let mut extra = r.extra.clone();
         if forced {
             messages.push(Message::Assistant {
-                content: PREFILL.to_string(),
+                content: if planned { PLAN_PREFILL } else { PREFILL }.to_string(),
                 reasoning: String::new(),
                 tool_calls: Vec::new(),
             });
-            let none = serde_json::json!({ "tool_choice": "none" });
+            let none = serde_json::json!({ "tool_choice": "none", "stop": CALL_MARKUP });
             match &mut extra {
                 Some(x) => merge(x, none),
                 None => extra = Some(none),
@@ -348,6 +368,8 @@ async fn drive(r: &mut Run, sink: &Sink) -> anyhow::Result<Outcome> {
         let mut reasoning = String::new();
         let mut calls = Vec::new();
         let mut truncated = false;
+        // Server tokens of this request and response, if reported.
+        let mut used = None;
         while let Some(ev) = stream.next().await {
             if stats.first_token_ms.is_none()
                 && matches!(ev, Ok(LlmEvent::TextDelta(_) | LlmEvent::ReasoningDelta(_)))
@@ -378,6 +400,7 @@ async fn drive(r: &mut Run, sink: &Sink) -> anyhow::Result<Outcome> {
                     stats.cached_tokens = cached_tokens;
                     if let Some(n) = prompt_tokens {
                         scale = n as f64 / estimated as f64;
+                        used = Some(n + completion_tokens.unwrap_or(0));
                         sink(AgentEvent::Usage {
                             used: n + completion_tokens.unwrap_or(0),
                             window: context_window,
@@ -410,6 +433,9 @@ async fn drive(r: &mut Run, sink: &Sink) -> anyhow::Result<Outcome> {
 
         stats.duration_ms = started.elapsed().as_millis() as u64;
         retried = false;
+        if forced {
+            cut_call_markup(&mut text);
+        }
         // A subagent's report is all its caller gets, so a cut-off one is worth another try.
         // The partial response stays out of history: the retry reuses the same prefix.
         if truncated && r.sub.is_some() && cut_offs < MAX_CUT_OFFS {
@@ -439,12 +465,17 @@ async fn drive(r: &mut Run, sink: &Sink) -> anyhow::Result<Outcome> {
             reasoning,
             tool_calls: calls.clone(),
         }];
-        let cap = output_cap(context_window);
+        let reserve = r.model.max_tokens.unwrap_or(DEFAULT_OUTPUT_RESERVE);
+        let used = used.unwrap_or((estimated as f64 * scale) as u32);
+        let free = context_window.map_or(0, |w| w.saturating_sub(used + reserve));
+        let cap = output_cap(context_window, free, scale, calls.len());
         let outputs = if wrap_up {
             refused = !calls.is_empty();
             calls.iter().map(|_| (REFUSED.to_string(), true)).collect()
         } else {
-            run_calls(r, &calls, cap, sink).await
+            let (outputs, n) = run_calls(r, &calls, cap, sink).await;
+            declined += n;
+            outputs
         };
         for (c, (output, is_error)) in calls.iter().zip(outputs) {
             stats.tools.push(metrics::ToolRun {
@@ -491,8 +522,13 @@ fn call_groups(calls: &[ToolCall], parallel: bool) -> Vec<Range<usize>> {
     groups
 }
 
-/// Outputs of `calls`, in order.
-async fn run_calls(r: &Run, calls: &[ToolCall], cap: usize, sink: &Sink) -> Vec<(String, bool)> {
+/// Outputs of `calls`, in order, and how many of them were `PlanDeclined`.
+async fn run_calls(
+    r: &Run,
+    calls: &[ToolCall],
+    cap: usize,
+    sink: &Sink,
+) -> (Vec<(String, bool)>, usize) {
     let start = |c: &ToolCall| {
         sink(AgentEvent::ToolStart {
             name: c.name.clone(),
@@ -504,6 +540,7 @@ async fn run_calls(r: &Run, calls: &[ToolCall], cap: usize, sink: &Sink) -> Vec<
         .map(|i| repeated(r, &calls[..i], &calls[i]))
         .collect();
     let mut out = Vec::with_capacity(calls.len());
+    let mut declined = 0;
     for range in call_groups(calls, r.agents.parallel) {
         let group = &calls[range.clone()];
         if group[0].name == subagents::TOOL && r.sub.is_none() {
@@ -513,7 +550,7 @@ async fn run_calls(r: &Run, calls: &[ToolCall], cap: usize, sink: &Sink) -> Vec<
                 delegate(r, c, label, sink)
             });
             for result in join_all(runs).await {
-                out.push(finish(result, cap, sink));
+                out.push(finish(r, subagents::TOOL, result, cap, sink));
             }
         } else {
             for (c, &repeat) in group.iter().zip(&repeats[range]) {
@@ -532,11 +569,15 @@ async fn run_calls(r: &Run, calls: &[ToolCall], cap: usize, sink: &Sink) -> Vec<
                     out.push((output.to_string(), true));
                     continue;
                 }
-                out.push(finish(call_tool(r, c, sink).await, cap, sink));
+                let result = call_tool(r, c, sink).await;
+                if result.as_ref().is_err_and(|e| e.is::<PlanDeclined>()) {
+                    declined += 1;
+                }
+                out.push(finish(r, &c.name, result, cap, sink));
             }
         }
     }
-    out
+    (out, declined)
 }
 
 /// Whether `c` repeats a read-only call made earlier in this turn, with no mutating call since.
@@ -575,12 +616,21 @@ fn same_args(a: &str, b: &str) -> bool {
         )
 }
 
-fn finish(result: anyhow::Result<String>, cap: usize, sink: &Sink) -> (String, bool) {
+fn finish(
+    r: &Run,
+    name: &str,
+    result: anyhow::Result<String>,
+    cap: usize,
+    sink: &Sink,
+) -> (String, bool) {
     let (output, is_error) = match result {
         Ok(out) => (out, false),
         Err(e) => (format!("error: {e:#}"), true),
     };
-    let output = cap_output(output, cap);
+    let output = match name {
+        "read_file" if !is_error => cap_read(output, cap, r.tools.root()),
+        _ => cap_output(output, cap, r.tools.root()),
+    };
     sink(AgentEvent::ToolResult {
         output: output.clone(),
         is_error,
@@ -615,7 +665,7 @@ async fn call_tool(r: &Run, c: &ToolCall, sink: &Sink) -> anyhow::Result<String>
     {
         bail!("subagents cannot start background jobs; run the command without `background`");
     }
-    let answer = if r.tools.needs_approval(r.mode, &c.name, &c.arguments) {
+    let answer = if r.tools.needs_approval(r.access, &c.name, &c.arguments) {
         let (reply, answer) = oneshot::channel();
         sink(AgentEvent::Approve {
             name: c.name.clone(),
@@ -629,11 +679,34 @@ async fn call_tool(r: &Run, c: &ToolCall, sink: &Sink) -> anyhow::Result<String>
     };
     let allow = r.sub.as_ref().and_then(|s| s.tools.as_deref());
     match answer {
-        Answer::Yes => r.tools.run(r.mode, allow, &c.name, &c.arguments).await,
+        Answer::Yes => r.tools.run(r.access, allow, &c.name, &c.arguments).await,
+        Answer::No(reason) if r.access == Access::Plan && r.tools.is_mutating(&c.name) => {
+            Err(PlanDeclined(reason).into())
+        }
         Answer::No(None) => Err(anyhow!("the user declined this call")),
         Answer::No(Some(reason)) => Err(anyhow!("the user declined this call and said: {reason}")),
     }
 }
+
+/// A mutating call the user declined in a `/plan` turn, with what they said. Counted by
+/// `run_calls`: after `MAX_PLAN_DECLINES` the turn must answer.
+#[derive(Debug)]
+struct PlanDeclined(Option<String>);
+
+impl std::fmt::Display for PlanDeclined {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the user declined this call")?;
+        if let Some(reason) = &self.0 {
+            write!(f, " and said: {reason}")?;
+        }
+        f.write_str(
+            ". This turn is for planning, not for changes: describe this change in your plan \
+             instead of making it",
+        )
+    }
+}
+
+impl std::error::Error for PlanDeclined {}
 
 #[derive(Deserialize)]
 struct DelegateArgs {
@@ -736,24 +809,26 @@ fn delegate<'a>(
             None => None,
         };
         let moved = wd.is_some();
-        let (mode, tools, instructions, repo_map) = match wd {
-            Some(w) => (
-                if w.read_only { Mode::Plan } else { r.mode },
-                w.tools,
-                w.instructions,
-                w.repo_map,
-            ),
+        // A subagent has a prompt of its own, so hiding its mutating tools costs the caller's
+        // cache nothing; of a `/plan` turn too, fixed at start, since a background one outlives it.
+        let (read_only, tools, instructions, repo_map) = match wd {
+            Some(w) => (w.read_only, w.tools, w.instructions, w.repo_map),
             None => (
-                r.mode,
+                false,
                 Arc::clone(&r.tools),
                 r.instructions.clone(),
                 r.repo_map.clone(),
             ),
         };
+        let access = if read_only || r.access != Access::Full {
+            Access::ReadOnly
+        } else {
+            Access::Full
+        };
         let mut sub = Run {
             provider,
             model,
-            mode,
+            access,
             history: vec![Message::User(a.task)],
             cut: ContextCut::default(),
             tools,
@@ -1349,39 +1424,96 @@ const MAX_TOOL_OUTPUT: usize = 16_000;
 /// With a small context window one output may take at most this fraction of it, so a single
 /// read does not crowd out the rest of the turn.
 const OUTPUT_WINDOW_SHARE: f64 = 0.15;
+/// The outputs of one response together may take at most this fraction of the room the window
+/// has left, the rest is for later steps of the turn.
+const OUTPUT_FREE_SHARE: f64 = 0.5;
 const MIN_TOOL_OUTPUT: usize = 4_000;
 
-fn output_cap(context_window: Option<u32>) -> usize {
+/// Per output, in bytes. `free` is the window's room in tokens after this response and the
+/// next one's reserve; `scale` converts the char-based estimate to server tokens.
+fn output_cap(context_window: Option<u32>, free: u32, scale: f64, calls: usize) -> usize {
     context_window.map_or(MAX_TOOL_OUTPUT, |w| {
-        ((w as f64 * OUTPUT_WINDOW_SHARE) as usize * CHARS_PER_TOKEN)
-            .clamp(MIN_TOOL_OUTPUT, MAX_TOOL_OUTPUT)
+        let tokens = (w as f64 * OUTPUT_WINDOW_SHARE)
+            .min(free as f64 * OUTPUT_FREE_SHARE / calls.max(1) as f64);
+        ((tokens * CHARS_PER_TOKEN as f64 / scale) as usize).clamp(MIN_TOOL_OUTPUT, MAX_TOOL_OUTPUT)
     })
 }
 
-fn cap_output(mut s: String, cap: usize) -> String {
+/// Keeps the head and a longer tail, both cut at line ends: a file reads from its start, while a
+/// command's errors and summary come last. The full output is saved under `root` so the model
+/// can read the rest in parts.
+fn cap_output(s: String, cap: usize, root: &Path) -> String {
     if s.len() <= cap {
         return s;
     }
-    let total = s.len();
-    let mut keep = cap;
-    while !s.is_char_boundary(keep) {
-        keep -= 1;
+    let mut head = cap / 3;
+    while !s.is_char_boundary(head) {
+        head -= 1;
     }
-    s.truncate(keep);
-    s.push_str(&format!("\n…[output truncated: {keep} of {total} bytes]"));
-    s
+    let head = s[..head].rfind('\n').map_or(head, |i| i + 1);
+    let mut tail = s.len() - (cap - cap / 3);
+    while !s.is_char_boundary(tail) {
+        tail += 1;
+    }
+    let tail = s[tail..].find('\n').map_or(tail, |i| tail + i + 1);
+    let mut note = format!("…[{} of {} bytes cut here", tail - head, s.len());
+    if let Some(p) = tools::spill(root, &s) {
+        note += &format!("; {}", tools::spilled_note(&p));
+    }
+    format!("{}{note}]\n{}", &s[..head], &s[tail..])
 }
 
-const SUBAGENT_NOTE: &str = "You are a subagent: the task comes from another agent, not from the \
+fn cut_call_markup(text: &mut String) {
+    if let Some(i) = CALL_MARKUP.iter().filter_map(|m| text.find(m)).min() {
+        text.truncate(text[..i].trim_end().len());
+    }
+}
+
+/// `read_file` output is cut to whole lines from its start, with the offset to continue at: the
+/// file is already on disk, and a spilled copy would only be read whole and cut again.
+fn cap_read(s: String, cap: usize, root: &Path) -> String {
+    if s.len() <= cap {
+        return s;
+    }
+    let line_no = |l: &str| l.split('\t').next()?.trim().parse::<usize>().ok();
+    let mut end = cap;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let end = s[..end].rfind('\n').map_or(0, |i| i + 1);
+    let shown = &s[..end];
+    match (
+        shown.lines().next().and_then(line_no),
+        shown.lines().last().and_then(line_no),
+    ) {
+        (Some(first), Some(last)) => format!(
+            "{shown}[showing lines {first}–{last}, cut to fit the context; use offset={} to \
+             continue]\n",
+            last + 1
+        ),
+        _ => cap_output(s, cap, root),
+    }
+}
+
+const SUBAGENT_NOTE: &str ="You are a subagent: the task comes from another agent, not from the \
 user, and you cannot ask it anything. Work on your own, then end with a final message reporting the \
 result. It is passed to that agent verbatim and is all it sees of your work, so make it complete \
 and concise.";
 
-const SUBAGENT_PLAN_NOTE: &str = "Tools that change files or run commands are unavailable to you. If the task needs such changes, do the read-only part and report exactly \
+const SUBAGENT_READ_ONLY_NOTE: &str = "Tools that change files or run commands are unavailable to you. If the task needs such changes, do the read-only part and report exactly \
 what would have to be changed or run.";
 
+/// The same for every turn, `/plan` ones included, so the prompt prefix stays cached.
+const MAIN_TASK: &str = "Match your work to the kind of request. A question (how, why, where, \
+what does X do): answer it; do not change files or run commands that change state. A request to \
+review, plan or propose: explore and report; do not implement until the user agrees. A request to \
+change something: make the change. Read files before editing them; prefer edit_file for targeted \
+changes. Change only what the task requires: no unrelated refactoring, renaming, reformatting, \
+extra features, comments, tests or new files unless asked. If you cannot tell which kind of \
+request it is, or a broader change seems necessary, ask one short question instead of guessing.";
+
 fn system_prompt(
-    mode: Mode,
+    access: Access,
     tools: &ToolRegistry,
     instructions: Option<&str>,
     skills: Option<&str>,
@@ -1389,24 +1521,16 @@ fn system_prompt(
     sub: Option<&Subagent>,
 ) -> String {
     let cwd = tools.root().display();
-    let task = match (sub, mode) {
-        (Some(s), Mode::Build) => format!("{}\n\n{SUBAGENT_NOTE}", s.prompt).trim().to_string(),
-        (Some(s), Mode::Plan) => format!("{}\n\n{SUBAGENT_NOTE}\n{SUBAGENT_PLAN_NOTE}", s.prompt)
+    let task = match (sub, access) {
+        (Some(s), Access::ReadOnly) => {
+            format!("{}\n\n{SUBAGENT_NOTE}\n{SUBAGENT_READ_ONLY_NOTE}", s.prompt)
+                .trim()
+                .to_string()
+        }
+        (Some(s), _) => format!("{}\n\n{SUBAGENT_NOTE}", s.prompt)
             .trim()
             .to_string(),
-        (None, Mode::Plan) => {
-            "You are in PLAN mode. Explore the code with the read-only tools and produce a concise, \
-             concrete implementation plan. Do not attempt to modify files."
-                .into()
-        }
-        (None, Mode::Build) => {
-            "You are in BUILD mode. Implement the requested changes using the tools. \
-             Read files before editing them; prefer edit_file for targeted changes. \
-             Change only what the task requires: no unrelated refactoring, renaming, reformatting, \
-             extra features, comments, tests or new files unless asked. If the request is ambiguous \
-             or a broader change seems necessary, stop and ask instead of guessing."
-                .into()
-        }
+        (None, _) => MAIN_TASK.into(),
     };
     let mut prompt = format!(
         "You are a coding agent working in `{cwd}`. All paths are relative to it; read-only tools \
@@ -1414,7 +1538,7 @@ fn system_prompt(
          user approves.\n{task}\n\
          Do exactly what the user asked — nothing more. If you have ideas, improvements or noticed \
          other problems, mention them briefly at the end and ask whether to act on them; do not act \
-         on them yourself. If the user asks a question, answer it without changing anything.\n\
+         on them yourself.\n\
          Ground every claim about the code in what you have read: this prompt (project \
          instructions, repository map, tool list) counts as read. If it already answers the \
          question, answer from it without tool calls; read or search only for details it does not \
@@ -1610,9 +1734,57 @@ mod tests {
 
     #[test]
     fn output_cap_scales_with_window() {
-        assert_eq!(output_cap(None), MAX_TOOL_OUTPUT);
-        assert_eq!(output_cap(Some(8192)), MIN_TOOL_OUTPUT);
-        assert_eq!(output_cap(Some(32768)), 14_745);
-        assert_eq!(output_cap(Some(131072)), MAX_TOOL_OUTPUT);
+        let roomy = u32::MAX;
+        assert_eq!(output_cap(None, 0, 1.0, 1), MAX_TOOL_OUTPUT);
+        assert_eq!(output_cap(Some(8192), roomy, 1.0, 1), MIN_TOOL_OUTPUT);
+        assert_eq!(output_cap(Some(32768), roomy, 1.0, 1), 14_745);
+        assert_eq!(output_cap(Some(131072), roomy, 1.0, 1), MAX_TOOL_OUTPUT);
+    }
+
+    #[test]
+    fn output_cap_shares_free_room() {
+        // 8000 free tokens, half of it over 4 calls: 1000 tokens, 3000 bytes, floored.
+        assert_eq!(output_cap(Some(131072), 8000, 1.0, 4), MIN_TOOL_OUTPUT);
+        // Over 1 call: 4000 tokens; a model counting 2x our estimate gets half the bytes.
+        assert_eq!(output_cap(Some(131072), 8000, 1.0, 1), 12_000);
+        assert_eq!(output_cap(Some(131072), 8000, 2.0, 1), 6_000);
+    }
+
+    #[test]
+    fn cap_output_keeps_head_and_tail_lines() {
+        let root = std::env::temp_dir().join(format!("xarness-cap-{}", std::process::id()));
+        let text: String = (0..1000).map(|i| format!("line {i}\n")).collect();
+        let out = cap_output(text, 600, &root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(out.starts_with("line 0\n"));
+        assert!(out.ends_with("line 999\n"));
+        assert!(out.contains("bytes cut here; full output saved to .xarness/tmp/"));
+        assert!(
+            out.lines()
+                .all(|l| l.starts_with("line ") || l.starts_with('…'))
+        );
+    }
+
+    #[test]
+    fn call_markup_is_cut_from_answer() {
+        let mut text = format!("{PREFILL}found X\n\n<tool_call> <function=run> ls </function>");
+        cut_call_markup(&mut text);
+        assert_eq!(text, format!("{PREFILL}found X"));
+    }
+
+    #[test]
+    fn cap_read_keeps_head_without_spilling() {
+        let root = std::env::temp_dir().join(format!("xarness-cap-read-{}", std::process::id()));
+        let text: String = (1..=300).map(|i| format!("{i:>5}\tline {i}\n")).collect();
+        let out = cap_read(text, 600, &root);
+        assert!(!root.exists());
+        assert!(out.starts_with("    1\tline 1\n"));
+        let last = out.lines().rev().nth(1).unwrap();
+        let n: usize = last.split('\t').next().unwrap().trim().parse().unwrap();
+        assert!(out.ends_with(&format!(
+            "[showing lines 1–{n}, cut to fit the context; use offset={} to continue]\n",
+            n + 1
+        )));
+        assert!(out.len() <= 600 + 100);
     }
 }

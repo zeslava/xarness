@@ -18,7 +18,7 @@ use crate::adapters::build_provider;
 use crate::adapters::mcp;
 use crate::agent::{self, AgentEvent, Answer, Background, BackgroundEvent, ContextCut, Run};
 use crate::config::{Config, ModelConfig};
-use crate::domain::message::{Message, Mode};
+use crate::domain::message::{Access, Message};
 use crate::domain::ports::LlmProvider;
 use crate::metrics;
 use crate::repomap;
@@ -32,6 +32,9 @@ const FLASH_TTL: Duration = Duration::from_millis(1500);
 /// Pastes over either limit are shown in the input as a `[Pasted #n]` placeholder.
 const PASTE_MAX_LINES: usize = 5;
 const PASTE_MAX_CHARS: usize = 1000;
+/// In the log a paste over this many lines keeps only `PASTE_PREVIEW_EDGE` lines at each end.
+const PASTE_PREVIEW_LINES: usize = 10;
+const PASTE_PREVIEW_EDGE: usize = 5;
 
 #[derive(Clone, Copy)]
 pub enum FlashKind {
@@ -125,6 +128,19 @@ fn default_think(model: &ModelConfig) -> Option<String> {
 }
 
 /// The log of a restored session. Tool outputs are left out, as successful ones are live.
+fn paste_preview(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= PASTE_PREVIEW_LINES {
+        return text.to_string();
+    }
+    let hidden = lines.len() - 2 * PASTE_PREVIEW_EDGE;
+    format!(
+        "{}\n… (hidden {hidden} lines)\n{}",
+        lines[..PASTE_PREVIEW_EDGE].join("\n"),
+        lines[lines.len() - PASTE_PREVIEW_EDGE..].join("\n")
+    )
+}
+
 fn history_log(history: &[Message], shown: &Shown) -> Vec<Entry> {
     let mut log = Vec::new();
     for (i, m) in history.iter().enumerate() {
@@ -221,7 +237,8 @@ pub struct App {
     /// Shown one at a time, each for `FLASH_TTL`; the front one is on screen since `flash_at`.
     flashes: VecDeque<Flash>,
     flash_at: Instant,
-    pub mode: Mode,
+    /// Of the running turn: `Plan` while a read-only skill's turn runs, `Full` otherwise.
+    pub access: Access,
     history: Vec<Message>,
     shown: Shown,
     /// `None` after a failed write, until `/clear` or `/resume` starts over.
@@ -307,6 +324,7 @@ impl App {
         let instructions = std::fs::read_to_string(tools.root().join("AGENTS.md"))
             .ok()
             .map(Arc::from);
+        crate::tools::clear_spills(tools.root());
         let session = Session::new(tools.root());
         let mut agents = Subagents::discover(tools.root(), &config.agents, |spec| {
             let (provider, model) = config.resolve_model(spec)?;
@@ -332,7 +350,7 @@ impl App {
             map_tx,
             flashes: VecDeque::new(),
             flash_at: Instant::now(),
-            mode: Mode::Plan,
+            access: Access::Full,
             history: Vec::new(),
             shown: Shown::new(),
             metrics: Vec::new(),
@@ -523,6 +541,13 @@ impl App {
         })
     }
 
+    /// Replaces paste placeholders with a preview of their text, for the log.
+    fn preview_pastes(&self, text: &str) -> String {
+        (0..self.pastes.len()).fold(text.to_string(), |acc, n| {
+            acc.replace(&self.paste_label(n), &paste_preview(&self.pastes[n]))
+        })
+    }
+
     fn insert(&mut self, text: &str) {
         self.recall = None;
         self.completion = 0;
@@ -688,7 +713,6 @@ impl App {
             KeyCode::Esc if self.view.is_some() => self.set_view(None),
             KeyCode::Esc => self.interrupt(),
             KeyCode::Enter => self.submit(),
-            KeyCode::BackTab => self.set_mode(self.mode.toggle()),
             KeyCode::Char('w') if ctrl => self.delete(self.word_back(), self.cursor),
             KeyCode::Backspace if alt || ctrl => self.delete(self.word_back(), self.cursor),
             KeyCode::Char('u') if ctrl => self.delete(self.line_bounds().0, self.cursor),
@@ -829,10 +853,11 @@ impl App {
         self.send(text);
     }
 
-    /// The log keeps paste placeholders, the model gets them expanded.
+    /// The log gets a preview of pastes, the model gets them in full.
     fn send(&mut self, text: String) {
         let full = self.expand_pastes(&text);
-        self.send_as(text, full);
+        let shown = self.preview_pastes(&text);
+        self.send_as(shown, full);
     }
 
     /// `shown` goes to the log, `text` to the model.
@@ -1026,7 +1051,9 @@ impl App {
         reply: oneshot::Sender<Answer>,
         background: bool,
     ) {
-        if self.always.contains(&name) {
+        // In a `/plan` turn a change is asked about even when its tool was answered "always".
+        let plan = !background && self.access == Access::Plan && self.tools.is_mutating(&name);
+        if self.always.contains(&name) && !plan {
             let _ = reply.send(Answer::Yes);
             return;
         }
@@ -1094,7 +1121,7 @@ impl App {
         let run = Run {
             provider: active.provider.clone(),
             model: active.model.clone(),
-            mode: self.mode,
+            access: self.access,
             history: self.history.clone(),
             cut: self.cut.clone(),
             tools: self.tools.clone(),
@@ -1132,6 +1159,7 @@ impl App {
         self.approval.retain(|a| a.background);
         self.log.retain(|e| e.agent().is_none());
         self.drop_transcripts(|t| !t.background);
+        self.access = Access::Full;
         if let Some(h) = self.running.take() {
             h.abort();
             // Invalidate events already queued by the aborted run.
@@ -1175,14 +1203,8 @@ impl App {
         let _ = a.reply.send(answer);
     }
 
-    fn set_mode(&mut self, mode: Mode) {
-        self.mode = mode;
-    }
-
     fn command(&mut self, cmd: Command) {
         match cmd {
-            Command::Plan => self.set_mode(Mode::Plan),
-            Command::Build => self.set_mode(Mode::Build),
             Command::Model(None) => {
                 let Some(active) = &self.active else {
                     self.log.push(Entry::Info(NO_PROVIDERS.into()));
@@ -1273,6 +1295,7 @@ impl App {
                 self.stop_background();
                 self.history.clear();
                 self.shown.clear();
+                crate::tools::clear_spills(self.tools.root());
                 self.session = Some(Session::new(self.tools.root()));
                 self.metrics.clear();
                 self.cut = ContextCut::default();
@@ -1473,6 +1496,7 @@ impl App {
             AgentEvent::Error(e) => self.push_log(Entry::Error(e)),
             AgentEvent::Finished => {
                 self.running = None;
+                self.access = Access::Full;
                 self.location = super::location::location(self.tools.root());
                 self.drop_transcripts(|t| !t.background);
                 // Queued messages and notices wait for the compaction's own `Finished`.
@@ -1588,6 +1612,11 @@ impl App {
             text.push_str(&format!("\n\nArguments: {a}"));
             shown.push_str(&format!(" {a}"));
         }
+        self.access = if skill.read_only {
+            Access::Plan
+        } else {
+            Access::Full
+        };
         self.send_as(shown, text);
     }
 
@@ -1614,7 +1643,10 @@ impl App {
                     "{}{flags}: {}\n  {}",
                     s.name,
                     s.short_description(100),
-                    s.dir.display()
+                    match s.builtin {
+                        Some(_) => "built in".to_string(),
+                        None => s.dir.display().to_string(),
+                    }
                 )
             })
             .collect();

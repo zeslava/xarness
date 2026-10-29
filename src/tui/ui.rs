@@ -10,7 +10,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::app::{APPROVAL_OPTIONS, App, Approval, Entry, FlashKind, Phase, Selection};
 use super::markdown;
-use crate::domain::message::Mode;
+use crate::domain::message::Access;
 
 const TOOL_OUTPUT_PREVIEW: usize = 8;
 const MAX_INPUT_ROWS: usize = 6;
@@ -35,9 +35,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let width = f.area().width.saturating_sub(2).max(1) as usize;
     let (rows, cur_row, cur_col) = input_lines(&app.input, app.cursor, width);
     let input_rows = rows.len().clamp(1, MAX_INPUT_ROWS);
-    let accent = match app.mode {
-        Mode::Plan => Color::Cyan,
-        Mode::Build => Color::LightBlue,
+    let accent = match app.access {
+        Access::Plan => Color::Cyan,
+        _ => Color::LightBlue,
     };
     let panel_cap = (f.area().height as usize * PANEL_SHARE_PCT / 100).max(1);
     let (panel, keep) = panel_lines(app, f.area().width as usize, panel_cap, accent);
@@ -165,10 +165,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let status = status_line(app);
     let used = status.width();
     f.render_widget(status, status_area);
-    let location = Line::styled(
+    // Styled as a span: a line's own style would be applied over the whole area, recoloring the status.
+    let location = Line::from(Span::styled(
         format!("{} ", app.location),
         Style::new().fg(Color::DarkGray),
-    );
+    ));
     // Hidden when it would overlap the status.
     if used + location.width() < status_area.width as usize {
         f.render_widget(location.right_aligned(), status_area);
@@ -412,14 +413,13 @@ fn input_lines(input: &str, cursor: usize, width: usize) -> (Vec<String>, usize,
 }
 
 fn status_line(app: &App) -> Line<'static> {
-    let (label, color) = match app.mode {
-        Mode::Plan => (" PLAN ", Color::Cyan),
-        Mode::Build => (" BUILD ", Color::LightBlue),
-    };
-    let mut spans = vec![Span::styled(
-        label,
-        Style::new().fg(Color::Black).bg(color).bold(),
-    )];
+    let mut spans = Vec::new();
+    if app.access == Access::Plan {
+        spans.push(Span::styled(
+            " PLAN ",
+            Style::new().fg(Color::Black).bg(Color::Cyan).bold(),
+        ));
+    }
     spans.push(Span::raw(format!(" {} ", app.model_label())));
     if let Some(think) = &app.think {
         spans.push(Span::styled(

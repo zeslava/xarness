@@ -1,6 +1,4 @@
 pub enum Command {
-    Plan,
-    Build,
     Model(Option<String>),
     Think(Option<String>),
     Map,
@@ -23,8 +21,8 @@ pub enum Command {
     },
 }
 
-pub const HELP: &str = "/clear  /compact [focus]  /resume [n]  /plan  /build  /model [provider/model]  /think [level]  /map [show]  /mcp  /skills  /agents [list]  /stats  /<skill> [args]  /help  /quit\n\
-Tab — complete command or cycle its arguments, Shift+Tab — toggle mode, Esc — interrupt or close the subagent pane, PgUp/PgDn/wheel — scroll, Up/Down/Ctrl+P/Ctrl+N — input history, drag — select and copy (Shift+drag — native selection), Ctrl+C — interrupt or clear input, twice to quit\n\
+pub const HELP: &str = "/clear  /compact [focus]  /resume [n]  /plan <task>  /model [provider/model]  /think [level]  /map [show]  /mcp  /skills  /agents [list]  /stats  /<skill> [args]  /help  /quit\n\
+Tab — complete command or cycle its arguments, Esc — interrupt or close the subagent pane, PgUp/PgDn/wheel — scroll, Up/Down/Ctrl+P/Ctrl+N — input history, drag — select and copy (Shift+drag — native selection), Ctrl+C — interrupt or clear input, twice to quit\n\
 Shift+Enter/Alt+Enter/Ctrl+J — new line, Ctrl+W/Alt+Backspace — delete word, Ctrl+U/Ctrl+K — delete to line start/end, \
 Ctrl+A/Ctrl+E — line start/end, Ctrl+←→/Alt+B/Alt+F — move by word\n\
 Approval: ←→/Tab + Enter; type a reason, pick no and Enter to decline with it; Esc interrupts";
@@ -33,8 +31,6 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("clear", "clear history"),
     ("compact", "replace history with a summary"),
     ("resume", "list or resume saved sessions"),
-    ("plan", "read-only mode"),
-    ("build", "mode with mutating tools"),
     ("model", "list or switch model"),
     ("think", "list or set reasoning level"),
     ("map", "rebuild repo map"),
@@ -129,8 +125,6 @@ pub fn parse(input: &str) -> Command {
     let name = parts.next().unwrap_or_default();
     let arg = parts.next().map(str::trim).filter(|s| !s.is_empty());
     match name {
-        "plan" => Command::Plan,
-        "build" => Command::Build,
         "model" => Command::Model(arg.map(str::to_string)),
         "think" => Command::Think(arg.map(str::to_string)),
         "map" => match arg {
