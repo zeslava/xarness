@@ -49,5 +49,5 @@ fn dirty(root: &Path) -> Option<bool> {
         .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
-    out.status.success().then(|| !out.stdout.is_empty())
+    out.status.success().then_some(!out.stdout.is_empty())
 }
