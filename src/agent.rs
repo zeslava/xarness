@@ -1495,7 +1495,7 @@ fn cap_read(s: String, cap: usize, root: &Path) -> String {
     }
 }
 
-const SUBAGENT_NOTE: &str ="You are a subagent: the task comes from another agent, not from the \
+const SUBAGENT_NOTE: &str = "You are a subagent: the task comes from another agent, not from the \
 user, and you cannot ask it anything. Work on your own, then end with a final message reporting the \
 result. It is passed to that agent verbatim and is all it sees of your work, so make it complete \
 and concise.";

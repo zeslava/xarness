@@ -13,6 +13,9 @@ use super::markdown;
 use crate::domain::message::Access;
 
 const TOOL_OUTPUT_PREVIEW: usize = 8;
+const DIFF_PREVIEW: usize = 20;
+/// Above this many old×new line pairs the LCS table is skipped and the edit shown as remove-all, add-all.
+const DIFF_MAX_CELLS: usize = 250_000;
 const MAX_INPUT_ROWS: usize = 6;
 /// Upper bound of the panel above the input, as a share of the screen height.
 const PANEL_SHARE_PCT: usize = 40;
@@ -313,18 +316,24 @@ fn approval_lines(a: &Approval, width: usize, cap: usize, accent: Color) -> Vec<
     let mut lines = vec![Line::from(title)];
     let room = cap.saturating_sub(2);
     // Hard-wrapped rather than truncated: the whole command must be visible to approve it.
-    let preview: Vec<String> = approval_preview(&a.name, &a.arguments)
+    let dim = Style::new().dim();
+    let preview: Vec<(Style, String)> = approval_preview(&a.name, &a.arguments)
         .iter()
         .flat_map(|l| {
+            let style = if a.name == "edit_file" {
+                l.chars().next().map_or(dim, diff_style)
+            } else {
+                dim
+            };
             let chars: Vec<char> = l.chars().collect();
             let chunks: Vec<String> = chars
                 .chunks(width.saturating_sub(4).max(1))
                 .map(|c| c.iter().collect())
                 .collect();
             if chunks.is_empty() {
-                vec![String::new()]
+                vec![(style, String::new())]
             } else {
-                chunks
+                chunks.into_iter().map(|c| (style, c)).collect()
             }
         })
         .collect();
@@ -333,16 +342,15 @@ fn approval_lines(a: &Approval, width: usize, cap: usize, accent: Color) -> Vec<
     } else {
         preview.len()
     };
-    let style = Style::new().dim();
     lines.extend(
         preview[..shown]
             .iter()
-            .map(|l| Line::styled(format!("  {OUTPUT_BAR} {l}"), style)),
+            .map(|(style, l)| Line::styled(format!("  {OUTPUT_BAR} {l}"), *style)),
     );
     if shown < preview.len() && room > 0 {
         lines.push(Line::styled(
             format!("  {OUTPUT_BAR} … {} more lines", preview.len() - shown),
-            style,
+            dim,
         ));
     }
     let mut options = Vec::new();
@@ -368,20 +376,13 @@ fn approval_preview(name: &str, arguments: &str) -> Vec<String> {
     let lines = |s: &str| s.lines().map(String::from).collect::<Vec<_>>();
     match name {
         "run" if str_arg("command").is_some() => lines(str_arg("command").unwrap_or_default()),
-        "edit_file" if str_arg("old_string").is_some() => {
-            let mut out: Vec<String> = str_arg("old_string")
-                .unwrap_or_default()
-                .lines()
-                .map(|l| format!("- {l}"))
-                .collect();
-            out.extend(
-                str_arg("new_string")
-                    .unwrap_or_default()
-                    .lines()
-                    .map(|l| format!("+ {l}")),
-            );
-            out
-        }
+        "edit_file" if str_arg("old_string").is_some() => line_diff(
+            str_arg("old_string").unwrap_or_default(),
+            str_arg("new_string").unwrap_or_default(),
+        )
+        .into_iter()
+        .map(|(c, l)| format!("{c} {l}"))
+        .collect(),
         "write_file" if str_arg("content").is_some() => {
             lines(str_arg("content").unwrap_or_default())
         }
@@ -520,22 +521,27 @@ fn log_text(log: &[Entry]) -> Text<'static> {
                 name,
                 arguments,
                 agent,
-            } => lines.push(Line::from(vec![
-                match agent {
-                    Some(a) => Span::styled(
-                        format!("  {SUBAGENT_MARK} {a} {} ", display_name(name)),
-                        Style::new().fg(Color::Magenta),
+            } => {
+                lines.push(Line::from(vec![
+                    match agent {
+                        Some(a) => Span::styled(
+                            format!("  {SUBAGENT_MARK} {a} {} ", display_name(name)),
+                            Style::new().fg(Color::Magenta),
+                        ),
+                        None => Span::styled(
+                            format!("{TOOL_MARK} {} ", display_name(name)),
+                            Style::new().fg(Color::Magenta).bold(),
+                        ),
+                    },
+                    Span::styled(
+                        truncate(&tool_summary(name, arguments), 200),
+                        Style::new().dim(),
                     ),
-                    None => Span::styled(
-                        format!("{TOOL_MARK} {} ", display_name(name)),
-                        Style::new().fg(Color::Magenta).bold(),
-                    ),
-                },
-                Span::styled(
-                    truncate(&tool_summary(name, arguments), 200),
-                    Style::new().dim(),
-                ),
-            ])),
+                ]));
+                if agent.is_none() && name == "edit_file" {
+                    lines.extend(edit_diff_lines(arguments));
+                }
+            }
             Entry::ToolOutput {
                 text,
                 is_error,
@@ -573,6 +579,72 @@ fn log_text(log: &[Entry]) -> Text<'static> {
         lines.push(Line::default());
     }
     Text::from(lines)
+}
+
+fn edit_diff_lines(arguments: &str) -> Vec<Line<'static>> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(arguments) else {
+        return Vec::new();
+    };
+    let str_arg = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or_default();
+    let diff = line_diff(str_arg("old_string"), str_arg("new_string"));
+    let mut out: Vec<Line> = diff
+        .iter()
+        .take(DIFF_PREVIEW)
+        .map(|(c, l)| Line::styled(format!("  {OUTPUT_BAR} {c} {l}"), diff_style(*c)))
+        .collect();
+    if diff.len() > DIFF_PREVIEW {
+        out.push(Line::styled(
+            format!("  {OUTPUT_BAR} … {} more lines", diff.len() - DIFF_PREVIEW),
+            Style::new().dim(),
+        ));
+    }
+    out
+}
+
+fn diff_style(mark: char) -> Style {
+    match mark {
+        '+' => Style::new().fg(Color::Green),
+        '-' => Style::new().fg(Color::Red),
+        _ => Style::new().dim(),
+    }
+}
+
+/// Line diff by longest common subsequence: each line marked `' '`, `'-'` or `'+'`.
+fn line_diff<'a>(old: &'a str, new: &'a str) -> Vec<(char, &'a str)> {
+    let a: Vec<&str> = old.lines().collect();
+    let b: Vec<&str> = new.lines().collect();
+    let (n, m) = (a.len(), b.len());
+    if n * m > DIFF_MAX_CELLS {
+        let removed = a.into_iter().map(|l| ('-', l));
+        return removed.chain(b.into_iter().map(|l| ('+', l))).collect();
+    }
+    // lcs[i][j]: LCS length of a[i..] and b[j..].
+    let mut lcs = vec![vec![0u32; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            lcs[i][j] = if a[i] == b[j] {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    let mut out = Vec::with_capacity(n.max(m));
+    while i < n || j < m {
+        if i < n && j < m && a[i] == b[j] {
+            out.push((' ', a[i]));
+            i += 1;
+            j += 1;
+        } else if i < n && (j == m || lcs[i + 1][j] >= lcs[i][j + 1]) {
+            out.push(('-', a[i]));
+            i += 1;
+        } else {
+            out.push(('+', b[j]));
+            j += 1;
+        }
+    }
+    out
 }
 
 /// Human-readable form of tool arguments; falls back to raw JSON for unknown
