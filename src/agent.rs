@@ -287,10 +287,20 @@ async fn drive(r: &mut Run, sink: &Sink) -> anyhow::Result<Outcome> {
                         + estimate_tokens(&t.parameters.to_string())
                 })
                 .sum::<usize>();
-        let history = elide_old_outputs(&r.history);
+        let reserve = r.model.max_tokens.unwrap_or(DEFAULT_OUTPUT_RESERVE);
+        let mut history = elide_old_outputs(&r.history, r.cut.elide_before);
+        let last_user = last_user(&r.history);
+        if r.cut.elide_before < last_user
+            && context_window.is_none_or(|w| {
+                let tokens = fixed + total_tokens(&r.cut.apply(&history));
+                elide_due(w, reserve, tokens as f64 * scale)
+            })
+        {
+            r.cut.elide_before = last_user;
+            history = elide_old_outputs(&r.history, last_user);
+        }
         let history = match context_window {
             Some(ctx) => {
-                let reserve = r.model.max_tokens.unwrap_or(DEFAULT_OUTPUT_RESERVE);
                 let budget = (ctx.saturating_sub(reserve) as f64 / scale) as usize;
                 fit_context(&history, budget.saturating_sub(fixed), &mut r.cut)
             }
@@ -961,7 +971,7 @@ pub async fn compact(
         Some(f) => format!("{COMPACT_REQUEST} Focus on: {f}"),
         None => COMPACT_REQUEST.into(),
     });
-    let history = elide_old_outputs(&r.history);
+    let history = elide_old_outputs(&r.history, r.cut.elide_before);
     let history = match context_window {
         Some(ctx) => {
             let reserve = r.model.max_tokens.unwrap_or(DEFAULT_OUTPUT_RESERVE);
@@ -1098,6 +1108,9 @@ pub struct ContextCut {
     start: usize,
     /// (index relative to `start`, bytes kept)
     truncated: Vec<(usize, usize)>,
+    /// History index before which long tool outputs and arguments are elided. Only ever moves
+    /// forward, so the prefix stays byte-identical between moves.
+    elide_before: usize,
 }
 
 impl ContextCut {
@@ -1263,7 +1276,10 @@ fn fit_context(history: &[Message], budget: usize, cut: &mut ContextCut) -> Vec<
     if total_tokens(&view) <= budget {
         return view;
     }
-    *cut = trim(history, budget);
+    *cut = ContextCut {
+        elide_before: cut.elide_before,
+        ..trim(history, budget)
+    };
     cut.apply(history)
 }
 
@@ -1289,7 +1305,7 @@ fn trim(history: &[Message], budget: usize) -> ContextCut {
     if total <= budget {
         return ContextCut {
             start,
-            truncated: Vec::new(),
+            ..Default::default()
         };
     }
     let mut excess = total - (budget as f64 * TRUNCATE_TARGET) as usize;
@@ -1327,24 +1343,42 @@ fn trim(history: &[Message], budget: usize) -> ContextCut {
         .enumerate()
         .filter_map(|(i, k)| Some((i, k?)))
         .collect();
-    ContextCut { start, truncated }
+    ContextCut {
+        start,
+        truncated,
+        ..Default::default()
+    }
 }
 
-/// Tool outputs and long string arguments of tool calls from finished turns (followed by a later
-/// user message) longer than this are replaced with a mark. Reasoning is kept only on the latest
-/// assistant message of the current turn: with a small context window, every step's thinking
-/// piling up within one turn fills it fast. This changes the previous step on each new step, so
-/// the server re-processes the prompt from there; outputs and arguments change only when a new
-/// turn starts.
+/// Finished turns keep their tool outputs until the window has less than this many tokens free,
+/// about what one heavy turn reads. A window this small elides them as soon as a turn ends.
+const ELIDE_FREE_TOKENS: f64 = 64_000.0;
+/// The same for huge windows, where the free room alone would let every request grow very long.
+const ELIDE_MAX_FILL: f64 = 0.75;
+
+fn elide_due(window: u32, reserve: u32, tokens: f64) -> bool {
+    let window = window as f64;
+    tokens > window * ELIDE_MAX_FILL || window - reserve as f64 - tokens < ELIDE_FREE_TOKENS
+}
+
+/// Tool outputs and long string arguments of tool calls before `before` (see `elide_due`) longer
+/// than this are replaced with a mark. Reasoning is kept only on the latest assistant message of
+/// the current turn: with a small context window, every step's thinking piling up within one turn
+/// fills it fast. This changes the previous step on each new step, so the server re-processes the
+/// prompt from there; outputs and arguments change only when `before` moves.
 const ELIDE_MIN_BYTES: usize = 200;
 const ELIDED_MARK: &str = "[output from an earlier turn elided; re-run the tool if needed]";
 const ELIDED_ARG: &str = "[argument from an earlier turn elided]";
 
-fn elide_old_outputs(history: &[Message]) -> Vec<Message> {
-    let last_user = history
+fn last_user(history: &[Message]) -> usize {
+    history
         .iter()
         .rposition(|m| matches!(m, Message::User(_)))
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
+
+fn elide_old_outputs(history: &[Message], before: usize) -> Vec<Message> {
+    let last_user = last_user(history);
     let last_assistant = history
         .iter()
         .rposition(|m| matches!(m, Message::Assistant { .. }))
@@ -1353,9 +1387,7 @@ fn elide_old_outputs(history: &[Message]) -> Vec<Message> {
         .iter()
         .enumerate()
         .map(|(i, m)| match m {
-            Message::Tool { call_id, content }
-                if i < last_user && content.len() > ELIDE_MIN_BYTES =>
-            {
+            Message::Tool { call_id, content } if i < before && content.len() > ELIDE_MIN_BYTES => {
                 Message::Tool {
                     call_id: call_id.clone(),
                     content: ELIDED_MARK.into(),
@@ -1372,7 +1404,7 @@ fn elide_old_outputs(history: &[Message]) -> Vec<Message> {
                 } else {
                     String::new()
                 },
-                tool_calls: if i < last_user {
+                tool_calls: if i < before {
                     tool_calls.iter().map(elide_arguments).collect()
                 } else {
                     tool_calls.clone()
@@ -1636,7 +1668,7 @@ mod tests {
             output("r"),
             Message::User("next".into()),
         ];
-        let elided = elide_old_outputs(&history);
+        let elided = elide_old_outputs(&history, 5);
         assert!(matches!(&elided[2], Message::Tool { content, .. } if content == ELIDED_MARK));
         assert!(matches!(&elided[4], Message::Tool { content, .. } if content == ELIDED_MARK));
 
@@ -1673,13 +1705,66 @@ mod tests {
             step("b"),
             output("b"),
         ];
-        let elided = elide_old_outputs(&history);
+        let elided = elide_old_outputs(&history, 0);
         assert_eq!(reasoning(&elided[1]), "");
         assert_eq!(reasoning(&elided[3]), "think");
 
         history.push(Message::User("next".into()));
-        let elided = elide_old_outputs(&history);
+        let elided = elide_old_outputs(&history, 0);
         assert_eq!(reasoning(&elided[3]), "");
+    }
+
+    #[test]
+    fn old_outputs_elided_only_before_boundary() {
+        let output = |id: &str| Message::Tool {
+            call_id: id.into(),
+            content: "x".repeat(3000),
+        };
+        let history = vec![
+            Message::User("q".into()),
+            output("a"),
+            Message::User("next".into()),
+            output("b"),
+            Message::User("last".into()),
+        ];
+        let is_elided = |h: &[Message], i: usize| matches!(&h[i], Message::Tool { content, .. } if content == ELIDED_MARK);
+        let kept = elide_old_outputs(&history, 0);
+        assert!(!is_elided(&kept, 1) && !is_elided(&kept, 3));
+        let part = elide_old_outputs(&history, 2);
+        assert!(is_elided(&part, 1) && !is_elided(&part, 3));
+    }
+
+    #[test]
+    fn elision_depends_on_free_room() {
+        // Small windows never have the room, so outputs go as soon as a turn ends.
+        assert!(elide_due(32_768, 2048, 1.0));
+        assert!(elide_due(64_000, 0, 1.0));
+        // 200k keeps them up to 68% without counting the reserve, 66% with an 8k one.
+        assert!(!elide_due(200_000, 0, 135_000.0));
+        assert!(elide_due(200_000, 0, 137_000.0));
+        assert!(!elide_due(200_000, 8_000, 127_000.0));
+        assert!(elide_due(200_000, 8_000, 129_000.0));
+        // Huge windows stop at the fill limit.
+        assert!(!elide_due(1_000_000, 0, 749_000.0));
+        assert!(elide_due(1_000_000, 0, 751_000.0));
+    }
+
+    #[test]
+    fn fit_context_keeps_elision_boundary() {
+        let history = vec![
+            Message::User("q".into()),
+            Message::Tool {
+                call_id: "a".into(),
+                content: "x".repeat(30_000),
+            },
+        ];
+        let mut cut = ContextCut {
+            elide_before: 7,
+            ..Default::default()
+        };
+        fit_context(&history, 1000, &mut cut);
+        assert!(!cut.truncated.is_empty());
+        assert_eq!(cut.elide_before, 7);
     }
 
     #[test]
@@ -1718,7 +1803,7 @@ mod tests {
                 }],
             },
         ];
-        let arguments = |h: &[Message]| match &elide_old_outputs(h)[1] {
+        let arguments = |h: &[Message]| match &elide_old_outputs(h, last_user(h))[1] {
             Message::Assistant { tool_calls, .. } => {
                 serde_json::from_str::<Value>(&tool_calls[0].arguments).unwrap()
             }
