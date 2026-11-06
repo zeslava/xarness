@@ -1539,10 +1539,11 @@ what would have to be changed or run.";
 const MAIN_TASK: &str = "Match your work to the kind of request. A question (how, why, where, \
 what does X do): answer it; do not change files or run commands that change state. A request to \
 review, plan or propose: explore and report; do not implement until the user agrees. A request to \
-change something: make the change. Read files before editing them; prefer edit_file for targeted \
+change something: make the change. A terse command is a request to act on its most \
+literal reading (a tool name means that tool). Read files before editing them; prefer edit_file for targeted \
 changes. Change only what the task requires: no unrelated refactoring, renaming, reformatting, \
-extra features, comments, tests or new files unless asked. If you cannot tell which kind of \
-request it is, or a broader change seems necessary, ask one short question instead of guessing.";
+extra features, comments, tests or new files unless asked. Ask one short question instead \
+of guessing only if no literal reading makes sense or a broader change seems necessary.";
 
 fn system_prompt(
     access: Access,
