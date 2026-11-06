@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
 use unicode_width::UnicodeWidthStr;
 
-use super::app::{APPROVAL_OPTIONS, App, Approval, Entry, FlashKind, Phase, Selection};
+use super::app::{APPROVAL_OPTIONS, App, Approval, Entry, FlashKind, Phase, Selection, ToolStatus};
 use super::markdown;
 use crate::domain::message::Access;
 
@@ -26,6 +26,8 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 // Markers must be single-width and without an emoji variant, or terminals disagree on their size.
 const PROMPT: &str = "❯ ";
 const TOOL_MARK: &str = "●";
+// Static: blinking draws the eye, and the status line's spinner already shows activity.
+const TOOL_RUNNING_MARK: &str = "○";
 const SUBAGENT_MARK: &str = "↳";
 const AGENT_MARK: &str = "◇";
 const WAIT_MARK: &str = "⏳";
@@ -521,23 +523,34 @@ fn log_text(log: &[Entry]) -> Text<'static> {
                 name,
                 arguments,
                 agent,
+                status,
             } => {
-                lines.push(Line::from(vec![
-                    match agent {
-                        Some(a) => Span::styled(
-                            format!("  {SUBAGENT_MARK} {a} {} ", display_name(name)),
+                let marker_style = Style::new().fg(Color::Magenta).bold();
+                let mark = match status {
+                    ToolStatus::Running => TOOL_RUNNING_MARK,
+                    _ => TOOL_MARK,
+                };
+                let mut spans = match agent {
+                    Some(a) => vec![
+                        Span::styled(format!("  {SUBAGENT_MARK} "), marker_style),
+                        Span::styled(
+                            format!("{a} {} ", display_name(name)),
                             Style::new().fg(Color::Magenta),
                         ),
-                        None => Span::styled(
-                            format!("{TOOL_MARK} {} ", display_name(name)),
+                    ],
+                    None => vec![
+                        Span::styled(format!("{mark} "), marker_style),
+                        Span::styled(
+                            format!("{} ", display_name(name)),
                             Style::new().fg(Color::Magenta).bold(),
                         ),
-                    },
-                    Span::styled(
-                        truncate(&tool_summary(name, arguments), 200),
-                        Style::new().dim(),
-                    ),
-                ]));
+                    ],
+                };
+                spans.push(Span::styled(
+                    truncate(&tool_summary(name, arguments), 200),
+                    Style::new().dim(),
+                ));
+                lines.push(Line::from(spans));
                 if agent.is_none() && name == "edit_file" {
                     lines.extend(edit_diff_lines(arguments));
                 }

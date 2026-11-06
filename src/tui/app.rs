@@ -77,6 +77,7 @@ pub enum Entry {
         name: String,
         arguments: String,
         agent: Option<String>,
+        status: ToolStatus,
     },
     ToolOutput {
         text: String,
@@ -87,7 +88,37 @@ pub enum Entry {
     Error(String),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ToolStatus {
+    Running,
+    Done,
+}
+
 impl Entry {
+    /// Results arrive in call order for each agent, including parallel `agent` calls.
+    fn finish_tool(log: &mut [Entry], label: Option<&str>) {
+        for entry in log {
+            if let Entry::Tool { agent, status, .. } = entry
+                && *status == ToolStatus::Running
+                && agent.as_deref() == label
+            {
+                *status = ToolStatus::Done;
+                break;
+            }
+        }
+    }
+
+    /// Calls cut short by an interrupt or a turn's end have no result to show.
+    fn finish_tools(log: &mut [Entry]) {
+        for entry in log {
+            if let Entry::Tool { status, .. } = entry
+                && *status == ToolStatus::Running
+            {
+                *status = ToolStatus::Done;
+            }
+        }
+    }
+
     /// Label of the subagent the entry comes from.
     fn agent(&self) -> Option<&String> {
         match self {
@@ -158,6 +189,7 @@ fn history_log(history: &[Message], shown: &Shown) -> Vec<Entry> {
                     name: c.name.clone(),
                     arguments: c.arguments.clone(),
                     agent: None,
+                    status: ToolStatus::Done,
                 }));
             }
             Message::System(_) | Message::Tool { .. } => {}
@@ -945,6 +977,7 @@ impl App {
                         name,
                         arguments,
                         agent: None,
+                        status: ToolStatus::Running,
                     },
                 );
             }
@@ -991,6 +1024,9 @@ impl App {
         let Some(t) = self.transcripts.iter_mut().find(|t| t.label == label) else {
             return;
         };
+        if let Entry::ToolOutput { .. } = entry {
+            Entry::finish_tool(&mut t.log, None);
+        }
         match (t.log.last_mut(), entry) {
             (Some(Entry::Assistant(s)), Entry::Assistant(delta)) => s.push_str(&delta),
             (_, e) => t.log.push(e),
@@ -1156,6 +1192,7 @@ impl App {
     }
 
     fn interrupt(&mut self) {
+        Entry::finish_tools(&mut self.log);
         self.approval.retain(|a| a.background);
         self.log.retain(|e| e.agent().is_none());
         self.drop_transcripts(|t| !t.background);
@@ -1410,6 +1447,7 @@ impl App {
                             name: name.clone(),
                             arguments: arguments.clone(),
                             agent: None,
+                            status: ToolStatus::Running,
                         },
                     );
                 }
@@ -1417,6 +1455,7 @@ impl App {
                     name,
                     arguments,
                     agent,
+                    status: ToolStatus::Running,
                 })
             }
             // Successful tool output is noise in the log; only errors are shown.
@@ -1425,6 +1464,7 @@ impl App {
                 is_error,
                 agent,
             } => {
+                Entry::finish_tool(&mut self.log, agent.as_deref());
                 self.set_phase(match &agent {
                     Some(a) => Phase::Running(a.clone()),
                     None => Phase::Waiting,
@@ -1495,6 +1535,7 @@ impl App {
             }),
             AgentEvent::Error(e) => self.push_log(Entry::Error(e)),
             AgentEvent::Finished => {
+                Entry::finish_tools(&mut self.log);
                 self.running = None;
                 self.access = Access::Full;
                 self.location = super::location::location(self.tools.root());
