@@ -738,7 +738,7 @@ struct Workdir {
 
 async fn workdir(r: &Run, c: &ToolCall, dir: &str, sink: &Sink) -> anyhow::Result<Option<Workdir>> {
     let root = r.tools.root();
-    let path = tools::resolve_read(root, dir)?;
+    let path = tools::resolve_path(root, dir)?;
     if path == root {
         return Ok(None);
     }

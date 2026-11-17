@@ -24,8 +24,8 @@ use crate::skills::Skills;
 
 pub(crate) use skill::NAME as SKILL_TOOL;
 
-/// Tools whose `path` goes through `resolve_read`.
-const PATH_READERS: [&str; 4] = ["read_file", "read_symbol", "list_dir", "grep"];
+/// Tools whose `path` may leave the working directory after approval.
+const PATH_TOOLS: [&str; 5] = ["read_file", "read_symbol", "list_dir", "grep", "write_file"];
 
 pub struct ToolRegistry {
     root: PathBuf,
@@ -127,7 +127,7 @@ impl ToolRegistry {
             .is_none_or(|t| t.mutating())
     }
 
-    /// Besides tools that always ask, a read-only tool asks when its `path` leaves the working
+    /// Besides tools that always ask, a path tool asks when its `path` leaves the working
     /// directory, and a mutating tool asks unless access is full (only MCP tools are offered
     /// to a read-only run).
     pub fn needs_approval(&self, access: Access, name: &str, arguments: &str) -> bool {
@@ -136,7 +136,7 @@ impl ToolRegistry {
         };
         tool.needs_approval()
             || (access != Access::Full && tool.mutating())
-            || (PATH_READERS.contains(&name)
+            || (PATH_TOOLS.contains(&name)
                 && serde_json::from_str::<Value>(arguments)
                     .ok()
                     .as_ref()
@@ -184,10 +184,9 @@ pub(crate) fn resolve(root: &Path, path: &str) -> Result<PathBuf> {
     Ok(out)
 }
 
-/// For read-only tools: any path is readable, e.g. dependency sources in `~/.cargo/registry` or
-/// `~/go/pkg/mod`; outside the working directory the call waits for approval
-/// (`ToolRegistry::needs_approval`). Writes stay inside the working directory.
-pub(crate) fn resolve_read(root: &Path, path: &str) -> Result<PathBuf> {
+/// Allows any path; callers must gate access outside the working directory on approval
+/// (`ToolRegistry::needs_approval`, or the agent's directory check).
+pub(crate) fn resolve_path(root: &Path, path: &str) -> Result<PathBuf> {
     Ok(lexical(root, path))
 }
 
@@ -273,4 +272,69 @@ pub(crate) fn display(root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .display()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn external_writes_need_approval() {
+        let root = std::env::temp_dir().join("xarness-approval");
+        let tools = ToolRegistry::new(root.clone(), Arc::new(Skills::default()));
+        let outside = root.with_file_name("xarness-outside").join("file.txt");
+        for (path, external) in [
+            ("file.txt".to_string(), false),
+            ("nested/../file.txt".to_string(), false),
+            (root.join("file.txt").to_string_lossy().into_owned(), false),
+            ("../xarness-outside/file.txt".to_string(), true),
+            (outside.to_string_lossy().into_owned(), true),
+            ("~/xarness-outside/file.txt".to_string(), true),
+        ] {
+            let args = json!({"path": path, "content": "hello"}).to_string();
+            for name in ["read_file", "write_file"] {
+                assert_eq!(
+                    tools.needs_approval(Access::Full, name, &args),
+                    external,
+                    "{name}: {path}"
+                );
+            }
+            assert!(tools.needs_approval(Access::Plan, "write_file", &args));
+        }
+    }
+
+    #[tokio::test]
+    async fn external_write_runs_after_approval_but_is_unavailable_read_only() {
+        let base = std::env::temp_dir().join(format!("xarness-write-{}", std::process::id()));
+        let root = base.join("project");
+        let target = base.join("outside/nested/file.txt");
+        let tools = ToolRegistry::new(root, Arc::new(Skills::default()));
+        let args = json!({"path": "../outside/nested/file.txt", "content": "hello"}).to_string();
+
+        assert!(tools.needs_approval(Access::Full, "write_file", &args));
+        assert!(
+            tools
+                .run(Access::ReadOnly, None, "write_file", &args)
+                .await
+                .is_err()
+        );
+        assert!(!target.exists());
+
+        // The agent calls run only after the user approves.
+        tools
+            .run(Access::Full, None, "write_file", &args)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "hello");
+
+        let args = json!({"path": target, "content": "updated"}).to_string();
+        assert!(tools.needs_approval(Access::Full, "write_file", &args));
+        tools
+            .run(Access::Full, None, "write_file", &args)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "updated");
+        std::fs::remove_dir_all(base).unwrap();
+    }
 }

@@ -47,7 +47,7 @@ impl Tool for WriteFile {
 impl WriteFile {
     fn call(&self, args: Value, root: &Path) -> Result<String> {
         let a: Args = super::parse(args)?;
-        let path = super::resolve(root, &a.path)?;
+        let path = super::resolve_path(root, &a.path)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }

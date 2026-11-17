@@ -57,7 +57,7 @@ impl Grep {
         let a: Args = super::parse(args)?;
         let re = Regex::new(&a.pattern)?;
         let path = a.path.as_deref().unwrap_or(".");
-        let base = super::resolve_read(root, path)?;
+        let base = super::resolve_path(root, path)?;
         // The walk skips unreadable entries, so a wrong path would otherwise read as "no matches".
         if !base.exists() {
             anyhow::bail!("path `{path}` does not exist");

@@ -83,7 +83,7 @@ impl Tool for ReadSymbol {
 impl ReadSymbol {
     fn call(&self, args: Value, root: &Path) -> Result<String> {
         let a: Args = super::parse(args)?;
-        let path = super::resolve_read(root, &a.path)?;
+        let path = super::resolve_path(root, &a.path)?;
         if path.is_dir() {
             let Some(names) = a.name else {
                 bail!(

@@ -50,7 +50,7 @@ impl Tool for ListDir {
 impl ListDir {
     fn call(&self, args: Value, root: &Path) -> Result<String> {
         let a: Args = super::parse(args)?;
-        let path = super::resolve_read(root, &a.path)?;
+        let path = super::resolve_path(root, &a.path)?;
         let mut entries: Vec<String> = std::fs::read_dir(&path)
             .with_context(|| format!("listing {}", a.path))?
             .filter_map(|e| e.ok())
