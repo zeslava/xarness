@@ -3,6 +3,7 @@ mod clipboard;
 mod commands;
 mod location;
 mod markdown;
+mod paths;
 mod ui;
 
 use std::sync::Arc;
@@ -90,6 +91,7 @@ async fn event_loop(
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(100));
     while !app.quit {
+        app.refresh_paths();
         terminal.draw(|f| ui::draw(f, &mut app))?;
         tokio::select! {
             Some(ev) = events.next() => app.on_term_event(ev?),
@@ -98,6 +100,7 @@ async fn event_loop(
             Some(servers) = mcp_rx.recv() => app.on_mcp(servers),
             Some(report) = job_rx.recv() => app.on_job(report),
             Some(map) = map_rx.recv() => app.on_repo_map(map),
+            _ = app.paths.receive() => {},
             // Animates the spinner, counts background agents' time and expires the flash, so no
             // redraws while idle.
             _ = ticker.tick(), if app.is_running() || app.has_background() || app.flash().is_some() => app.on_tick(),

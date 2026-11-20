@@ -167,7 +167,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         input_area.x + cursor_col as u16,
         input_area.y + 1 + (cur_row - first) as u16,
     ));
-    let status = status_line(app);
+    let status = status_line(app, status_area.width as usize);
     let used = status.width();
     f.render_widget(status, status_area);
     // Styled as a span: a line's own style would be applied over the whole area, recoloring the status.
@@ -415,7 +415,7 @@ fn input_lines(input: &str, cursor: usize, width: usize) -> (Vec<String>, usize,
     (lines, pos.0, pos.1)
 }
 
-fn status_line(app: &App) -> Line<'static> {
+fn status_line(app: &App, width: usize) -> Line<'static> {
     let mut spans = Vec::new();
     if app.access == Access::Plan {
         spans.push(Span::styled(
@@ -446,25 +446,31 @@ fn status_line(app: &App) -> Line<'static> {
         };
         spans.push(Span::styled(s, Style::new().fg(fg)));
     }
-    if !app.always.is_empty() {
-        let tools = app.always.iter().cloned().collect::<Vec<_>>().join(", ");
-        spans.push(Span::styled(
-            format!(" · auto {tools}"),
-            Style::new().fg(Color::Yellow),
-        ));
-    }
+    let mut alerts = Vec::new();
     if app.unseen > 0 {
-        spans.push(Span::styled(
+        alerts.push(Span::styled(
             format!(" · {UNSEEN_MARK} {} new lines", app.unseen),
             Style::new().fg(Color::Yellow),
         ));
     }
     if app.quit_armed {
-        spans.push(Span::styled(
+        alerts.push(Span::styled(
             " · Ctrl+C again to quit",
             Style::new().fg(Color::Yellow).bold(),
         ));
     }
+    if !app.always.is_empty() {
+        // Keep the tool list within a third of the row and leave room for alerts.
+        let used: usize = spans.iter().chain(&alerts).map(Span::width).sum();
+        let room = width.saturating_sub(used).min(width / 3);
+        let tools = app.always.iter().cloned().collect::<Vec<_>>().join(", ");
+        let full = format!(" · auto {tools}");
+        let compact = format!(" · auto {}", app.always.len());
+        if let Some(text) = [full, compact].into_iter().find(|s| s.width() <= room) {
+            spans.push(Span::styled(text, Style::new().fg(Color::Yellow)));
+        }
+    }
+    spans.extend(alerts);
     Line::from(spans)
 }
 

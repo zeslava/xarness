@@ -289,6 +289,7 @@ pub struct App {
     recall: Option<usize>,
     /// Selected row of the slash-command completion popup.
     pub completion: usize,
+    pub(super) paths: super::paths::Paths,
     /// Lines scrolled up from the bottom of the log.
     pub scroll: u16,
     /// Log viewport from the last draw, for page scrolling and mapping the mouse.
@@ -367,6 +368,7 @@ impl App {
             })
         });
         agents.parallel = config.agents_parallel;
+        let paths = super::paths::Paths::new(tools.root().to_path_buf());
         let mut app = Self {
             location: super::location::location(tools.root()),
             think: active.as_ref().and_then(|a| default_think(&a.model)),
@@ -395,6 +397,7 @@ impl App {
             sent: Vec::new(),
             recall: None,
             completion: 0,
+            paths,
             scroll: 0,
             log_area: Rect::default(),
             log_total: 0,
@@ -695,8 +698,35 @@ impl App {
             self.recall = None;
             self.completion = 0;
         }
+        if key.code == KeyCode::Esc && self.approval.is_empty() && self.paths.is_active() {
+            self.paths.dismiss(&self.input, self.cursor);
+            self.completion = 0;
+            return;
+        }
+        let path_items = self.paths.completions();
+        if !path_items.is_empty() && self.approval.is_empty() {
+            let n = path_items.len();
+            match key.code {
+                KeyCode::Up if self.recall.is_none() => {
+                    self.completion = (self.completion + n - 1) % n;
+                    return;
+                }
+                KeyCode::Down | KeyCode::BackTab if self.recall.is_none() => {
+                    self.completion = (self.completion + 1) % n;
+                    return;
+                }
+                KeyCode::Tab | KeyCode::Enter => {
+                    self.paths
+                        .accept(self.completion, &mut self.input, &mut self.cursor);
+                    self.completion = 0;
+                    self.recall = None;
+                    return;
+                }
+                _ => {}
+            }
+        }
         let completions = self.completions();
-        if !completions.is_empty() && self.approval.is_empty() {
+        if self.input.starts_with('/') && !completions.is_empty() && self.approval.is_empty() {
             let n = completions.len();
             let selected = &completions[self.completion.min(n - 1)].insert;
             // A recalled slash command shows completions too; Up/Down keep browsing history.
@@ -768,7 +798,20 @@ impl App {
         }
     }
 
+    pub(super) fn refresh_paths(&mut self) {
+        if self
+            .paths
+            .refresh(&self.input, self.cursor, self.approval.is_empty())
+        {
+            self.completion = 0;
+        }
+    }
+
     pub fn completions(&self) -> Vec<Completion> {
+        let paths = self.paths.completions();
+        if !paths.is_empty() {
+            return paths;
+        }
         let skills = self
             .user_skills()
             .map(|s| (s.name.clone(), s.short_description(60)))
@@ -1787,4 +1830,62 @@ fn latin_shortcut(mut key: KeyEvent) -> KeyEvent {
         key.code = KeyCode::Char(EN.as_bytes()[i] as char);
     }
     key
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn path_keys_preserve_text_and_do_not_submit() {
+        let root = std::env::temp_dir().join(format!("xarness-path-keys-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("alpha"), "").unwrap();
+        std::fs::write(root.join("beta"), "").unwrap();
+        let skills = Arc::new(Skills::default());
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (bg, _) = tokio::sync::mpsc::unbounded_channel();
+        let (map, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            serde_json::from_str("{}").unwrap(),
+            ToolRegistry::new(root.clone(), skills.clone()),
+            skills,
+            tx,
+            bg,
+            map,
+            false,
+        )
+        .unwrap();
+        app.input = "read @ then test".into();
+        app.cursor = 6;
+        app.refresh_paths();
+        app.paths.receive().await;
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.input, "read @beta then test");
+        assert!(app.history.is_empty());
+        assert!(app.queued.is_empty());
+        app.refresh_paths();
+        assert!(app.completions().is_empty());
+        app.cursor = 10;
+        app.refresh_paths();
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.refresh_paths();
+        assert!(app.completions().is_empty());
+        assert_eq!(app.input, "read @beta then test");
+        // Moving to the mention reopens it; Tab also accepts without submitting.
+        app.cursor = 6;
+        app.refresh_paths();
+        app.paths.receive().await;
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input, "read @alpha then test");
+        assert!(app.history.is_empty());
+        // Slash completion continues to replace and complete the command.
+        app.input = "/qui".into();
+        app.cursor = 4;
+        app.refresh_paths();
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input, "/quit ");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
