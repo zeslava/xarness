@@ -77,8 +77,8 @@ pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
     /// Tools that change the filesystem: hidden from read-only runs, asked about in `/plan` turns.
     fn mutating(&self) -> bool;
-    /// Each call waits for the user's approval in the TUI.
-    fn needs_approval(&self) -> bool {
+    /// Whether this call waits for the user's approval in the TUI.
+    fn needs_approval(&self, _args: &Value) -> bool {
         false
     }
     fn run(&self, args: Value, root: &Path) -> BoxFuture<'static, anyhow::Result<String>>;

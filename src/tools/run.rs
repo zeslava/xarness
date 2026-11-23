@@ -55,7 +55,7 @@ impl Tool for RunCommand {
         true
     }
 
-    fn needs_approval(&self) -> bool {
+    fn needs_approval(&self, _args: &Value) -> bool {
         true
     }
 

@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
@@ -25,7 +25,14 @@ use crate::skills::Skills;
 pub(crate) use skill::NAME as SKILL_TOOL;
 
 /// Tools whose `path` may leave the working directory after approval.
-const PATH_TOOLS: [&str; 5] = ["read_file", "read_symbol", "list_dir", "grep", "write_file"];
+const PATH_TOOLS: [&str; 6] = [
+    "read_file",
+    "read_symbol",
+    "list_dir",
+    "grep",
+    "write_file",
+    "edit_file",
+];
 
 pub struct ToolRegistry {
     root: PathBuf,
@@ -134,13 +141,13 @@ impl ToolRegistry {
         let Some(tool) = self.find(Access::Full, None, name) else {
             return false;
         };
-        tool.needs_approval()
+        let args = serde_json::from_str::<Value>(arguments).unwrap_or(Value::Null);
+        tool.needs_approval(&args)
             || (access != Access::Full && tool.mutating())
             || (PATH_TOOLS.contains(&name)
-                && serde_json::from_str::<Value>(arguments)
-                    .ok()
-                    .as_ref()
-                    .and_then(|a| a.get("path")?.as_str())
+                && args
+                    .get("path")
+                    .and_then(Value::as_str)
                     .is_some_and(|p| !lexical(&self.root, p).starts_with(&self.root)))
     }
 
@@ -173,19 +180,9 @@ pub(crate) fn parse<T: DeserializeOwned>(args: Value) -> Result<T> {
     serde_json::from_value(args).map_err(|e| anyhow!("invalid arguments: {e}"))
 }
 
-/// Lexical resolution: the target may not exist yet, so no canonicalize. Symlinks are not followed.
-pub(crate) fn resolve(root: &Path, path: &str) -> Result<PathBuf> {
-    let out = lexical(root, path);
-    if !out.starts_with(root) {
-        bail!(
-            "path `{path}` is outside the working directory; only files inside it are accessible"
-        );
-    }
-    Ok(out)
-}
-
 /// Allows any path; callers must gate access outside the working directory on approval
 /// (`ToolRegistry::needs_approval`, or the agent's directory check).
+/// Lexical resolution: the target may not exist yet, so no canonicalize. Symlinks are not followed.
 pub(crate) fn resolve_path(root: &Path, path: &str) -> Result<PathBuf> {
     Ok(lexical(root, path))
 }
@@ -280,7 +277,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn external_writes_need_approval() {
+    fn external_paths_need_approval_for_all_file_tools() {
         let root = std::env::temp_dir().join("xarness-approval");
         let tools = ToolRegistry::new(root.clone(), Arc::new(Skills::default()));
         let outside = root.with_file_name("xarness-outside").join("file.txt");
@@ -293,19 +290,21 @@ mod tests {
             ("~/xarness-outside/file.txt".to_string(), true),
         ] {
             let args = json!({"path": path, "content": "hello"}).to_string();
-            for name in ["read_file", "write_file"] {
+            for name in PATH_TOOLS {
                 assert_eq!(
                     tools.needs_approval(Access::Full, name, &args),
                     external,
                     "{name}: {path}"
                 );
             }
-            assert!(tools.needs_approval(Access::Plan, "write_file", &args));
+            for name in ["write_file", "edit_file"] {
+                assert!(tools.needs_approval(Access::Plan, name, &args));
+            }
         }
     }
 
     #[tokio::test]
-    async fn external_write_runs_after_approval_but_is_unavailable_read_only() {
+    async fn external_write_and_edit_run_after_approval_but_are_unavailable_read_only() {
         let base = std::env::temp_dir().join(format!("xarness-write-{}", std::process::id()));
         let root = base.join("project");
         let target = base.join("outside/nested/file.txt");
@@ -335,6 +334,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "updated");
+
+        for path in [
+            "../outside/nested/file.txt".to_string(),
+            target.to_string_lossy().into_owned(),
+        ] {
+            let args =
+                json!({"path": path, "old_string": "updated", "new_string": "edited"}).to_string();
+            assert!(tools.needs_approval(Access::Full, "edit_file", &args));
+            assert!(
+                tools
+                    .run(Access::ReadOnly, None, "edit_file", &args)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "updated");
+
+            tools
+                .run(Access::Full, None, "edit_file", &args)
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "edited");
+            std::fs::write(&target, "updated").unwrap();
+        }
         std::fs::remove_dir_all(base).unwrap();
     }
 }

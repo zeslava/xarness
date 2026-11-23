@@ -66,7 +66,7 @@ cargo install --path .
 
 When started without a configuration, xarness tries to create `~/.config/xarness/config.json` with an empty `providers` object and opens the interface with a setup hint. Add a provider and models, then restart the application.
 
-The directory you launch from becomes the working root: built-in file writing tools are restricted to it, and reading files outside it requires approval. Shell commands run from this directory and also require approval; this is not OS-level process isolation. Ordinary file edits inside the project are applied without a separate prompt.
+The directory you launch from becomes the working root: reading, writing and editing files outside it require approval. Shell commands run from this directory and also require approval; this is not OS-level process isolation. Ordinary file edits inside the project are applied without a separate prompt.
 
 ## Configuration
 

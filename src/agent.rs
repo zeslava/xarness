@@ -1566,7 +1566,7 @@ fn system_prompt(
         (None, _) => MAIN_TASK.into(),
     };
     let mut prompt = format!(
-        "You are a coding agent working in `{cwd}`. All paths are relative to it; read-only tools \
+        "You are a coding agent working in `{cwd}`. All paths are relative to it; file tools \
          also accept paths outside it (`~/…` or absolute), e.g. dependency sources, after the \
          user approves.\n{task}\n\
          Do exactly what the user asked — nothing more. If you have ideas, improvements or noticed \

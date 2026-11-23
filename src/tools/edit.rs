@@ -50,7 +50,7 @@ impl Tool for EditFile {
 impl EditFile {
     fn call(&self, args: Value, root: &Path) -> Result<String> {
         let a: Args = super::parse(args)?;
-        let path = super::resolve(root, &a.path)?;
+        let path = super::resolve_path(root, &a.path)?;
         let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", a.path))?;
         let (updated, at) = apply(&text, &a.old_string, &a.new_string, a.replace_all)?;
         std::fs::write(&path, &updated).with_context(|| format!("writing {}", a.path))?;

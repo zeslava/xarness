@@ -159,7 +159,7 @@ impl Tool for McpTool {
         self.mutating
     }
 
-    fn needs_approval(&self) -> bool {
+    fn needs_approval(&self, _args: &Value) -> bool {
         self.approval
     }
 
