@@ -2,8 +2,10 @@ mod app;
 mod clipboard;
 mod commands;
 mod location;
+mod log;
 mod markdown;
 mod paths;
+mod render;
 mod ui;
 
 use std::sync::Arc;
@@ -89,21 +91,40 @@ async fn event_loop(
     mut map_rx: mpsc::UnboundedReceiver<Option<crate::repomap::RepoMap>>,
 ) -> Result<()> {
     let mut events = EventStream::new();
-    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(100));
+    let mut frames = render::Frames::new(tokio::time::Instant::now());
     while !app.quit {
-        app.refresh_paths();
-        terminal.draw(|f| ui::draw(f, &mut app))?;
+        let now = tokio::time::Instant::now();
+        let animated = app.is_running() || app.has_background() || app.flash().is_some();
+        if frames.due(now, animated) {
+            let now = now.into_std();
+            app.on_tick(now);
+            terminal.draw(|f| ui::draw(f, &mut app, now))?;
+            frames.drawn(tokio::time::Instant::now());
+        }
+        let animated = app.is_running() || app.has_background() || app.flash().is_some();
+        let mut changed = true;
         tokio::select! {
             Some(ev) = events.next() => app.on_term_event(ev?),
-            Some((id, ev)) = rx.recv() => app.on_agent_event(id, ev),
+            Some((id, ev)) = rx.recv() => {
+                // Repeated reasoning deltas carry no new visible state.
+                changed = id == app.run_id() && !matches!(
+                    &ev, crate::agent::AgentEvent::Thinking
+                        if app.phase.0 == app::Phase::Thinking
+                );
+                app.on_agent_event(id, ev);
+            },
             Some(ev) = background_rx.recv() => app.on_background(ev),
             Some(servers) = mcp_rx.recv() => app.on_mcp(servers),
             Some(report) = job_rx.recv() => app.on_job(report),
             Some(map) = map_rx.recv() => app.on_repo_map(map),
             _ = app.paths.receive() => {},
-            // Animates the spinner, counts background agents' time and expires the flash, so no
-            // redraws while idle.
-            _ = ticker.tick(), if app.is_running() || app.has_background() || app.flash().is_some() => app.on_tick(),
+            _ = tokio::time::sleep_until(frames.deadline()), if frames.pending(animated) => {
+                changed = false;
+            },
+        }
+        app.refresh_paths();
+        if changed {
+            frames.invalidate();
         }
     }
     Ok(())

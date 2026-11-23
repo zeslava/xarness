@@ -14,6 +14,7 @@ use tokio::task::JoinHandle;
 
 use super::clipboard::Clipboard;
 use super::commands::{self, Command, Completion};
+use super::log::Log;
 use crate::adapters::build_provider;
 use crate::adapters::mcp;
 use crate::agent::{self, AgentEvent, Answer, Background, BackgroundEvent, ContextCut, Run};
@@ -71,6 +72,7 @@ impl Selection {
     }
 }
 
+#[cfg_attr(test, derive(Clone))]
 pub enum Entry {
     User(String),
     Assistant(String),
@@ -98,27 +100,44 @@ pub enum ToolStatus {
 
 impl Entry {
     /// Results arrive in call order for each agent, including parallel `agent` calls.
-    fn finish_tool(log: &mut [Entry], label: Option<&str>) {
-        for entry in log {
-            if let Entry::Tool { agent, status, .. } = entry
-                && *status == ToolStatus::Running
-                && agent.as_deref() == label
-            {
-                *status = ToolStatus::Done;
-                break;
-            }
-        }
+    fn finish_tool(log: &mut Log, label: Option<&str>) {
+        let mut found = false;
+        log.update_where(
+            |entry| {
+                let matches = !found
+                    && matches!(entry,
+                        Entry::Tool { agent, status: ToolStatus::Running, .. }
+                            if agent.as_deref() == label
+                    );
+                found |= matches;
+                matches
+            },
+            |entry| {
+                if let Entry::Tool { status, .. } = entry {
+                    *status = ToolStatus::Done;
+                }
+            },
+        );
     }
 
     /// Calls cut short by an interrupt or a turn's end have no result to show.
-    fn finish_tools(log: &mut [Entry]) {
-        for entry in log {
-            if let Entry::Tool { status, .. } = entry
-                && *status == ToolStatus::Running
-            {
-                *status = ToolStatus::Done;
-            }
-        }
+    fn finish_tools(log: &mut Log) {
+        log.update_where(
+            |entry| {
+                matches!(
+                    entry,
+                    Entry::Tool {
+                        status: ToolStatus::Running,
+                        ..
+                    }
+                )
+            },
+            |entry| {
+                if let Entry::Tool { status, .. } = entry {
+                    *status = ToolStatus::Done;
+                }
+            },
+        );
     }
 
     /// Label of the subagent the entry comes from.
@@ -229,7 +248,7 @@ pub struct BackgroundRun {
 /// A running subagent's conversation, for the live view; dropped when it ends.
 pub struct Transcript {
     pub label: String,
-    pub log: Vec<Entry>,
+    pub log: Log,
     background: bool,
 }
 
@@ -281,7 +300,7 @@ pub struct App {
     metrics: Vec<metrics::Request>,
     cut: ContextCut,
     pub usage: Option<ContextUsage>,
-    pub log: Vec<Entry>,
+    pub log: Log,
     pub input: String,
     /// Cursor position in chars, not bytes.
     pub cursor: usize,
@@ -304,8 +323,8 @@ pub struct App {
     /// Set when a drag ends; the next draw copies the selection, as it has the rendered log.
     pub copy: bool,
     pub clipboard: Clipboard,
-    /// Spinner frame counter, advanced only while a run is active.
-    pub tick: usize,
+    /// Monotonic origin shared by every spinner frame.
+    pub animation_started: Instant,
     running: Option<JoinHandle<()>>,
     /// The active run is a compaction; its `Finished` must not trigger another one.
     compacting: bool,
@@ -393,7 +412,7 @@ impl App {
             session: Some(session),
             cut: ContextCut::default(),
             usage: None,
-            log,
+            log: log.into(),
             input: String::new(),
             cursor: 0,
             sent: Vec::new(),
@@ -407,7 +426,7 @@ impl App {
             selection: None,
             copy: false,
             clipboard: Clipboard::new(),
-            tick: 0,
+            animation_started: Instant::now(),
             running: None,
             compacting: false,
             phase: (Phase::Waiting, Instant::now()),
@@ -439,7 +458,7 @@ impl App {
         match Session::open(path) {
             Ok((session, history, shown)) => {
                 self.stop_background();
-                self.log = history_log(&history, &shown);
+                self.log = history_log(&history, &shown).into();
                 self.log.push(Entry::Info("session resumed".into()));
                 self.history = history;
                 self.shown = shown;
@@ -473,6 +492,10 @@ impl App {
 
     pub fn approval(&self) -> Option<&Approval> {
         self.approval.front()
+    }
+
+    pub fn run_id(&self) -> u64 {
+        self.run_id
     }
 
     pub fn is_running(&self) -> bool {
@@ -1001,7 +1024,7 @@ impl App {
             {
                 self.transcripts.push(Transcript {
                     label: agent,
-                    log: vec![Entry::User(task)],
+                    log: vec![Entry::User(task)].into(),
                     background: true,
                 })
             }
@@ -1570,7 +1593,7 @@ impl App {
             } => self.ask(name, arguments, agent, reply, false),
             AgentEvent::SubagentStarted { agent, task } => self.transcripts.push(Transcript {
                 label: agent,
-                log: vec![Entry::User(task)],
+                log: vec![Entry::User(task)].into(),
                 background: false,
             }),
             AgentEvent::SubagentText { agent, text } => self.record(&agent, Entry::Assistant(text)),
@@ -1671,11 +1694,10 @@ impl App {
         self.flashes.front()
     }
 
-    pub fn on_tick(&mut self) {
-        self.tick = self.tick.wrapping_add(1);
-        if !self.flashes.is_empty() && self.flash_at.elapsed() >= FLASH_TTL {
+    pub fn on_tick(&mut self, now: Instant) {
+        if !self.flashes.is_empty() && now.saturating_duration_since(self.flash_at) >= FLASH_TTL {
             self.flashes.pop_front();
-            self.flash_at = Instant::now();
+            self.flash_at = now;
         }
     }
 
@@ -1856,6 +1878,96 @@ fn latin_shortcut(mut key: KeyEvent) -> KeyEvent {
 #[cfg(test)]
 mod path_tests {
     use super::*;
+
+    #[test]
+    fn copying_cached_wrapped_markdown_matches_visible_text() {
+        let log = Log::from(vec![Entry::Assistant("**hello** world".into())]);
+        let rendered = log.prepare(5);
+        let paragraph = ratatui::widgets::Paragraph::new(rendered.text.clone())
+            .wrap(ratatui::widgets::Wrap { trim: false });
+        let selection = Selection {
+            anchor: (0, 0),
+            head: (1, 4),
+            dragged: true,
+        };
+        assert_eq!(
+            super::super::ui::selected_text(&paragraph, 5, selection),
+            "hello\nworld"
+        );
+    }
+
+    #[tokio::test]
+    async fn input_and_panels_work_between_scheduled_frames() {
+        use super::super::{render::Frames, ui};
+        use ratatui::{Terminal, backend::TestBackend};
+        let root = std::env::temp_dir().join(format!("xarness-render-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let skills = Arc::new(Skills::default());
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (bg, _) = tokio::sync::mpsc::unbounded_channel();
+        let (map, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            serde_json::from_str("{}").unwrap(),
+            ToolRegistry::new(root.clone(), skills.clone()),
+            skills,
+            tx,
+            bg,
+            map,
+            false,
+        )
+        .unwrap();
+        app.running = Some(tokio::spawn(std::future::pending()));
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let start = tokio::time::Instant::now();
+        let mut frames = Frames::new(start);
+        terminal
+            .draw(|f| ui::draw(f, &mut app, start.into_std()))
+            .unwrap();
+        frames.drawn(start);
+        // A burst of reasoning and text must not require a draw to process keys.
+        for _ in 0..1000 {
+            app.on_agent_event(app.run_id, AgentEvent::Thinking);
+            app.on_agent_event(app.run_id, AgentEvent::TextDelta("word ".into()));
+            frames.invalidate();
+            assert!(!frames.due(start, true));
+        }
+        for ch in "queued input".chars() {
+            app.on_term_event(Event::Key(KeyEvent::new(
+                KeyCode::Char(ch),
+                KeyModifiers::NONE,
+            )));
+        }
+        assert_eq!(app.input, "queued input");
+        let next = start + Duration::from_millis(34);
+        assert!(frames.due(next, true));
+        terminal
+            .draw(|f| ui::draw(f, &mut app, next.into_std()))
+            .unwrap();
+        assert!(app.log_total > 30);
+        app.on_agent_event(
+            app.run_id,
+            AgentEvent::SubagentStarted {
+                agent: "worker".into(),
+                task: "inspect".into(),
+            },
+        );
+        app.set_view(Some("worker".into()));
+        terminal
+            .draw(|f| ui::draw(f, &mut app, next.into_std()))
+            .unwrap();
+        assert!(app.log_area.width < 120);
+        app.set_view(None);
+        terminal
+            .draw(|f| ui::draw(f, &mut app, next.into_std()))
+            .unwrap();
+        assert_eq!(app.log_area.width, 120);
+        app.on_agent_event(app.run_id, AgentEvent::Finished);
+        terminal
+            .draw(|f| ui::draw(f, &mut app, next.into_std()))
+            .unwrap();
+        assert!(!app.is_running());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[tokio::test]
     async fn path_keys_preserve_text_and_do_not_submit() {

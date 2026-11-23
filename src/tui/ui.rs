@@ -36,7 +36,7 @@ const NEWLINE_MARK: &str = " ↵ ";
 const UNSEEN_MARK: &str = "↓";
 const OK_MARK: &str = "✓";
 
-pub fn draw(f: &mut Frame, app: &mut App) {
+pub fn draw(f: &mut Frame, app: &mut App, now: Instant) {
     let width = f.area().width.saturating_sub(2).max(1) as usize;
     let (rows, cur_row, cur_col) = input_lines(&app.input, app.cursor, width);
     let input_rows = rows.len().clamp(1, MAX_INPUT_ROWS);
@@ -45,7 +45,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         _ => Color::LightBlue,
     };
     let panel_cap = (f.area().height as usize * PANEL_SHARE_PCT / 100).max(1);
-    let (panel, keep) = panel_lines(app, f.area().width as usize, panel_cap, accent);
+    let (panel, keep) = panel_lines(app, f.area().width as usize, panel_cap, accent, now);
     // The live row is always there, so the log doesn't jump when a turn starts or ends.
     let [log_area, live_area, panel_area, input_area, status_area] = Layout::vertical([
         Constraint::Min(1),
@@ -76,8 +76,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         None => log_area,
     };
 
-    let log = Paragraph::new(log_text(&app.log)).wrap(Wrap { trim: false });
-    let total = log.line_count(log_area.width);
+    let mut log = app.log.prepare(log_area.width);
+    let total = log.total;
     if app.scroll > 0 {
         // `scroll` counts from the bottom, so growth would push the viewed lines up.
         let grown = total as i64 - app.log_total as i64;
@@ -93,22 +93,31 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.scroll = app.scroll.min(max_scroll);
     app.log_area = log_area;
     let offset = max_scroll.saturating_sub(app.scroll);
-    if std::mem::take(&mut app.copy)
-        && let Some(sel) = app.selection
-    {
-        let text = selected_text(&log, log_area.width, sel);
-        if !text.is_empty() {
-            app.clipboard.copy(&text);
-            app.notify(FlashKind::Ok, format!("{OK_MARK} copied"));
-        }
+    let copied = if std::mem::take(&mut app.copy) {
+        app.selection
+            .map(|sel| {
+                selected_text(
+                    &Paragraph::new(log.text.clone()).wrap(Wrap { trim: false }),
+                    log_area.width,
+                    sel,
+                )
+            })
+            .filter(|text| !text.is_empty())
+    } else {
+        None
+    };
+    log.paint(log_area, offset, f.buffer_mut());
+    drop(log);
+    if let Some(text) = copied {
+        app.clipboard.copy(&text);
+        app.notify(FlashKind::Ok, format!("{OK_MARK} copied"));
     }
-    f.render_widget(log.scroll((offset, 0)), log_area);
     if let Some(sel) = app.selection {
         highlight(f.buffer_mut(), log_area, offset, sel);
     }
     // A pending approval has the panel as its indicator.
     if app.is_running() && app.approval().is_none() {
-        f.render_widget(live_line(app), live_area);
+        f.render_widget(live_line(app, now), live_area);
     }
     if let Some(flash) = app.flash() {
         let color = match flash.kind {
@@ -182,16 +191,16 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 }
 
 /// A subagent's live conversation, always following its end.
-fn transcript_pane(f: &mut Frame, area: Rect, log: &[Entry], side: bool, title: String) {
+fn transcript_pane(f: &mut Frame, area: Rect, log: &super::log::Log, side: bool, title: String) {
     let block = Block::default()
         .borders(if side { Borders::LEFT } else { Borders::TOP })
         .border_style(Style::new().fg(Color::Gray))
         .title(Span::styled(title, Style::new().fg(Color::Magenta).bold()));
     let inner = block.inner(area);
-    let text = Paragraph::new(log_text(log)).wrap(Wrap { trim: false });
-    let offset = (text.line_count(inner.width) as u16).saturating_sub(inner.height);
+    let mut text = log.prepare(inner.width);
+    let offset = (text.total as u16).saturating_sub(inner.height);
     f.render_widget(block, area);
-    f.render_widget(text.scroll((offset, 0)), inner);
+    text.paint(inner, offset, f.buffer_mut());
 }
 
 fn highlight(buf: &mut Buffer, area: Rect, offset: u16, sel: Selection) {
@@ -212,7 +221,7 @@ fn highlight(buf: &mut Buffer, area: Rect, offset: u16, sel: Selection) {
 
 /// Renders only the selected wrapped lines off-screen and reads the cells back, so the text
 /// matches what was highlighted even where it has scrolled out of view.
-fn selected_text(log: &Paragraph, width: u16, sel: Selection) -> String {
+pub(super) fn selected_text(log: &Paragraph, width: u16, sel: Selection) -> String {
     let ((l0, c0), (l1, c1)) = sel.range();
     let height = (l1 - l0 + 1).min(u16::MAX as usize) as u16;
     let area = Rect::new(0, 0, width, height);
@@ -244,7 +253,13 @@ fn selected_text(log: &Paragraph, width: u16, sel: Selection) -> String {
 /// The panel between the log and the input shows one thing at a time, by priority:
 /// a pending approval, slash-command completions, background subagents and queued messages. Returns its lines,
 /// sized to the content, and the row to keep visible if they exceed `cap`.
-fn panel_lines(app: &App, width: usize, cap: usize, accent: Color) -> (Vec<Line<'static>>, usize) {
+fn panel_lines(
+    app: &App,
+    width: usize,
+    cap: usize,
+    accent: Color,
+    now: Instant,
+) -> (Vec<Line<'static>>, usize) {
     if let Some(a) = app.approval() {
         let lines = approval_lines(a, width, cap, accent);
         let last = lines.len().saturating_sub(1);
@@ -279,7 +294,7 @@ fn panel_lines(app: &App, width: usize, cap: usize, accent: Color) -> (Vec<Line<
                 format!("{AGENT_MARK} {}{tool} ", b.label),
                 Style::new().fg(Color::Magenta),
             ),
-            Span::styled(elapsed(b.started), Style::new().dim()),
+            Span::styled(elapsed(b.started, now), Style::new().dim()),
         ])
     });
     let lines: Vec<Line> = background
@@ -474,20 +489,20 @@ fn status_line(app: &App, width: usize) -> Line<'static> {
     Line::from(spans)
 }
 
-fn live_line(app: &App) -> Line<'static> {
+fn live_line(app: &App, now: Instant) -> Line<'static> {
     let (phase, started) = &app.phase;
     let (label, time) = match phase {
-        Phase::Waiting => ("waiting".to_string(), elapsed(*started)),
-        Phase::Thinking => ("thinking".to_string(), elapsed(*started)),
-        Phase::Writing => ("writing".to_string(), elapsed(*started)),
-        Phase::Running(name) => (format!("running {name}"), elapsed(*started)),
+        Phase::Waiting => ("waiting".to_string(), elapsed(*started, now)),
+        Phase::Thinking => ("thinking".to_string(), elapsed(*started, now)),
+        Phase::Writing => ("writing".to_string(), elapsed(*started, now)),
+        Phase::Running(name) => (format!("running {name}"), elapsed(*started, now)),
         // Counts down to the retry, then times the retried request like `Waiting`.
-        Phase::Retrying { reason, until } => match until.checked_duration_since(Instant::now()) {
+        Phase::Retrying { reason, until } => match until.checked_duration_since(now) {
             Some(left) => (reason.clone(), format!("retry in {}s", left.as_secs() + 1)),
-            None => ("waiting".to_string(), elapsed(*until)),
+            None => ("waiting".to_string(), elapsed(*until, now)),
         },
     };
-    let icon = SPINNER[app.tick % SPINNER.len()];
+    let icon = SPINNER[spinner_frame(app.animation_started, now)];
     Line::from(vec![
         Span::styled(
             format!("{icon} {label} "),
@@ -497,8 +512,12 @@ fn live_line(app: &App) -> Line<'static> {
     ])
 }
 
-fn elapsed(since: Instant) -> String {
-    let secs = since.elapsed().as_secs();
+fn spinner_frame(started: Instant, now: Instant) -> usize {
+    (now.saturating_duration_since(started).as_millis() / 100 % SPINNER.len() as u128) as usize
+}
+
+fn elapsed(since: Instant, now: Instant) -> String {
+    let secs = now.saturating_duration_since(since).as_secs();
     if secs < 60 {
         format!("{secs}s")
     } else {
@@ -514,7 +533,7 @@ fn kilo(n: u32) -> String {
     }
 }
 
-fn log_text(log: &[Entry]) -> Text<'static> {
+pub(super) fn log_text(log: &[Entry]) -> Text<'static> {
     let mut lines: Vec<Line> = Vec::new();
     for entry in log.iter() {
         match entry {
@@ -758,5 +777,24 @@ fn truncate(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         s.chars().take(max).collect::<String>() + "…"
+    }
+}
+
+#[cfg(test)]
+mod animation_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn spinner_uses_time_and_skips_missed_frames() {
+        let start = Instant::now();
+        assert_eq!(spinner_frame(start, start), 0);
+        assert_eq!(spinner_frame(start, start + Duration::from_millis(99)), 0);
+        assert_eq!(spinner_frame(start, start + Duration::from_millis(100)), 1);
+        let delayed = start + Duration::from_millis(2350);
+        for _ in 0..1000 {
+            assert_eq!(spinner_frame(start, delayed), 3);
+        }
+        assert_eq!(spinner_frame(start, start + Duration::from_secs(300)), 0);
     }
 }
