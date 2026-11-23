@@ -34,7 +34,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("model", "list or switch model"),
     ("think", "list or set reasoning level"),
     ("map", "rebuild repo map"),
-    ("mcp", "MCP server status"),
+    ("mcp", "MCP servers and tools with descriptions"),
     ("skills", "list skills"),
     ("agents", "watch running subagents; list: show all"),
     ("stats", "request and context metrics"),

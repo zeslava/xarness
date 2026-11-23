@@ -19,7 +19,7 @@ use crate::adapters::mcp;
 use crate::agent::{self, AgentEvent, Answer, Background, BackgroundEvent, ContextCut, Run};
 use crate::config::{Config, ModelConfig};
 use crate::domain::message::{Access, Message};
-use crate::domain::ports::LlmProvider;
+use crate::domain::ports::{LlmProvider, ToolSpec};
 use crate::metrics;
 use crate::repomap;
 use crate::session::{self, Session, Shown};
@@ -35,6 +35,8 @@ const PASTE_MAX_CHARS: usize = 1000;
 /// In the log a paste over this many lines keeps only `PASTE_PREVIEW_EDGE` lines at each end.
 const PASTE_PREVIEW_LINES: usize = 10;
 const PASTE_PREVIEW_EDGE: usize = 5;
+
+type McpStatus = Vec<(String, Result<Vec<ToolSpec>, String>)>;
 
 #[derive(Clone, Copy)]
 pub enum FlashKind {
@@ -259,8 +261,8 @@ pub struct App {
     agents: Arc<Subagents>,
     /// Built at startup only, so the system prompt prefix stays cacheable.
     skill_catalog: Option<Arc<str>>,
-    /// Per server: tool count or connection error; `None` while connecting.
-    mcp: Option<Vec<(String, Result<usize, String>)>>,
+    /// Per server: available tool specs or connection error; `None` while connecting.
+    mcp: Option<McpStatus>,
     /// Built at startup, on `/map` and on compaction only, so the system prompt prefix stays
     /// cacheable.
     repo_map: Option<Arc<str>>,
@@ -1609,16 +1611,21 @@ impl App {
             .into_iter()
             .map(|(name, res)| match res {
                 Ok(tools) => {
-                    let n = tools.len();
+                    let mut specs: Vec<_> = tools.iter().map(|t| t.spec()).collect();
+                    specs.sort_by(|a, b| a.name.cmp(&b.name));
                     self.tools.add_mcp(tools);
-                    (name, Ok(n))
+                    (name, Ok(specs))
                 }
                 Err(e) => (name, Err(format!("{e:#}"))),
             })
             .collect();
         let total = status.len();
         let ok = status.iter().filter(|(_, r)| r.is_ok()).count();
-        let tools: usize = status.iter().filter_map(|(_, r)| r.as_ref().ok()).sum();
+        let tools: usize = status
+            .iter()
+            .filter_map(|(_, r)| r.as_ref().ok())
+            .map(Vec::len)
+            .sum();
         self.mcp = Some(status);
         if total == 0 {
             return;
@@ -1802,11 +1809,25 @@ impl App {
         status
             .iter()
             .map(|(name, res)| match res {
-                Ok(n) => format!("mcp {name}: {n} tools"),
+                Ok(tools) => {
+                    let mut block = format!("mcp {name}: {} tools", tools.len());
+                    for tool in tools {
+                        block.push_str(&format!("\n  {}", tool.name));
+                        let description = tool.description.trim();
+                        if description.is_empty() {
+                            block.push_str("\n    (no description)");
+                        } else {
+                            for line in description.lines() {
+                                block.push_str(&format!("\n    {line}"));
+                            }
+                        }
+                    }
+                    block
+                }
                 Err(e) => format!("mcp {name}: failed: {e}"),
             })
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n\n")
     }
 
     fn push_log(&mut self, entry: Entry) {
