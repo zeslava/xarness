@@ -953,9 +953,10 @@ impl App {
         self.send(text);
     }
 
-    /// The log gets a preview of pastes, the model gets them in full.
+    /// The log keeps typed paths and paste previews; the model gets absolute paths and full pastes.
     fn send(&mut self, text: String) {
-        let full = self.expand_pastes(&text);
+        let resolved = super::paths::resolve_mentions(&text, self.tools.root());
+        let full = self.expand_pastes(&resolved);
         let shown = self.preview_pastes(&text);
         self.send_as(shown, full);
     }
@@ -1878,6 +1879,54 @@ fn latin_shortcut(mut key: KeyEvent) -> KeyEvent {
 #[cfg(test)]
 mod path_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn sending_resolves_paths_and_preserves_shown_text() {
+        let base = std::env::temp_dir().join(format!("xarness-send-paths-{}", std::process::id()));
+        let root = base.join("parent/project");
+        std::fs::create_dir_all(&root).unwrap();
+        let skills = Arc::new(Skills::default());
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (bg, _) = tokio::sync::mpsc::unbounded_channel();
+        let (map, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            serde_json::from_str("{}").unwrap(),
+            ToolRegistry::new(root.clone(), skills.clone()),
+            skills,
+            tx,
+            bg,
+            map,
+            false,
+        )
+        .unwrap();
+        // Resolving input must not rewrite the contents of a stored paste.
+        app.pastes.push("literal @../../in-paste.rs".into());
+        app.send(format!("Прочти @../../file.rs\n{}", app.paste_label(0)));
+        let shown = "Прочти @../../file.rs\nliteral @../../in-paste.rs";
+        let expected = format!(
+            "Прочти {}\nliteral @../../in-paste.rs",
+            base.join("file.rs").display()
+        );
+        assert!(matches!(&app.history[0], Message::User(text) if text == &expected));
+        assert_eq!(app.shown[&0], shown);
+        assert!(matches!(app.log.last_mut(), Some(Entry::User(text)) if text == shown));
+
+        let saved = session::list(&root);
+        let (_, history, shown) = Session::open(saved[0].path.clone()).unwrap();
+        assert!(matches!(&history[0], Message::User(text) if text == &expected));
+        assert_eq!(shown, app.shown);
+
+        app.history.clear();
+        app.shown.clear();
+        app.log.clear();
+        app.resume(saved[0].path.clone());
+        assert!(matches!(&app.history[0], Message::User(text) if text == &expected));
+        assert_eq!(app.shown, shown);
+        let displayed = app.log.prepare(120).text.to_string();
+        assert!(displayed.contains("@../../file.rs"));
+        assert!(!displayed.contains(&base.join("file.rs").display().to_string()));
+        std::fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn copying_cached_wrapped_markdown_matches_visible_text() {

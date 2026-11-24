@@ -18,14 +18,14 @@ fn byte_at(text: &str, cursor: usize) -> usize {
         .map_or(text.len(), |(i, _)| i)
 }
 
-fn mention(input: &str, cursor: usize) -> Option<Mention> {
-    if input.starts_with('/') {
-        return None;
-    }
-    let cursor = byte_at(input, cursor);
-    for (start, ch) in input.char_indices() {
-        if ch != '@' || (start > 0 && !input[..start].ends_with(char::is_whitespace)) {
-            continue;
+fn mention_ranges(input: &str) -> impl Iterator<Item = Range<usize>> + '_ {
+    let mut consumed = 0;
+    input.char_indices().filter_map(move |(start, ch)| {
+        if start < consumed
+            || ch != '@'
+            || (start > 0 && !input[..start].ends_with(char::is_whitespace))
+        {
+            return None;
         }
         let body = start + 1;
         let quoted = input[body..].starts_with('"');
@@ -42,23 +42,58 @@ fn mention(input: &str, cursor: usize) -> Option<Mention> {
         } else if let Some(i) = input[body..].find(char::is_whitespace) {
             end = body + i;
         }
-        if cursor < body || cursor > end {
-            continue;
-        }
-        let raw = &input[body..cursor];
-        let prefix = if quoted {
-            let raw = raw.strip_prefix('"')?;
-            let raw = raw.strip_suffix('"').unwrap_or(raw);
-            serde_json::from_str::<String>(&format!("\"{raw}\"")).ok()?
+        consumed = end;
+        Some(start..end)
+    })
+}
+
+fn mention(input: &str, cursor: usize) -> Option<Mention> {
+    if input.starts_with('/') {
+        return None;
+    }
+    let cursor = byte_at(input, cursor);
+    let range = mention_ranges(input).find(|r| cursor > r.start && cursor <= r.end)?;
+    let raw = &input[range.start + 1..cursor];
+    let prefix = if let Some(raw) = raw.strip_prefix('"') {
+        let raw = raw.strip_suffix('"').unwrap_or(raw);
+        serde_json::from_str::<String>(&format!("\"{raw}\"")).ok()?
+    } else {
+        raw.to_string()
+    };
+    Some(Mention { range, prefix })
+}
+
+/// Give the model unambiguous paths while keeping mention syntax in the input and log.
+/// Use the file tools' lexical resolver: paths need not exist, and symlinks are not followed.
+pub(super) fn resolve_mentions(input: &str, root: &Path) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut copied = 0;
+    for range in mention_ranges(input) {
+        let raw = &input[range.start + 1..range.end];
+        let path = if raw.starts_with('"') {
+            let Ok(path) = serde_json::from_str::<String>(raw) else {
+                continue;
+            };
+            path
         } else {
             raw.to_string()
         };
-        return Some(Mention {
-            range: start..end,
-            prefix,
-        });
+        if path.is_empty() {
+            continue;
+        }
+        let Ok(resolved) = crate::tools::resolve_path(root, &path) else {
+            continue;
+        };
+        let mut resolved = resolved.to_string_lossy().into_owned();
+        if path.ends_with('/') && !resolved.ends_with('/') {
+            resolved.push('/');
+        }
+        out.push_str(&input[copied..range.start]);
+        out.push_str(&quoted(&resolved));
+        copied = range.end;
     }
-    None
+    out.push_str(&input[copied..]);
+    out
 }
 
 #[derive(Clone)]
@@ -250,6 +285,88 @@ mod tests {
             "my service/src/"
         );
         assert_eq!(mention("@\"my service", 12).unwrap().prefix, "my service");
+    }
+
+    #[test]
+    fn mentions_resolve_for_model() {
+        let root = Path::new("/work/team/project");
+        assert_eq!(
+            resolve_mentions("Прочти @../../file.rs и @../file.rs\n@src/../new.rs", root),
+            "Прочти /work/file.rs и /work/team/file.rs\n/work/team/project/new.rs"
+        );
+        assert_eq!(
+            resolve_mentions(r#"@"../my service/a\"b.rs" @/tmp/a/../b/"#, root),
+            r#""/work/team/my service/a\"b.rs" /tmp/b/"#
+        );
+        assert_eq!(
+            resolve_mentions(r#"@"my @ service/file.rs""#, root),
+            r#""/work/team/project/my @ service/file.rs""#
+        );
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(
+                resolve_mentions("@~/src/../new.rs", root),
+                quoted(&home.join("new.rs").to_string_lossy())
+            );
+        }
+        // Empty or malformed mentions and email addresses remain literal text.
+        for input in [
+            "a@example.com @",
+            r#"@"""#,
+            r#"@"unfinished"#,
+            r#"@"bad\q""#,
+        ] {
+            assert_eq!(resolve_mentions(input, root), input);
+        }
+    }
+
+    #[tokio::test]
+    async fn parent_completions_preserve_depth_when_read() {
+        let base =
+            std::env::temp_dir().join(format!("xarness-parent-paths-{}", std::process::id()));
+        let root = base.join("parent/project");
+        std::fs::create_dir_all(&root).unwrap();
+        for (directory, content) in [(&base, "grandparent"), (&base.join("parent"), "parent")] {
+            std::fs::create_dir_all(directory.join("my service")).unwrap();
+            std::fs::write(directory.join("my service/main.rs"), content).unwrap();
+        }
+        let mut paths = Paths::new(root.clone());
+        let tools = crate::tools::ToolRegistry::new(
+            root,
+            std::sync::Arc::new(crate::skills::Skills::default()),
+        );
+
+        for (parents, content) in [("../", "parent"), ("../../", "grandparent")] {
+            let mut input = format!("Прочти @{parents}my");
+            let mut cursor = input.chars().count();
+            paths.refresh(&input, cursor, true);
+            paths.receive().await;
+            assert_eq!(
+                paths.completions()[0].label,
+                format!("{parents}my service/")
+            );
+            assert!(paths.accept(0, &mut input, &mut cursor));
+            assert_eq!(input, format!("Прочти @\"{parents}my service/\""));
+
+            paths.refresh(&input, cursor, true);
+            paths.receive().await;
+            assert!(paths.accept(0, &mut input, &mut cursor));
+            assert_eq!(input, format!("Прочти @\"{parents}my service/main.rs\" "));
+            // Read the absolute path sent to the model after accepting the completion.
+            let resolved = resolve_mentions(&input, tools.root());
+            let path: String =
+                serde_json::from_str(resolved.strip_prefix("Прочти ").unwrap().trim()).unwrap();
+            let output = tools
+                .run(
+                    crate::domain::message::Access::Full,
+                    None,
+                    "read_file",
+                    &serde_json::json!({ "path": path }).to_string(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(output, format!("    1\t{content}\n"));
+        }
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[tokio::test]
