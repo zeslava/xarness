@@ -31,7 +31,7 @@ impl Tool for Grep {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "grep".into(),
-            description: "Search file contents with a regex, respecting .gitignore. Returns `path:line:text`, followed by `[in Name]` when the line is inside a definition — pass that name to read_symbol instead of reading the whole file. At most 50 matches, lines longer than 200 chars are cut with …. Narrow the pattern or path if there are too many matches.".into(),
+            description: "Regex text search respecting .gitignore. For semantic symbol usages, prefer find_usages when available. Returns `path:line:text [in Name]`; use read_symbol only if more source is needed to answer. Up to 50 matches, lines cut at 200 chars. Narrow pattern/path if truncated.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -130,26 +130,5 @@ fn enclosing(defs: &[Def], line: usize) -> Option<String> {
     let k = (0..defs.len())
         .filter(|&k| defs[k].start <= line && line <= defs[k].end)
         .min_by_key(|&k| defs[k].end - defs[k].start)?;
-    let name = type_name(&defs[k]);
-    Some(match repomap::container(defs, k) {
-        Some(c) => format!("{}::{name}", type_name(&defs[c])),
-        None => name.to_string(),
-    })
-}
-
-/// For `impl Trait for Type` the tag name is the trait; the type is what tells impls apart.
-fn type_name(d: &Def) -> &str {
-    match d
-        .text
-        .strip_prefix("impl")
-        .and_then(|t| t.rsplit_once(" for "))
-    {
-        Some((_, ty)) => {
-            let end = ty
-                .find(|c: char| !(c.is_alphanumeric() || c == '_'))
-                .unwrap_or(ty.len());
-            &ty[..end]
-        }
-        None => &d.name,
-    }
+    Some(defs[k].qualified_name.clone())
 }

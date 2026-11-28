@@ -1577,14 +1577,22 @@ fn system_prompt(
          question, answer from it without tool calls; read or search only for details it does not \
          cover, instead of guessing. Stop calling tools as soon as you can answer. Before building \
          on an assumption, state it in one sentence and verify it with a tool.\n\
+         For symbol usages, prefer find_usages when available. For a question asking only where \
+         a symbol is used, an untruncated result without an incompleteness warning is sufficient, \
+         including zero matches: answer only with files, lines and enclosing callers when available, \
+         or report no usages, then stop. Explain behavior only when explicitly requested and \
+         verified in source. Resolve ambiguous symbols with a qualified name or position. \
+         Use grep when semantic search is unavailable, \
+         fails, or leaves a specific coverage gap. For these questions, read source only for \
+         requested details missing from the result.\n\
          When the user says you are wrong, do not apologize or agree yet: re-check with tools, then \
          state what the code shows. If you were wrong, say so in one line and fix it; if you were \
          right, say so and cite the evidence.\n\
          Once the build or tests pass after your change, do not re-check what they already \
          confirmed: end the turn with a short report.\n\
          Reply in the language the user writes in.\n\
-         Be concise. When showing code from files, quote it verbatim; put explanations \
-         outside the code block."
+         Be concise. Copy source excerpts verbatim; put explanations outside the code block. \
+         If summarizing or simplifying code, use prose instead of presenting it as a source excerpt."
     );
     if let Some(text) = instructions {
         prompt.push_str("\n\n# Project instructions (AGENTS.md)\n\n");
@@ -1600,11 +1608,11 @@ fn system_prompt(
     }
     if let Some(map) = repo_map {
         prompt.push_str(
-            "\n\n# Repository map\n\nFiles with line counts and the declarations they define. \
-             Consult it before searching: if a symbol you need is listed, go straight to read_symbol with \
-             its name instead of grepping for it. Use grep only for what the map does not show \
-             (usages, string literals, symbols missing from the map). It may not reflect edits made in \
-             this session: if read_symbol does not find a name, fall back to grep.\n\n",
+            "\n\n# Repository map\n\nPartial list of declarations; files include line counts. \
+             When definition source is needed, request the definition named in the task directly \
+             with read_symbol, even if absent here. For other definitions, use the listed names. \
+             Use grep for string literals or to locate unknown definitions. The map may be stale: \
+             if read_symbol does not find a name, fall back to grep.\n\n",
         );
         prompt.push_str(map);
     }

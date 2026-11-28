@@ -4,6 +4,7 @@ pub enum Command {
     Map,
     MapShow,
     Mcp,
+    Lsp,
     Skills,
     /// Opens the pane of the newest running subagent, then steps to older ones.
     Agents,
@@ -21,7 +22,7 @@ pub enum Command {
     },
 }
 
-pub const HELP: &str = "@path: complete files and directories (../, /, ~/); Tab/Enter selects, Esc dismisses. Paths with spaces: @\"my service/\".\n/clear  /compact [focus]  /resume [n]  /plan <task>  /model [provider/model]  /think [level]  /map [show]  /mcp  /skills  /agents [list]  /stats  /<skill> [args]  /help  /quit\n\
+pub const HELP: &str = "@path: complete files and directories (../, /, ~/); Tab/Enter selects, Esc dismisses. Paths with spaces: @\"my service/\".\n/clear  /compact [focus]  /resume [n]  /plan <task>  /model [provider/model]  /think [level]  /map [show]  /mcp  /lsp  /skills  /agents [list]  /stats  /<skill> [args]  /help  /quit\n\
 Tab — complete command or cycle its arguments, Esc — interrupt or close the subagent pane, PgUp/PgDn/wheel — scroll, Up/Down/Ctrl+P/Ctrl+N — input history, drag — select and copy (Shift+drag — native selection), Ctrl+C — interrupt or clear input, twice to quit\n\
 Shift+Enter/Alt+Enter/Ctrl+J — new line, Ctrl+W/Alt+Backspace — delete word, Ctrl+U/Ctrl+K — delete to line start/end, \
 Ctrl+A/Ctrl+E — line start/end, Ctrl+←→/Alt+B/Alt+F — move by word\n\
@@ -35,6 +36,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("think", "list or set reasoning level"),
     ("map", "rebuild repo map"),
     ("mcp", "MCP servers and tools with descriptions"),
+    ("lsp", "language servers, capabilities and last errors"),
     ("skills", "list skills"),
     ("agents", "watch running subagents; list: show all"),
     ("stats", "request and context metrics"),
@@ -136,6 +138,7 @@ pub fn parse(input: &str) -> Command {
             },
         },
         "mcp" => Command::Mcp,
+        "lsp" => Command::Lsp,
         "skills" => Command::Skills,
         "agents" => match arg {
             None => Command::Agents,

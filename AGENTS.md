@@ -1,50 +1,49 @@
-# CLAUDE.md
+# xarness
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
-## What this is
-
-`xarness` — a terminal (ratatui) coding agent that talks to OpenAI-compatible chat-completions endpoints (e.g. local llama.cpp).
-
-The working directory at launch becomes the sandbox root for all tools.
-
-## Config
-
-Three layers, each the first existing of its candidates, merged in order (later overrides earlier key by key; objects merge recursively, arrays such as `models` are replaced whole):
-
-1. global: `~/.config/xarness/config.{toml,json}` on every OS; if no layer exists at all, a `config.json` with empty `providers` is written here (best effort) and the TUI starts with no model, prompting to configure a provider
-2. project: `./.xarness/config.{toml,json}`
-3. local: `./.xarness/config.local.{toml,json}` — gitignored, for keys and personal endpoints
-
-The schema is defined in `src/config.rs`.
-
-- Models are addressed as `provider/model`; split on the **first** `/` only, since model ids may contain `/`.
-- `context_window` enables history trimming; without it, the provider is asked (llama.cpp `/props` → `n_ctx`, fetched each turn), and if that fails full history is sent.
-- `auto_compact` (e.g. `0.8`, absent = off): after a turn whose server-reported usage reaches that fraction of the context window, history is compacted like `/compact`; queued messages are sent after it. A model's own `auto_compact` overrides the top-level one.
-- `think.levels` maps a level name to raw JSON merged into the request body (`ChatRequest.extra`) — reasoning control is provider-specific, so it is pure config, not code. `think` may instead be a list of `reasoning_effort` values (`["low", "high"]`; also accepted as `levels` next to a `default`) or a preset name (`qwen`, see `think_preset`), and may be set on the provider, where models without their own inherit it.
-- `mcp.<server>` configures an MCP server: `command`/`args`/`env` (stdio) or `url`/`headers`/`headers_env` (streamable HTTP), plus `enabled`, `approval` (`auto` | `always` | `never`) and an optional `tools` allowlist.
-- `agents.<name>` holds a subagent's runtime settings: `enabled`, `model` (`provider/model`; absent = the caller's model), `think` (a level of that model) and `extra` (raw JSON merged over the level). The definitions themselves are files, see `subagents.rs`. `agents_parallel` (default `true`) runs consecutive `agent` calls in parallel; set it to `false` for a single-slot server.
-- `skills.compat` (default `["agents"]`) adds other agents' skill dirs `.<name>/skills`; `skills.disabled` lists skill names to skip.
+Rust terminal coding agent using ratatui and OpenAI-compatible APIs.
+The launch directory is the tools' root.
 
 ## Architecture
 
-Hexagonal layout:
+- `src/domain/`: messages, access and ports; must not import adapters.
+- `src/adapters/`: LLM providers and MCP client.
+- `src/tools/`: built-in tools, path resolution and approval checks.
+- `src/agent.rs`: model/tool loop; emits events to the TUI.
+- `src/tui/`: application state, event loop and rendering.
 
-- `domain/` — `Message`, `Access` (`Full`/`Plan`/`ReadOnly`, per run; there are no user-facing modes), and ports in `domain/ports.rs`: `LlmProvider` (returns a `BoxStream` of `LlmEvent`) and `Tool`. Domain must not import from `adapters/`.
-- `adapters/` — `LlmProvider` implementations; `build_provider` dispatches on `ProviderKind`. `openai.rs` does SSE parsing, accumulates streamed tool-call deltas, and maps server "context exceeded" errors to the `ContextOverflow` error type. Rate limits, 5xx, network errors and a connection lost mid-stream are retried after 5/10/20/30/50 s (`Retry-After` wins); before each wait it emits `LlmEvent::Retry`, on which the agent drops what was streamed so far and logs a notice. `mcp.rs` is the MCP client (`rmcp`): exposes each server tool as a `Tool` named `server__tool`; `mutating` = not annotated `readOnlyHint`, and with `approval = auto` mutating tools need approval.
-- `tools/` — `Tool` impls registered in `ToolRegistry::new`. MCP tools are added later via `add_mcp`: servers connect in the background at startup (`tui::run`), so the tool list changes at most once per session. Built-in tools with `mutating() == true` are hidden from the model and rejected at run time with `Access::ReadOnly` (subagents only); MCP tools are always offered, and mutating ones need approval unless access is `Full`. File paths use `tools::resolve_path`, which is lexical (no canonicalize, symlinks not followed), expands a leading `~` and allows any path. Calls to `read_file`, `grep`, `list_dir`, `read_symbol`, `write_file` and `edit_file` outside root wait for approval (`ToolRegistry::needs_approval` checks the `path` argument). `Tool::needs_approval` receives the arguments for tool-specific checks, such as `skill` files outside the skill's directory.
-- `agent.rs` — the agent loop, run as a spawned tokio task per user turn. Streams a request, executes tool calls, loops until the model returns no tool calls. Emits `AgentEvent`s tagged with a `run_id` over an unbounded channel.
-- `tui/` — `mod.rs` event loop `select!`s over terminal events, agent events and a spinner ticker (only while running). `app.rs` owns state/history and handles keys and slash commands (`commands.rs`); `ui.rs` renders.
+## Preserve these invariants
 
-### Non-obvious invariants
+- Commit assistant tool calls and their results atomically. Ignore stale
+  `run_id` events; background agents use a separate event channel.
+- Keep the system prompt and tool schemas stable for KV caching, except
+  initial MCP discovery. Rebuild the main repomap only at startup, `/map`
+  and compaction; subagent directory maps are cached for the session.
+- Trim whole turns before truncating tool outputs. Preserve skill
+  instructions within their active turn. Cut command outputs must name
+  their full spill file; cut file reads must give a continuation offset.
+- Deliver background job/subagent reports between turns, never during an
+  active turn. Esc cancels foreground work; background work survives it
+  but is stopped by `/clear` and `/resume`.
+- Preserve `Full`/`Plan`/`ReadOnly` access and per-tool approval checks.
+  Path resolution is lexical, not canonical; outside-root path-tool
+  calls require approval. `/plan` is per-turn, not a separate user mode.
+- Persist committed history, not reasoning or live subagent transcripts.
+- Load project `AGENTS.md` only from the working directory at startup.
+  Keep only skill names/descriptions in the prompt; load bodies on demand.
 
-- **History is committed atomically**: the agent sends `AgentEvent::Commit` with the assistant message plus all its tool results together, so an interrupted run (Esc aborts the task) never leaves dangling tool calls. The TUI ignores events whose `run_id` is stale.
-- **Context fitting** (`agent.rs`): token counts are estimated at ~3 chars/token, then corrected by a `scale` factor from server-reported `prompt_tokens`. Long tool outputs and arguments of finished turns are elided only once the window has under 64k tokens free after the reserve or is 75% full (`elide_due`; with no known window, always, and windows this small elide as soon as a turn ends); the boundary `ContextCut::elide_before` only moves forward, up to the last user message, so the prefix stays cached between moves. `fit_context` drops whole turns from the front (a turn starts at a `User` message), then truncates oldest tool outputs. Once the cut takes more than half the bytes of the current turn's outputs (`starved`), the next request asks for an answer from what was found, listing the turn's cut calls as unverified, like a subagent's wrap-up, instead of letting the model re-read what was cut until the window is exhausted. On `ContextOverflow` with no text yet streamed, it recalibrates and retries the turn once.
-- **Background jobs report back** (`tools/jobs.rs`): `run` with `background` starts a job whose watcher sends its report to the TUI when it exits (skipped if the model already saw the exit via `job`). The report becomes a `User` message marked as an automatic notice: it starts a turn when idle, otherwise it is sent with the next turn after `Finished`. It is never injected mid-turn.
-- **Cut outputs are spilled** (`tools::spill`): whenever `run`, a job report or `agent::cap_output` shows an output cut, the full text is saved to `./.xarness/tmp/` (gets a `*` `.gitignore`) and the cut marker names the file, so the model reads the rest in parts instead of re-running the command. The dir is wiped in `App::new` and on `/clear`. `output_cap` gives each output of a response the smaller of 15% of the window and an equal share of half the room left after the response and the next one's reserve (server-reported usage, converted to bytes with `scale`), clamped to 4–16 KB; `cap_output` keeps a third as head and two thirds as tail, cut at line ends. `read_file` outputs are not spilled (the file is on disk, and a copy would be read whole and cut again): `cap_read` keeps whole lines from the start and names the `offset` to continue at.
-- **Sessions** (`session.rs`): history is saved as JSONL in `./.xarness/sessions/<millis>.jsonl` (the dir gets a `*` `.gitignore`). `App::persist` appends whatever history gained since the last save — after the user message is pushed and on each `Commit` — and rewrites the file on `Compacted`; `/clear` starts a new file, created only on first save. `-c`/`--continue` loads the newest session, `/resume [n]` lists or loads one; the log is rebuilt from history. `reasoning` is not persisted. A user message whose log text differs from its content (paste placeholders, `/skill args`) is preceded by a `{"shown": …}` line, restored into the log on resume. A failed write disables saving until `/clear` or `/resume`.
-- **One mode, `/plan` per turn**: the main agent's system prompt is the same for every turn (it tells the model to match its work to the kind of request), so the prefix stays cached. A user-invoked skill with frontmatter `read-only: true` (an xarness extension; the spec's `allowed-tools` means pre-approved, not a limit) runs its turn with `Access::Plan`: every tool stays in the request, mutating calls wait for approval even if answered "always", a declined one gets a refusal telling the model to put it in the plan, and after `MAX_PLAN_DECLINES` the turn is wrapped up like a subagent's (refusal, then prefill + `tool_choice: "none"`). Access is reset to `Full` on `Finished` and interrupt; subagents started in such a turn run `ReadOnly`, fixed at start. The built-in `plan` skill (`skills::builtins`) is added after all skill dirs, so a `plan` skill of one's own replaces it; built-in skills are user-only and have no files.
-- The system prompt is rebuilt each turn. `AGENTS.md` from the working directory (only there, no parent/subdir lookup) is read once in `App::new` and appended to it.
-- `repomap.rs` builds a repo map (files + tree-sitter tag definitions, Rust/Go/JS/TS/Python/Bash) appended to the system prompt. It is built only in `App::new`, on `/map` and when compaction starts (the next request misses the cache anyway), never per turn, so the prompt prefix stays byte-identical for the server's KV cache. Definitions are listed without line numbers, which go stale with every edit. Over budget it degrades by `Depth` (trait-impl methods → all members → paths only → truncated paths).
-- **Subagents** (`subagents.rs`, `agent.rs`): definitions are `./.xarness/agents/<name>.md`, then `~/.config/xarness/agents/<name>.md`; the first of a name wins. There are no built-in agents. Frontmatter `name`, `description`, `tools` (allowlist; absent = all), body = system prompt. The main agent gets an `agent` tool (`{agent, task, dir?}`); its spec lists the agents and is static per session. `dir` (checked like `resolve_path`) becomes the subagent's root: it gets a registry clone rooted there (`ToolRegistry::rooted`) and that directory's AGENTS.md and repo map, built once per session per dir (`Subagents::dir_context`, never rebuilt by `/map`). Outside the caller's root the call needs approval and the subagent runs `ReadOnly`; its result is prefixed with the dir its paths are relative to. With `agents_parallel` the spec also offers `background`: the call returns at once and `agent::Background` spawns the subagent outside the turn's task, so Esc does not stop it (`/clear` and `/resume` do). Its approvals and metrics reach the TUI over a channel of their own (`BackgroundEvent`), bypassing the `run_id` check, and survive an interrupt; its report becomes an automatic notice like a job's. A call runs `drive` recursively with a fresh history `[User(task)]`, inside the parent's task (Esc aborts both), and returns only the final text as the tool result, so the parent's atomic `Commit` holds. The subagent's sink forwards only tool start/result, approvals, metrics, `SubagentStarted` (its task) and its text as `SubagentText`, tagged with its label; its `Commit` and `Usage` are dropped. The TUI keeps a `Transcript` per running subagent, live only: dropped when it ends (main agent's tool result, `Finished`, interrupt; for background ones their `Finished`), never persisted. `/agents` opens a read-only pane beside the log (below it on narrow terminals) and cycles it through them, newest first; Esc closes it. `/agents list` shows the definitions. With `agents_parallel`, consecutive `agent` calls in one response run in parallel (`call_groups`), other calls keep their order; approvals queue in the TUI. Subagents cannot start agents or background jobs (the report would reach the main agent after they finish) and after `MAX_SUBAGENT_STEPS` get a request that asks for a report of what they found. In such a wrap-up the tools stay in the request (removing them would change the prompt prefix and miss the KV cache, and models then write calls as plain text); calls are answered with a refusal once; if made again, the response is dropped and requested once more with the answer begun as an assistant prefill that opens a list and `tool_choice: "none"` (alone it only makes weak models write the call as text; the call markup `<tool_call>`/`<function=` is also sent as `stop` and cut from the answer), and calls after that are dropped and the turn ends with the text. A subagent response cut off at `max_tokens` is discarded (kept out of history, so the retry reuses the cached prefix) and requested again with a note asking for brevity, up to `MAX_CUT_OFFS` times in a row; after that the partial report is returned marked as cut off. With llama.cpp `-np 1` a subagent's prompt evicts the parent's KV cache; `-np 2+` (or `extra.id_slot`) avoids it.
-- `skills.rs` loads Agent Skills (`<dir>/<name>/SKILL.md`, YAML frontmatter parsed by a minimal subset parser) once at startup from `./.xarness/skills`, project compat dirs, `~/.config/xarness/skills`, then home compat dirs; the first skill of a name wins. Only the catalog (name + description) goes into the system prompt; the model loads a body with the `skill` tool, the user with `/<name> [args]`. `skill` resolves extra files relative to the skill dir: files within it (including global skills) need no approval; paths outside it wait for approval. `skill` outputs are never truncated by context fitting within their turn; once the turn is finished they can be elided like other tool outputs.
+## Configuration
+
+See `README.md` and `src/config.rs` for parameters and implementation.
+Layers: global (`~/.config/xarness`) -> project (`.xarness/config.*`) ->
+local (`.xarness/config.local.*`). Within each layer JSON wins over TOML.
+Create and edit configuration in JSON; use TOML only when explicitly requested.
+Objects merge recursively; arrays, including `models`, replace whole.
+Split `provider/model` identifiers on the first slash only.
+Reasoning controls are provider-specific JSON configured through `think`.
+
+## Build checks in restricted sandboxes
+
+Use `RUSTC_WRAPPER= CARGO_CACHE_RUSTC_INFO=0` when running Cargo in a
+sandbox that blocks sccache's local socket. This prevents failed compiler
+probes from poisoning `target/.rustc_info.json` for normal builds and LSP.
+Keep sccache enabled for normal builds outside such sandboxes.

@@ -1,0 +1,10 @@
+{
+  "lsp": {
+    "rust": {
+      "command": "rust-analyzer",
+      "filetypes": {
+        "rs": "rust"
+      }
+    }
+  }
+}

@@ -1384,6 +1384,9 @@ impl App {
                 let msg = self.mcp_status();
                 self.log.push(Entry::Info(msg));
             }
+            Command::Lsp => {
+                self.log.push(Entry::Info(self.tools.lsp_status()));
+            }
             Command::Skills => {
                 let msg = self.skills_status();
                 self.log.push(Entry::Info(msg));

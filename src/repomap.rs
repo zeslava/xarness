@@ -30,13 +30,27 @@ pub struct RepoMap {
 pub(crate) struct Def {
     /// Line of the name; `start..=end` is the whole node.
     pub line: usize,
+    /// Exact name offset in UTF-8 bytes, for semantic navigation.
+    pub name_byte: usize,
     pub start: usize,
     pub end: usize,
     pub name: String,
+    /// Scope-qualified name accepted by read_symbol, without signature syntax.
+    pub qualified_name: String,
     pub text: String,
     /// Header line of the innermost enclosing impl/class/trait/module.
     pub parent: Option<String>,
     depth: Depth,
+}
+
+impl Def {
+    pub(crate) fn declaration(&self) -> String {
+        if self.qualified_name == self.name {
+            self.text.clone()
+        } else {
+            format!("{}: {}", self.qualified_name, self.text)
+        }
+    }
 }
 
 /// Ordered by how early a definition is dropped when the map is over budget.
@@ -47,6 +61,8 @@ enum Depth {
     Member,
     /// Methods of trait impls: repetitive, and the `impl Trait for Type` line says enough.
     TraitMember,
+    /// Values are less useful for navigating behavior than callable definitions.
+    Value,
 }
 
 struct File {
@@ -94,7 +110,7 @@ pub fn build(root: &Path) -> Option<RepoMap> {
     let mut ctx = TagsContext::new();
     for (file, src) in files.iter_mut().zip(&sources) {
         if let (Some(src), Some(config)) = (src, langs.for_path(&file.path)) {
-            (file.defs, file.refs) = tags(&mut ctx, config, src);
+            (file.defs, file.refs) = tags(&mut ctx, config, src, true);
         }
     }
     let shown = select(&files, BUDGET_BYTES - paths_len);
@@ -120,12 +136,12 @@ fn render(files: &[File], shown: Option<&[Vec<bool>]>) -> String {
 }
 
 fn def_line(d: &Def) -> String {
-    let indent = if d.depth == Depth::TopLevel {
-        "  "
-    } else {
+    let indent = if matches!(d.depth, Depth::Member | Depth::TraitMember) {
         "    "
+    } else {
+        "  "
     };
-    format!("{indent}{}\n", d.text)
+    format!("{indent}{}\n", d.declaration())
 }
 
 /// Takes definitions in priority order while they fit. Stops at the first one that doesn't,
@@ -212,9 +228,8 @@ fn priorities(files: &[File]) -> Vec<Vec<f64>> {
                 .iter()
                 .map(|d| {
                     let depth = match d.depth {
-                        Depth::TopLevel => 1.0,
-                        Depth::Member => 0.5,
-                        Depth::TraitMember => 0.1,
+                        Depth::TopLevel | Depth::Member => 1.0,
+                        Depth::TraitMember | Depth::Value => 0.1,
                     };
                     rank[i] * depth + inflow.get(&(i, d.name.as_str())).unwrap_or(&0.0)
                 })
@@ -281,11 +296,25 @@ fn path_line(out: &mut String, f: &File) {
 }
 
 pub(crate) fn defs(ctx: &mut TagsContext, config: &TagsConfiguration, src: &str) -> Vec<Def> {
-    tags(ctx, config, src).0
+    tags(ctx, config, src, true).0
 }
 
-/// Definitions and referenced names, both outside test modules.
-fn tags(ctx: &mut TagsContext, config: &TagsConfiguration, src: &str) -> (Vec<Def>, Vec<String>) {
+/// Navigation also needs definitions in tests and multiple definitions on a single line.
+pub(crate) fn navigation_defs(
+    ctx: &mut TagsContext,
+    config: &TagsConfiguration,
+    src: &str,
+) -> Vec<Def> {
+    tags(ctx, config, src, false).0
+}
+
+/// Definitions and referenced names; repository-map callers omit test modules.
+fn tags(
+    ctx: &mut TagsContext,
+    config: &TagsConfiguration,
+    src: &str,
+    skip_tests: bool,
+) -> (Vec<Def>, Vec<String>) {
     let Ok((tags, _)) = ctx.generate_tags(config, src.as_bytes(), None) else {
         return (Vec::new(), Vec::new());
     };
@@ -295,6 +324,7 @@ fn tags(ctx: &mut TagsContext, config: &TagsConfiguration, src: &str) -> (Vec<De
     let mut trait_impls: Vec<Range<usize>> = Vec::new();
     let mut classes: Vec<Range<usize>> = Vec::new();
     let mut containers: Vec<(Range<usize>, String)> = Vec::new();
+    let mut scopes: Vec<(Range<usize>, String)> = Vec::new();
     let mut found: Vec<(Range<usize>, Def)> = Vec::new();
     let mut refs: Vec<(Range<usize>, String)> = Vec::new();
     for tag in tags.flatten() {
@@ -307,7 +337,7 @@ fn tags(ctx: &mut TagsContext, config: &TagsConfiguration, src: &str) -> (Vec<De
         if !tag.is_definition && kind != "implementation" {
             continue;
         }
-        if kind == "module" && &src[tag.name_range.clone()] == "tests" {
+        if skip_tests && kind == "module" && &src[tag.name_range.clone()] == "tests" {
             tests.push(tag.range);
             continue;
         }
@@ -324,6 +354,7 @@ fn tags(ctx: &mut TagsContext, config: &TagsConfiguration, src: &str) -> (Vec<De
             classes.push(tag.range.clone());
         }
         let depth = match kind {
+            "constant" => Depth::Value,
             "implementation" => Depth::Member,
             "method" if within(&tag.range, &trait_impls) => Depth::TraitMember,
             "method" => Depth::Member,
@@ -332,24 +363,74 @@ fn tags(ctx: &mut TagsContext, config: &TagsConfiguration, src: &str) -> (Vec<De
             _ => Depth::TopLevel,
         };
         let text = crate::tools::clip(line, MAX_LINE_CHARS).into_owned();
+        let name = src[tag.name_range.clone()].to_string();
         if matches!(kind, "implementation" | "class" | "interface" | "module") {
             containers.push((tag.range.clone(), text.clone()));
         }
+        if matches!(
+            kind,
+            "implementation" | "class" | "interface" | "module" | "function" | "method"
+        ) {
+            // Trait impl tags name the trait, while their members belong to the target type.
+            let scope = if kind == "implementation" {
+                line.rsplit_once(" for ")
+                    .map(|(_, ty)| {
+                        ty.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                            .next()
+                            .unwrap_or(&name)
+                    })
+                    .unwrap_or(&name)
+            } else {
+                &name
+            };
+            scopes.push((tag.range.clone(), scope.to_string()));
+        }
+        // Go receivers are scopes without enclosing declaration nodes.
+        let header = &src[tag.range.start..tag.name_range.start];
+        let receiver = (kind == "method")
+            .then(|| {
+                header
+                    .strip_prefix("func")?
+                    .trim_start()
+                    .strip_prefix('(')?
+                    .split_once(')')
+            })
+            .flatten()
+            .and_then(|(receiver, _)| receiver.split_whitespace().last())
+            .map(|ty| ty.trim_start_matches('*').split('[').next().unwrap_or(ty));
         let def = Def {
             line: tag.span.start.row + 1,
+            name_byte: tag.name_range.start,
             start: line_of(tag.range.start),
             end: line_of(tag.range.end.saturating_sub(1)),
-            name: src[tag.name_range.clone()].to_string(),
+            qualified_name: receiver.map_or_else(|| name.clone(), |ty| format!("{ty}.{name}")),
+            name,
             text,
             parent: None,
             depth,
         };
         found.push((tag.range, def));
     }
+    let separator = if config.language == tree_sitter_rust::LANGUAGE.into() {
+        "::"
+    } else {
+        "."
+    };
     let mut defs: Vec<Def> = found
         .into_iter()
         .filter(|(r, _)| !within(r, &tests))
         .map(|(r, mut d)| {
+            let mut parents: Vec<_> = scopes
+                .iter()
+                .filter(|(o, _)| *o != r && o.start <= r.start && r.end <= o.end)
+                .collect();
+            parents.sort_by_key(|(o, _)| std::cmp::Reverse(o.len()));
+            parents.dedup_by(|a, b| a.0 == b.0);
+            if !parents.is_empty() {
+                let mut names: Vec<_> = parents.iter().map(|(_, name)| name.as_str()).collect();
+                names.push(&d.qualified_name);
+                d.qualified_name = names.join(separator);
+            }
             d.parent = containers
                 .iter()
                 .filter(|(o, _)| *o != r && o.start <= r.start && r.end <= o.end)
@@ -358,8 +439,12 @@ fn tags(ctx: &mut TagsContext, config: &TagsConfiguration, src: &str) -> (Vec<De
             d
         })
         .collect();
-    defs.sort_by_key(|d| d.line);
-    defs.dedup_by_key(|d| d.line);
+    if skip_tests {
+        defs.sort_by_key(|d| d.line);
+        defs.dedup_by_key(|d| d.line);
+    } else {
+        defs.sort_by_key(|d| d.name_byte);
+    }
     let refs = refs
         .into_iter()
         .filter(|(r, _)| !within(r, &tests))
@@ -388,6 +473,8 @@ const RUST_CONSTS_QUERY: &str = r#"
 /// The stock query only sees plain and method calls; types and `Type::f()` paths carry most
 /// of the cross-file links in Rust.
 const RUST_REFS_QUERY: &str = r#"
+(impl_item type: (generic_type type: (type_identifier) @name) !trait) @reference.implementation
+(impl_item trait: (generic_type type: (type_identifier) @name)) @reference.implementation
 (call_expression function: (scoped_identifier name: (identifier) @name)) @reference.call
 (scoped_identifier path: (identifier) @name) @reference.type
 (type_identifier) @name @reference.type
@@ -411,7 +498,7 @@ impl Languages {
         // The TypeScript query only covers TS-specific nodes; functions and classes come from
         // the JavaScript one, which the TS grammar extends.
         let ts_query = format!(
-            "{}\n{}",
+            "{}\n{}\n(internal_module name: (identifier) @name) @definition.module",
             tree_sitter_javascript::TAGS_QUERY,
             tree_sitter_typescript::TAGS_QUERY
         );
@@ -498,6 +585,84 @@ mod tests {
             .map(|d| (d.start, d.end, d.name.as_str()))
             .collect();
         assert_eq!(got, [(1, 3, "build"), (4, 6, "run")]);
+    }
+
+    #[test]
+    fn scoped_names_in_map_cover_supported_languages() {
+        let cases = [
+            (
+                "x.rs",
+                "mod outer {\nstruct A<T>(T);\nimpl<T> A<T> {\nfn run() {}\n}\n}\n",
+                "outer::A::run",
+            ),
+            (
+                "x.rs",
+                "struct A;\nimpl Tr for A {\nfn run() {}\n}\n",
+                "A::run",
+            ),
+            (
+                "x.go",
+                "package p\ntype A[T any] struct {}\nfunc (a *A[T]) run() {}\n",
+                "A.run",
+            ),
+            ("x.js", "class A {\nrun() {}\n}\n", "A.run"),
+            (
+                "x.ts",
+                "namespace outer {\nexport class A {\nrun() {}\n}\n}\n",
+                "outer.A.run",
+            ),
+            ("x.tsx", "class A {\nrun() {}\n}\n", "A.run"),
+            (
+                "x.py",
+                "class Outer:\n    class A:\n        def run(self):\n            pass\n",
+                "Outer.A.run",
+            ),
+            (
+                "x.py",
+                "def outer():\n    def run():\n        pass\n",
+                "outer.run",
+            ),
+            ("x.sh", "run() {\n true\n}\n", "run"),
+        ];
+        for (path, src, expected) in cases {
+            let defs = defs(
+                &mut TagsContext::new(),
+                languages().for_path(path).unwrap(),
+                src,
+            );
+            let d = defs.iter().find(|d| d.name == "run").unwrap();
+            assert_eq!(d.qualified_name, expected, "{path}: {src}");
+            assert!(def_line(d).contains(expected), "{path}: {src}");
+        }
+    }
+
+    #[test]
+    fn limited_budget_keeps_methods_before_unreferenced_values() {
+        let src = "const FIRST: &str = \"long descriptive text\";\n\
+                   const SECOND: &str = \"more descriptive text\";\n\
+                   struct Store;\nimpl Store {\nfn read() {}\n}\n";
+        let defs = defs(
+            &mut TagsContext::new(),
+            languages().for_path("store.rs").unwrap(),
+            src,
+        );
+        let budget = defs
+            .iter()
+            .filter(|d| d.depth != Depth::Value)
+            .map(|d| def_line(d).len())
+            .sum();
+        let files = [File {
+            path: "store.rs".into(),
+            lines: Some(src.lines().count()),
+            defs,
+            refs: Vec::new(),
+        }];
+        let shown = select(&files, budget);
+        let map = render(&files, Some(&shown));
+        assert!(map.contains("Store::read"), "{map}");
+        assert!(!map.contains("FIRST"), "{map}");
+        assert!(!map.contains("SECOND"), "{map}");
+        assert_eq!(map.len(), render(&files, None).len() + budget);
     }
 
     #[test]

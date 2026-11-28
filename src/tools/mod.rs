@@ -2,6 +2,7 @@ mod edit;
 mod grep;
 mod jobs;
 mod ls;
+mod lsp;
 mod read;
 mod run;
 mod skill;
@@ -25,13 +26,15 @@ use crate::skills::Skills;
 pub(crate) use skill::NAME as SKILL_TOOL;
 
 /// Tools whose `path` may leave the working directory after approval.
-const PATH_TOOLS: [&str; 6] = [
+const PATH_TOOLS: [&str; 8] = [
     "read_file",
     "read_symbol",
     "list_dir",
     "grep",
     "write_file",
     "edit_file",
+    "find_usages",
+    "goto_definition",
 ];
 
 pub struct ToolRegistry {
@@ -40,6 +43,7 @@ pub struct ToolRegistry {
     jobs: Arc<jobs::Jobs>,
     /// Added once MCP servers connect, after startup.
     mcp: RwLock<Vec<Arc<dyn Tool>>>,
+    lsp: Option<Arc<crate::adapters::lsp::Manager>>,
 }
 
 impl ToolRegistry {
@@ -68,11 +72,37 @@ impl ToolRegistry {
             tools,
             jobs,
             mcp: RwLock::default(),
+            lsp: None,
         }
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn with_lsp(mut self, manager: Arc<crate::adapters::lsp::Manager>) -> Self {
+        if manager.enabled() {
+            self.tools.push(Arc::new(lsp::Navigation {
+                manager: manager.clone(),
+                references: true,
+            }));
+            self.tools.push(Arc::new(lsp::Navigation {
+                manager: manager.clone(),
+                references: false,
+            }));
+        }
+        self.lsp = Some(manager);
+        self
+    }
+
+    pub fn lsp_status(&self) -> String {
+        self.lsp
+            .as_ref()
+            .map_or_else(|| "lsp: no servers configured".into(), |m| m.status())
+    }
+
+    pub fn lsp_manager(&self) -> Option<Arc<crate::adapters::lsp::Manager>> {
+        self.lsp.clone()
     }
 
     /// The same tools working in `root`, for a subagent sent to another directory. MCP tools
@@ -82,6 +112,7 @@ impl ToolRegistry {
             root,
             tools: self.tools.clone(),
             jobs: Arc::clone(&self.jobs),
+            lsp: self.lsp.clone(),
             mcp: RwLock::new(
                 self.mcp
                     .read()
@@ -279,7 +310,8 @@ mod tests {
     #[test]
     fn external_paths_need_approval_for_all_file_tools() {
         let root = std::env::temp_dir().join("xarness-approval");
-        let tools = ToolRegistry::new(root.clone(), Arc::new(Skills::default()));
+        let tools = ToolRegistry::new(root.clone(), Arc::new(Skills::default()))
+            .with_lsp(crate::adapters::lsp::tests::manager());
         let outside = root.with_file_name("xarness-outside").join("file.txt");
         for (path, external) in [
             ("file.txt".to_string(), false),

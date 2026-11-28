@@ -47,6 +47,7 @@ pub async fn run(
             let _ = mcp_tx.send(mcp::connect_all(servers, root).await);
         });
     }
+    let lsp = tools.lsp_manager();
     let app = App::new(config, tools, skills, tx, background_tx, map_tx, resume)?;
     let mut terminal = ratatui::init();
     // Wheel and drag arrive as mouse events, apart from the arrow keys; selection is ours
@@ -78,6 +79,9 @@ pub async fn run(
     let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
+    if let Some(lsp) = lsp {
+        lsp.shutdown().await;
+    }
     res
 }
 

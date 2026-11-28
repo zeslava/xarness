@@ -387,7 +387,7 @@ fn approval_lines(a: &Approval, width: usize, cap: usize, accent: Color) -> Vec<
 /// What a call needing approval will do, one string per line.
 fn approval_preview(name: &str, arguments: &str) -> Vec<String> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(arguments) else {
-        return arguments.lines().map(String::from).collect();
+        return vec!["invalid arguments".into()];
     };
     let str_arg = |k: &str| v.get(k).and_then(|x| x.as_str());
     let lines = |s: &str| s.lines().map(String::from).collect::<Vec<_>>();
@@ -403,9 +403,13 @@ fn approval_preview(name: &str, arguments: &str) -> Vec<String> {
         "write_file" if str_arg("content").is_some() => {
             lines(str_arg("content").unwrap_or_default())
         }
-        _ => serde_json::to_string_pretty(&v)
-            .map(|s| lines(&s))
-            .unwrap_or_default(),
+        _ => match v.as_object() {
+            Some(args) => args
+                .iter()
+                .flat_map(|(key, value)| lines(&format!("{key}: {}", argument_value(value))))
+                .collect(),
+            None => lines(&argument_value(&v)),
+        },
     }
 }
 
@@ -685,12 +689,15 @@ fn line_diff<'a>(old: &'a str, new: &'a str) -> Vec<(char, &'a str)> {
     out
 }
 
-/// Human-readable form of tool arguments; falls back to raw JSON for unknown
-/// tools or arguments that don't parse.
+/// Human-readable arguments for built-ins and arbitrary MCP tools.
 fn tool_summary(name: &str, arguments: &str) -> String {
+    if arguments.trim().is_empty() {
+        return "no arguments".into();
+    }
     let Ok(v) = serde_json::from_str::<serde_json::Value>(arguments) else {
-        return arguments.to_string();
+        return "invalid arguments".into();
     };
+    let fallback = || argument_value(&v).trim().replace('\n', NEWLINE_MARK);
     let str_arg = |k: &str| v.get(k).and_then(|x| x.as_str());
     let path = str_arg("path");
     match (name, path) {
@@ -704,18 +711,32 @@ fn tool_summary(name: &str, arguments: &str) -> String {
                 (None, None) => p.to_string(),
             }
         }
-        ("read_symbol", Some(p)) => match v.get("name") {
-            Some(serde_json::Value::String(n)) => format!("{n} in {p}"),
-            Some(serde_json::Value::Array(ns)) => {
-                let ns: Vec<&str> = ns.iter().filter_map(|n| n.as_str()).collect();
-                format!("{} in {p}", ns.join(", "))
+        ("read_symbol" | "find_usages" | "goto_definition", Some(p)) => match v.get("name") {
+            Some(n) => {
+                // Models sometimes encode a list of names as a JSON string.
+                let decoded = n
+                    .as_str()
+                    .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok());
+                let names = match decoded {
+                    Some(names) => names.join(", "),
+                    None => argument_value(n),
+                };
+                format!("{names} in {p}")
             }
+            _ if v.get("line").is_some() => match v.get("column") {
+                Some(column) => format!(
+                    "{p}:{}:{}",
+                    argument_value(&v["line"]),
+                    argument_value(column)
+                ),
+                None => format!("{p}:{}", argument_value(&v["line"])),
+            },
             // Small files come back whole, so "outline" would be misleading.
             _ => p.to_string(),
         },
         ("grep", _) => match str_arg("pattern") {
             Some(pat) => format!("/{pat}/ in {}", path.unwrap_or(".")),
-            None => arguments.to_string(),
+            None => fallback(),
         },
         ("list_dir", _) => path.unwrap_or(".").to_string(),
         ("write_file", Some(p)) => match str_arg("content") {
@@ -735,33 +756,54 @@ fn tool_summary(name: &str, arguments: &str) -> String {
                 format!("{} &", c.trim().replace('\n', NEWLINE_MARK))
             }
             Some(c) => c.trim().replace('\n', NEWLINE_MARK),
-            None => arguments.to_string(),
+            None => fallback(),
         },
         ("agent", _) => match (str_arg("agent"), str_arg("task")) {
             (Some(a), Some(t)) => format!("{a}: {}", t.trim().replace('\n', NEWLINE_MARK)),
-            _ => arguments.to_string(),
+            _ => fallback(),
         },
-        (n, _) if n.contains("__") => mcp_summary(&v).unwrap_or_else(|| arguments.to_string()),
-        _ => arguments.to_string(),
+        ("job", _) => match v.get("id") {
+            Some(id) if v.get("kill").and_then(|x| x.as_bool()) == Some(true) => {
+                format!("stop #{}", argument_value(id))
+            }
+            Some(id) => format!("#{}", argument_value(id)),
+            None => "list".into(),
+        },
+        ("skill", _) => match (str_arg("name"), str_arg("file")) {
+            (Some(skill), Some(file)) => format!("{file} in {skill}"),
+            (Some(skill), None) => skill.to_string(),
+            _ => fallback(),
+        },
+        (n, _) if n.contains("__") => match v.as_object() {
+            Some(args) if args.len() == 1 => argument_value(args.values().next().unwrap())
+                .trim()
+                .replace('\n', NEWLINE_MARK),
+            _ => fallback(),
+        },
+        _ => fallback(),
     }
 }
 
-/// MCP tools have arbitrary schemas: a lone argument is shown as its bare
-/// value, several as `key=value` pairs.
-fn mcp_summary(v: &serde_json::Value) -> Option<String> {
-    let obj = v.as_object()?;
-    let flat = |x: &serde_json::Value| match x {
-        serde_json::Value::String(s) => s.trim().replace('\n', NEWLINE_MARK),
-        other => other.to_string(),
-    };
-    Some(match obj.len() {
-        1 => flat(obj.values().next()?),
-        _ => obj
+/// Keep nested arguments readable without JSON punctuation or string escaping.
+fn argument_value(v: &serde_json::Value) -> String {
+    use serde_json::Value;
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Array(values) => values
             .iter()
-            .map(|(k, x)| format!("{k}={}", flat(x)))
+            .map(argument_value)
+            .collect::<Vec<_>>()
+            .join(", "),
+        Value::Object(obj) if obj.is_empty() => "no arguments".into(),
+        Value::Object(obj) => obj
+            .iter()
+            .map(|(k, x)| format!("{k}={}", argument_value(x)))
             .collect::<Vec<_>>()
             .join("  "),
-    })
+        Value::Null => "none".into(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+    }
 }
 
 /// `server__tool` → `server: tool`; built-in names are returned as is.

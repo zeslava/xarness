@@ -25,7 +25,7 @@ impl Tool for ReadFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "read_file".into(),
-            description: "Read a text file. Returns lines prefixed with 1-based line numbers; returns at most 300 lines by default, lines longer than 500 chars are cut with …. For large files, first use grep to find the relevant line numbers, then read just that range with offset/limit.".into(),
+            description: "Read text with 1-based line numbers (default 300 lines; lines cut at 500 chars). For definition bodies, prefer read_symbol. Use offset/limit for known ranges; grep can locate unknown text. Read only when existing results lack details needed to answer.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {

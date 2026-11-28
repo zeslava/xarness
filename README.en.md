@@ -13,7 +13,7 @@ Features:
 - A repository map and instructions from `AGENTS.md` in the model's context.
 - Saved conversations, session resumption, and history compaction as the context fills up.
 - Switching models and configured reasoning levels during a conversation.
-- MCP servers, skills, and custom subagents.
+- MCP servers, LSP navigation, skills, and custom subagents.
 
 ## Installation
 
@@ -78,7 +78,7 @@ Both JSON and TOML are supported; all examples below use JSON. Settings are read
 | Project settings | `./.xarness/config.json` | `./.xarness/config.toml` |
 | Local project settings | `./.xarness/config.local.json` | `./.xarness/config.local.toml` |
 
-Each layer uses only the first existing file: TOML takes precedence over JSON. Later layers override earlier ones by key. Objects are merged recursively; arrays are replaced entirely. For example, a new `models` array replaces the provider's entire model list.
+Each layer uses only the first existing file: JSON takes precedence over TOML. Create new configurations in JSON; TOML remains supported for compatibility. Later layers override earlier ones by key. Objects are merged recursively; arrays are replaced entirely. For example, a new `models` array replaces the provider's entire model list.
 
 Keep shared project settings in `.xarness/config.json` and personal endpoints and keys in `.xarness/config.local.json`. Add `.xarness/config.local.*` to your project's `.gitignore`. Restart xarness after changing settings.
 
@@ -198,6 +198,46 @@ In `headers_env`, specify the name of an environment variable containing the com
 
 Servers connect in the background at startup. `/mcp` shows their status; tools are exposed to the model as `server__tool`.
 
+### Language servers (LSP)
+
+Configure installed stdio language servers explicitly; xarness does not discover or install them:
+
+```json
+{
+  "lsp": {
+    "rust": {
+      "command": "rust-analyzer",
+      "filetypes": { "rs": "rust" }
+    },
+    "go": {
+      "command": "gopls",
+      "filetypes": { "go": "go" }
+    }
+  }
+}
+```
+
+The `lsp` object uses the normal configuration layers. Each server accepts `enabled` (default `true`), `command`, `args`, `env`, `filetypes` (extension without a dot → language identifier), `initialization_options`, and `settings`. For example, set `"settings": { "gopls": { "staticcheck": true } }` for gopls. Two enabled servers cannot claim the same extension; this is a configuration error.
+
+With an enabled LSP configuration, the model receives two read-only tools:
+
+- `find_usages`: semantic references, excluding the declaration.
+- `goto_definition`: semantic definition locations.
+
+Both take a file `path` and exactly one addressing form: `name` (one exact definition name, optionally qualified, such as `Type::method` or `Type.method`), or `line` and `column` (one-based Unicode character coordinates). Name lookup reuses `read_symbol` definitions and returns candidates for ambiguous names. For languages without tree-sitter support, use positions. Results are sorted and deduplicated, with at most 50 locations, an explicit truncation notice, enclosing definitions where available, and one line of context. Results outside the working root show locations without reading their contents; their columns are marked with the server's encoding.
+
+Servers start lazily on the first query, with one shared connection per server and tool working root. A subagent using the same root shares the connection; a different directory uses a separate workspace. Subagent tool allowlists still apply: include `find_usages` and/or `goto_definition` to allow navigation. Input paths outside the root require approval.
+
+Open documents are compared with disk before navigation and synchronized with increasing versions; registered file watchers also deliver create, change, delete, and rename events from tools, shell commands, and external editors. Initialization times out after 30 seconds; navigation has a separate shared 30-second deadline for readiness, the request, and retries when the workspace snapshot changes. For rust-analyzer, the client requests `experimental/serverStatus` and waits for `quiescent: true`; other servers use active progress operations, with no universal indexing-complete guarantee. If loading starts during a request, its result is requested again after loading finishes. Cancelling a tool cancels its request and preserves the server; a later call reconnects after a crash. Connection errors, workspace loading errors, unsupported capabilities, timeouts, and successful empty results are distinct, with no automatic text-search fallback. Progress and degraded server health are shown in results and `/lsp`.
+
+`/lsp` shows connection status, capabilities, progress, the last error, and bounded stderr logs. Server requests to apply edits are rejected. Diagnostics, hover, refactoring, and call hierarchy are outside this version. MCP, the repository map, `grep`, and `read_symbol` remain independent; connecting or losing a server does not change tool schemas or rebuild the map.
+
+Tests use a controlled Python 3 stdio server. To additionally run the real rust-analyzer/gopls checks with both servers and toolchains installed:
+
+```bash
+cargo test real_language_servers -- --ignored --nocapture
+```
+
 ### Project instructions and skills
 
 Put project instructions — validation commands, conventions, and constraints — in `AGENTS.md` in the launch directory. The file is read at startup and added to the system prompt. Parent directories and subdirectories are not searched.
@@ -277,7 +317,7 @@ By default, consecutive subagent calls in a single response run in parallel; bac
 | `/clear` | Clear history and start a new session. |
 | `/resume [n]` | List saved sessions or load one. |
 | `/map` / `/map show` | Rebuild / display the repository map. |
-| `/mcp`, `/skills`, `/agents list` | Inspect connected extensions. |
+| `/mcp`, `/lsp`, `/skills`, `/agents list` | Inspect connected extensions. |
 | `/agents` | Open the subagent pane or cycle to the next helper. |
 | `/stats` | Show statistics. |
 | `/help`, `/quit` | Show help / quit. |

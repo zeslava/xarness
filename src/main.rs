@@ -22,9 +22,10 @@ async fn main() -> Result<()> {
     let resume = std::env::args()
         .skip(1)
         .any(|a| a == "-c" || a == "--continue");
+    let lsp = Arc::new(adapters::lsp::Manager::new(config.lsp.clone())?);
     tui::run(
         config,
-        tools::ToolRegistry::new(root, Arc::clone(&skills)),
+        tools::ToolRegistry::new(root, Arc::clone(&skills)).with_lsp(lsp),
         skills,
         resume,
     )

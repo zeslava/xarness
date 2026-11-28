@@ -14,6 +14,8 @@ pub struct Config {
     #[serde(default)]
     pub mcp: BTreeMap<String, McpServerConfig>,
     #[serde(default)]
+    pub lsp: BTreeMap<String, LspServerConfig>,
+    #[serde(default)]
     pub skills: SkillsConfig,
     /// Runtime settings of subagents by name; their definitions are `agents/<name>.md` files.
     #[serde(default)]
@@ -197,6 +199,45 @@ fn enabled() -> bool {
     true
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct LspServerConfig {
+    #[serde(default = "enabled")]
+    pub enabled: bool,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Extension (without a dot) to LSP language identifier.
+    #[serde(default)]
+    pub filetypes: BTreeMap<String, String>,
+    pub initialization_options: Option<Value>,
+    #[serde(default)]
+    pub settings: Value,
+}
+
+pub fn validate_lsp(servers: &BTreeMap<String, LspServerConfig>) -> Result<()> {
+    let mut extensions = BTreeMap::new();
+    for (name, cfg) in servers.iter().filter(|(_, c)| c.enabled) {
+        if cfg.command.trim().is_empty() {
+            return Err(anyhow!("lsp.{name}: command must not be empty"));
+        }
+        for (ext, language) in &cfg.filetypes {
+            if ext.is_empty() || ext.starts_with('.') || language.is_empty() {
+                return Err(anyhow!(
+                    "lsp.{name}: expected extension without a dot and nonempty language identifier"
+                ));
+            }
+            if let Some(other) = extensions.insert(ext, name) {
+                return Err(anyhow!(
+                    "LSP extension `{ext}` is assigned to both `{other}` and `{name}`"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum McpApproval {
@@ -236,16 +277,20 @@ impl Config {
     pub fn load() -> Result<Self> {
         // Not `dirs::config_dir()`: on macOS that is `~/Library/Application Support`.
         let global = dirs::home_dir().map(|h| h.join(".config/xarness"));
+        Self::load_from(global, Path::new("."))
+    }
+
+    fn load_from(global: Option<PathBuf>, project: &Path) -> Result<Self> {
         let layers = [
             global
                 .iter()
-                .flat_map(|d| [d.join("config.toml"), d.join("config.json")])
+                .flat_map(|d| [d.join("config.json"), d.join("config.toml")])
                 .collect(),
-            [".xarness/config.toml", ".xarness/config.json"]
-                .map(PathBuf::from)
+            [".xarness/config.json", ".xarness/config.toml"]
+                .map(|p| project.join(p))
                 .to_vec(),
-            [".xarness/config.local.toml", ".xarness/config.local.json"]
-                .map(PathBuf::from)
+            [".xarness/config.local.json", ".xarness/config.local.toml"]
+                .map(|p| project.join(p))
                 .to_vec(),
         ];
         let mut merged: Option<Value> = None;
@@ -268,7 +313,9 @@ impl Config {
             }
             Value::Object(Default::default())
         });
-        serde_json::from_value(merged).context("invalid config")
+        let config: Self = serde_json::from_value(merged).context("invalid config")?;
+        validate_lsp(&config.lsp)?;
+        Ok(config)
     }
 
     /// `spec` is `provider/model`; the model id itself may contain `/` (e.g. litellm's `openai/gpt-4o`).
@@ -339,6 +386,44 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn json_takes_precedence_in_every_layer_with_toml_fallback() {
+        let root = std::env::temp_dir().join(format!(
+            "xarness-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = root.join("global");
+        let project = root.join("project");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::create_dir_all(project.join(".xarness")).unwrap();
+        for (dir, stem, layer) in [
+            (global.clone(), "config", "global"),
+            (project.join(".xarness"), "config", "project"),
+            (project.join(".xarness"), "config.local", "local"),
+        ] {
+            let json_path = dir.join(format!("{stem}.json"));
+            let json = json!({"default": format!("{layer}-json")}).to_string();
+            std::fs::write(&json_path, &json).unwrap();
+            std::fs::write(
+                dir.join(format!("{stem}.toml")),
+                format!("default = '{layer}-toml'\n"),
+            )
+            .unwrap();
+            let load = || Config::load_from(Some(global.clone()), &project);
+            assert_eq!(load().unwrap().default.unwrap(), format!("{layer}-json"));
+            std::fs::remove_file(&json_path).unwrap();
+            assert_eq!(load().unwrap().default.unwrap(), format!("{layer}-toml"));
+            std::fs::write(&json_path, "invalid json").unwrap();
+            assert!(load().unwrap_err().to_string().contains("parsing"));
+            std::fs::write(&json_path, &json).unwrap();
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn merge_overrides_by_key() {
         let mut base = json!({
             "default": "a/x",
@@ -358,5 +443,35 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn lsp_config_layers_defaults_and_extension_conflicts() {
+        let mut base = json!({"lsp":{"rust":{"command":"rust-analyzer","filetypes":{"rs":"rust"},"args":["old"],"env":{"A":"1"},"settings":{"rust-analyzer":{"cargo":{"allFeatures":false}}}}}});
+        merge(
+            &mut base,
+            json!({"lsp":{"rust":{"args":["new"],"env":{"B":"2"},"settings":{"rust-analyzer":{"cargo":{"allFeatures":true}}}},"go":{"command":"gopls","filetypes":{"go":"go"}}}}),
+        );
+        let mut config: Config = serde_json::from_value(base).unwrap();
+        validate_lsp(&config.lsp).unwrap();
+        let rust = &config.lsp["rust"];
+        assert!(rust.enabled);
+        assert_eq!(rust.args, ["new"]);
+        assert_eq!(rust.env.len(), 2);
+        assert_eq!(rust.settings["rust-analyzer"]["cargo"]["allFeatures"], true);
+        config.lsp.insert("other".into(), rust.clone());
+        assert!(
+            validate_lsp(&config.lsp)
+                .unwrap_err()
+                .to_string()
+                .contains("both")
+        );
+        config.lsp.get_mut("other").unwrap().enabled = false;
+        validate_lsp(&config.lsp).unwrap();
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(config.lsp.is_empty());
+        let toml: LspServerConfig =
+            toml::from_str("command = 'gopls'\nfiletypes = { go = 'go' }").unwrap();
+        assert!(toml.enabled);
     }
 }
